@@ -1,3 +1,6 @@
+<!-- ═══════════════════════════════════════════════════════ -->
+<!-- 完整配置版 — 用于悬浮窗（5标签页完整配置） -->
+<!-- ═══════════════════════════════════════════════════════ -->
 <style>
     /* ─── 标签页容器 ────────────────────────────────────── */
     .oair-tabs-container {
@@ -135,11 +138,11 @@
 </style>
 
 <div class="oair-settings-ui">
-    <!-- 状态栏 -->
+    <!-- 状态栏（悬浮窗内也有） -->
     <div style="display:flex; justify-content:space-between; align-items:center; margin-bottom:10px; border-bottom:1px solid rgba(255,255,255,0.1); padding-bottom:5px; gap:8px;">
-        <div id="oair_status" style="font-size:0.8em; color:cyan;">就绪</div>
+        <div id="oair_floating_status" style="font-size:0.8em; color:cyan;">就绪</div>
         <label style="display:flex; align-items:center; gap:6px; font-size:0.8em; white-space:nowrap;">
-            <input id="oair_enabled" type="checkbox">
+            <input id="oair_floating_enabled" type="checkbox">
             启用
         </label>
     </div>
@@ -239,11 +242,11 @@
                 <div>
                     <label class="oair-field-label">图片尺寸</label>
                     <select id="oair_image_size" class="text_pole" style="width:100%; box-sizing:border-box;">
-                        <option value="256x256">256×256</option>
-                        <option value="512x512">512×512</option>
-                        <option value="1024x1024">1024×1024</option>
-                        <option value="1024x1792">1024×1792</option>
-                        <option value="1792x1024">1792×1024</option>
+                        <option value="256x256">256x256</option>
+                        <option value="512x512">512x512</option>
+                        <option value="1024x1024">1024x1024</option>
+                        <option value="1024x1792">1024x1792</option>
+                        <option value="1792x1024">1792x1024</option>
                     </select>
                 </div>
                 <div>
