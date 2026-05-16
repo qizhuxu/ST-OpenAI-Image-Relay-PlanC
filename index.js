@@ -393,7 +393,202 @@ function updateFabState(state) {
 }
 
 // ═══════════════════════════════════════════════════════════════
-// SECTION 7: UI — FLOATING PANEL (L2)
+// SECTION 7: UI — FLOATING PANEL HTML (L2 内嵌)
+// ═══════════════════════════════════════════════════════════════
+
+function getFullPanelHtml() {
+    return `
+<style>
+    .oair-tabs-container { display:flex; flex-direction:column; gap:0; }
+    .oair-tab-bar { display:flex; gap:2px; border-bottom:1px solid rgba(255,255,255,0.15); margin-bottom:8px; flex-wrap:wrap; }
+    .oair-tab-label { padding:5px 10px; font-size:0.78em; cursor:pointer; border-radius:4px 4px 0 0; opacity:0.55; transition:all 0.15s; user-select:none; white-space:nowrap; }
+    .oair-tab-label:hover { opacity:0.85; background:rgba(255,255,255,0.05); }
+    .oair-tab-panel { display:none; }
+    #oair_fl_tab_basic:checked ~ .oair-tab-bar label[for="oair_fl_tab_basic"],
+    #oair_fl_tab_backend:checked ~ .oair-tab-bar label[for="oair_fl_tab_backend"],
+    #oair_fl_tab_extract:checked ~ .oair-tab-bar label[for="oair_fl_tab_extract"],
+    #oair_fl_tab_optimize:checked ~ .oair-tab-bar label[for="oair_fl_tab_optimize"],
+    #oair_fl_tab_manual:checked ~ .oair-tab-bar label[for="oair_fl_tab_manual"] { opacity:1; background:rgba(255,255,255,0.1); border-bottom:2px solid cyan; }
+    #oair_fl_tab_basic:checked ~ #oair_fl_panel_basic,
+    #oair_fl_tab_backend:checked ~ #oair_fl_panel_backend,
+    #oair_fl_tab_extract:checked ~ #oair_fl_panel_extract,
+    #oair_fl_tab_optimize:checked ~ #oair_fl_panel_optimize,
+    #oair_fl_tab_manual:checked ~ #oair_fl_panel_manual { display:block; }
+    .oair-section { background:rgba(0,0,0,0.15); padding:10px; border-radius:6px; margin-bottom:8px; }
+    .oair-section-title { font-weight:bold; font-size:0.88em; margin-bottom:8px; display:flex; align-items:center; gap:6px; }
+    .oair-field-label { display:block; font-size:0.75em; opacity:0.8; margin-top:6px; margin-bottom:2px; }
+    .oair-hint { margin-top:4px; font-size:0.72em; opacity:0.6; line-height:1.4; }
+    .oair-row { display:grid; grid-template-columns:1fr 1fr; gap:6px; margin-top:6px; }
+    .oair-btn-row { display:flex; gap:6px; margin-top:6px; }
+    .oair-optimized-box { background:rgba(0,200,100,0.08); border:1px solid rgba(0,200,100,0.25); border-radius:6px; padding:8px; margin-top:6px; font-size:0.85em; line-height:1.5; white-space:pre-wrap; word-break:break-all; }
+    .oair-toggle-row { display:flex; justify-content:space-between; align-items:center; gap:8px; }
+    .oair-toggle-label { display:flex; align-items:center; gap:6px; font-size:0.8em; }
+    .oair-badge { display:inline-block; padding:1px 6px; border-radius:3px; font-size:0.7em; font-weight:bold; vertical-align:middle; }
+    .oair-badge-green { background:rgba(0,200,100,0.2); color:#60ff90; }
+    .oair-badge-orange { background:rgba(255,180,60,0.2); color:#ffd280; }
+    .oair-badge-red { background:rgba(255,80,80,0.2); color:#ff9090; }
+</style>
+<div class="oair-settings-ui">
+    <div style="display:flex; justify-content:space-between; align-items:center; margin-bottom:10px; border-bottom:1px solid rgba(255,255,255,0.1); padding-bottom:5px; gap:8px;">
+        <div id="oair_fl_status" style="font-size:0.8em; color:cyan;">就绪</div>
+        <label style="display:flex; align-items:center; gap:6px; font-size:0.8em; white-space:nowrap;">
+            <input id="oair_fl_enabled" type="checkbox"> 启用
+        </label>
+    </div>
+    <input type="radio" name="oair_fl_tab" id="oair_fl_tab_basic" checked style="display:none">
+    <input type="radio" name="oair_fl_tab" id="oair_fl_tab_backend" style="display:none">
+    <input type="radio" name="oair_fl_tab" id="oair_fl_tab_extract" style="display:none">
+    <input type="radio" name="oair_fl_tab" id="oair_fl_tab_optimize" style="display:none">
+    <input type="radio" name="oair_fl_tab" id="oair_fl_tab_manual" style="display:none">
+    <div class="oair-tab-bar">
+        <label for="oair_fl_tab_basic" class="oair-tab-label">📋 基础</label>
+        <label for="oair_fl_tab_backend" class="oair-tab-label">⚙️ 后端</label>
+        <label for="oair_fl_tab_extract" class="oair-tab-label">🔍 提取</label>
+        <label for="oair_fl_tab_optimize" class="oair-tab-label">✨ 优化</label>
+        <label for="oair_fl_tab_manual" class="oair-tab-label">🎨 手动</label>
+    </div>
+    <div class="oair-tab-panel" id="oair_fl_panel_basic">
+        <div class="oair-section">
+            <div class="oair-section-title">主模型提示注入</div>
+            <label class="oair-field-label">世界书式默认提示词</label>
+            <textarea id="oair_fl_main_prompt" class="text_pole" rows="12" style="width:100%; box-sizing:border-box;" placeholder="这里的内容会像常驻世界书一样注入到主模型提示链里。"></textarea>
+            <div class="oair-hint">这段文字会以系统规则的方式自动注入到主模型提示链开头，不会发送给图片后端。</div>
+        </div>
+        <div class="oair-section">
+            <div class="oair-section-title">消息生图按钮</div>
+            <label class="oair-toggle-label"><input id="oair_fl_message_gen_enabled" type="checkbox"> 在聊天消息上显示生图按钮</label>
+            <div class="oair-hint">启用后，每条消息的操作栏会出现两个按钮：<br>🖼️ 直接生图 — 使用消息原文作为提示词<br>✨ 总结生图 — 先将消息总结为提示词再生图</div>
+        </div>
+    </div>
+    <div class="oair-tab-panel" id="oair_fl_panel_backend">
+        <div class="oair-section">
+            <div class="oair-section-title">API 模式</div>
+            <label class="oair-field-label">选择接口类型</label>
+            <select id="oair_fl_api_mode" class="text_pole" style="width:100%; box-sizing:border-box;">
+                <option value="chat">Chat Completions (/v1/chat/completions)</option>
+                <option value="images">Images API (/v1/images/generations)</option>
+            </select>
+            <div class="oair-hint"><b>Chat Completions</b>：通过聊天接口生图，后端在文本回复中返回图片链接<br><b>Images API</b>：使用 OpenAI 标准图片生成接口，直接返回图片数据</div>
+        </div>
+        <div class="oair-section">
+            <div class="oair-section-title">连接配置</div>
+            <label class="oair-field-label">服务地址</label>
+            <input id="oair_fl_service_url" class="text_pole" style="width:100%; box-sizing:border-box;" placeholder="http://your-api-server/v1/chat/completions">
+            <div class="oair-row">
+                <div><label class="oair-field-label">API 密钥</label><input id="oair_fl_api_key" type="password" class="text_pole" style="width:100%; box-sizing:border-box;" placeholder="sk-..."></div>
+                <div><label class="oair-field-label">模型</label><input id="oair_fl_model" class="text_pole" style="width:100%; box-sizing:border-box;" placeholder="模型名称"></div>
+            </div>
+            <label class="oair-field-label">超时（毫秒）</label>
+            <input id="oair_fl_timeout_ms" type="number" min="1000" step="1000" class="text_pole" style="width:100%; box-sizing:border-box;">
+        </div>
+        <div class="oair-section oair-chat-api-fields">
+            <div class="oair-section-title">Chat Completions 模板</div>
+            <label class="oair-field-label">发送给图片后端的模板</label>
+            <textarea id="oair_fl_prompt_template" class="text_pole" rows="3" style="width:100%; box-sizing:border-box;" placeholder="在需要插入提取内容的位置使用 {{prompt}}。"></textarea>
+            <div class="oair-hint">将提取出的提示词包装后发给 chat completions 后端。</div>
+        </div>
+        <div class="oair-section oair-images-api-fields" style="display:none;">
+            <div class="oair-section-title">Images API 参数</div>
+            <label class="oair-field-label">发送给图片后端的模板</label>
+            <textarea id="oair_fl_images_prompt_template" class="text_pole" rows="2" style="width:100%; box-sizing:border-box;" placeholder="{{prompt}}（默认直通，不包装）"></textarea>
+            <div class="oair-row">
+                <div><label class="oair-field-label">图片尺寸</label>
+                    <select id="oair_fl_image_size" class="text_pole" style="width:100%; box-sizing:border-box;">
+                        <option value="256x256">256x256</option><option value="512x512">512x512</option><option value="1024x1024">1024x1024</option><option value="1024x1792">1024x1792</option><option value="1792x1024">1792x1024</option>
+                    </select>
+                </div>
+                <div><label class="oair-field-label">生成数量</label><input id="oair_fl_image_count" type="number" min="1" max="10" class="text_pole" style="width:100%; box-sizing:border-box;"></div>
+            </div>
+            <label class="oair-field-label">响应格式</label>
+            <select id="oair_fl_image_response_format" class="text_pole" style="width:100%; box-sizing:border-box;">
+                <option value="url">URL（返回图片链接）</option><option value="b64_json">Base64（返回图片数据）</option>
+            </select>
+        </div>
+        <div class="oair-section">
+            <div class="oair-section-title">额外请求体</div>
+            <label class="oair-field-label">额外请求体 JSON（可选）</label>
+            <textarea id="oair_fl_extra_body" class="text_pole" rows="3" style="width:100%; box-sizing:border-box;" placeholder='{"preset_name":"image"}'></textarea>
+        </div>
+    </div>
+    <div class="oair-tab-panel" id="oair_fl_panel_extract">
+        <div class="oair-section">
+            <div class="oair-section-title">提取提示词正则</div>
+            <label class="oair-field-label">从助手回复中提取生图提示词</label>
+            <textarea id="oair_fl_extraction_regex" class="text_pole" rows="3" style="width:100%; box-sizing:border-box;"></textarea>
+        </div>
+        <div class="oair-section">
+            <div class="oair-section-title">返回图片正则回退</div>
+            <label class="oair-field-label">当后端把图片链接放在文本里返回时使用</label>
+            <textarea id="oair_fl_response_image_regex" class="text_pole" rows="2" style="width:100%; box-sizing:border-box;"></textarea>
+            <div class="oair-hint">扩展会优先读取 <code>media</code> 这类结构化图片字段。只有当后端把图片链接放在文本里返回时，才会使用这里的回退正则。</div>
+        </div>
+    </div>
+    <div class="oair-tab-panel" id="oair_fl_panel_optimize">
+        <div class="oair-section">
+            <div class="oair-section-title">提示词优化 <span class="oair-badge oair-badge-orange">新</span></div>
+            <label class="oair-toggle-label"><input id="oair_fl_optimize_enabled" type="checkbox"> 启用提示词优化</label>
+            <div class="oair-hint">使用 LLM 自动优化提示词，添加画面细节、构图、光线等描述。</div>
+            <div style="margin-top:8px;">
+                <label class="oair-toggle-label"><input id="oair_fl_optimize_auto" type="checkbox"> 自动优化（应用于自动提取的提示词）</label>
+                <div class="oair-hint">关闭时，仅在手动点击「优化提示词」按钮时生效。</div>
+            </div>
+            <label class="oair-field-label">优化模板</label>
+            <textarea id="oair_fl_optimize_template" class="text_pole" rows="10" style="width:100%; box-sizing:border-box;" placeholder="优化提示词的模板，使用 {{prompt}} 插入原始提示词。"></textarea>
+            <details style="margin-top:8px;">
+                <summary style="font-size:0.78em; cursor:pointer; opacity:0.7;">自定义优化 LLM 后端（可选）</summary>
+                <div style="margin-top:6px;">
+                    <label class="oair-field-label">优化 LLM 服务地址（留空则使用主后端）</label>
+                    <input id="oair_fl_optimize_api_url" class="text_pole" style="width:100%; box-sizing:border-box;" placeholder="http://127.0.0.1:8080/v1/chat/completions">
+                    <div class="oair-row">
+                        <div><label class="oair-field-label">优化 LLM 模型</label><input id="oair_fl_optimize_model" class="text_pole" style="width:100%; box-sizing:border-box;" placeholder="留空则使用主模型"></div>
+                        <div><label class="oair-field-label">优化 LLM API 密钥</label><input id="oair_fl_optimize_api_key" type="password" class="text_pole" style="width:100%; box-sizing:border-box;" placeholder="留空则使用主密钥"></div>
+                    </div>
+                </div>
+            </details>
+        </div>
+        <div class="oair-section">
+            <div class="oair-section-title">NSFW 规避 <span class="oair-badge oair-badge-red">安全</span></div>
+            <label class="oair-toggle-label"><input id="oair_fl_nsfw_avoidance" type="checkbox"> 启用 NSFW 内容规避</label>
+            <div class="oair-hint">使用 LLM 自动审查提示词，移除不安全内容，避免封号。<br><b>建议开启</b>：即使主提示词已要求 SFW，此功能可作为额外安全网。</div>
+            <label class="oair-field-label">NSFW 审查模板</label>
+            <textarea id="oair_fl_nsfw_avoidance_template" class="text_pole" rows="8" style="width:100%; box-sizing:border-box;" placeholder="NSFW 审查模板，使用 {{prompt}} 插入原始提示词。"></textarea>
+        </div>
+        <div class="oair-section">
+            <div class="oair-section-title">消息总结模板</div>
+            <label class="oair-field-label">将聊天消息转化为生图提示词的模板</label>
+            <textarea id="oair_fl_summarize_template" class="text_pole" rows="8" style="width:100%; box-sizing:border-box;" placeholder="使用 {{message}} 插入消息内容。"></textarea>
+            <div class="oair-hint">点击消息上的「总结生图」按钮时使用此模板。</div>
+        </div>
+    </div>
+    <div class="oair-tab-panel" id="oair_fl_panel_manual">
+        <div class="oair-section">
+            <div class="oair-section-title">手动生图</div>
+            <label class="oair-field-label">输入提示词</label>
+            <textarea id="oair_fl_manual_prompt" class="text_pole" rows="4" style="width:100%; box-sizing:border-box;" placeholder="描述你想生成的图片..."></textarea>
+            <div id="oair_fl_manual_optimized_prompt" style="display:none;">
+                <label class="oair-field-label" style="color:#60ff90;">✨ 优化后的提示词</label>
+                <div id="oair_fl_manual_optimized_text" class="oair-optimized-box"></div>
+                <div class="oair-hint" style="color:#60ff90;">生成图片时将使用此优化版本</div>
+            </div>
+            <div class="oair-btn-row">
+                <button id="oair_fl_btn_optimize" class="menu_button" style="flex:1; justify-content:center;">✨ 优化提示词</button>
+                <button id="oair_fl_btn_manual_gen" class="menu_button" style="flex:1; justify-content:center;">🎨 生成图片</button>
+            </div>
+            <div class="oair-btn-row">
+                <button id="oair_fl_btn_clear_manual" class="menu_button" style="flex:1; justify-content:center;">清空</button>
+            </div>
+            <div class="oair-hint" style="margin-top:4px;">💡 提示：先输入提示词 → 点击「优化提示词」查看优化效果 → 点击「生成图片」</div>
+        </div>
+        <div class="oair-section">
+            <div class="oair-section-title">预览</div>
+            <div id="oair_fl_manual_preview" style="display:grid; gap:8px;"></div>
+        </div>
+    </div>
+</div>`;
+}
+
+// ═══════════════════════════════════════════════════════════════
+// SECTION 8: UI — FLOATING PANEL (L2)
 // ═══════════════════════════════════════════════════════════════
 
 function createFloatingPanel() {
@@ -483,26 +678,12 @@ function createFloatingPanel() {
         });
     });
 
-    // ─── 加载 settings_full.html 内容 ─────────────────────
-    const fullHtmlUrl = `${extensionFolderPath}/settings_full.html`;
-    console.log(`[${extensionName}] Loading floating panel HTML from: ${fullHtmlUrl}`);
-    $.get(fullHtmlUrl)
-        .then(function (html) {
-            panel.find(".oair-floating-body").html(html);
-            bindFloatingEvents();
-            syncAllUi();
-            console.log(`[${extensionName}] Floating panel HTML loaded successfully`);
-        })
-        .catch(function (error) {
-            console.error(`[${extensionName}] Failed to load settings_full.html from ${fullHtmlUrl}`, error);
-            panel.find(".oair-floating-body").html(
-                '<div style="padding:20px; text-align:center; color:#ff9090;">' +
-                '<p><b>配置页面加载失败</b></p>' +
-                `<p style="font-size:0.85em; opacity:0.7;">请求路径: ${fullHtmlUrl}</p>` +
-                '<p style="font-size:0.85em; opacity:0.7;">请检查插件文件是否完整，或尝试重新安装插件。</p>' +
-                '</div>'
-            );
-        });
+    // ─── 内嵌 settings_full.html 内容 ─────────────────────
+    // 不使用 $.get() 加载外部文件，直接内嵌避免路径问题
+    panel.find(".oair-floating-body").html(getFullPanelHtml());
+    bindFloatingEvents();
+    syncAllUi();
+    console.log(`[${extensionName}] Floating panel HTML embedded successfully`);
 }
 
 /**
