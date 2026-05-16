@@ -144,19 +144,10 @@ $(function () {
         ensureSettings();
         applyMainPromptInjection();
 
-        // ─── L0: 等待 SillyTavern 自动注入面板 HTML ──────
-        waitForElement("#ST-OpenAI-Image-Relay-settings").then(() => {
-            bindPanelEvents();
-            syncAllUi();
-            setStatus("就绪");
-        }).catch((err) => {
-            console.warn(`[${extensionName}] Panel element not found, falling back to manual injection`, err);
-            // Fallback: 如果 SillyTavern 没有自动注入，手动注入
-            const container = $("#extensions_settings");
-            if (container.length > 0) {
-                injectUiFallback(container);
-            }
-        });
+        // ─── L0: 主动注入面板 HTML 到扩展设置区域 ──────
+        // SillyTavern 不支持 manifest.json 的 html 字段，
+        // 必须由 JS 自行加载和注入设置面板。
+        await injectPanel();
 
         // ─── L1: 创建 FAB ─────────────────────────────────
         createFab();
@@ -170,51 +161,35 @@ $(function () {
     })();
 });
 
-/**
- * 等待指定元素出现在 DOM 中
- * @param {string} selector - CSS 选择器
- * @param {number} [timeout=10000] - 超时毫秒数
- * @returns {Promise<jQuery>}
- */
-function waitForElement(selector, timeout = 10000) {
-    return new Promise((resolve, reject) => {
-        const el = $(selector);
-        if (el.length) { resolve(el); return; }
-        const timer = setInterval(() => {
-            const el = $(selector);
-            if (el.length) { clearInterval(timer); resolve(el); }
-        }, 200);
-        setTimeout(() => { clearInterval(timer); reject(new Error(`Timeout waiting for ${selector}`)); }, timeout);
-    });
-}
+
 
 // ═══════════════════════════════════════════════════════════════
-// SECTION 4: UI — PANEL INJECTION FALLBACK (L0)
+// SECTION 4: UI — PANEL INJECTION (L0)
 // ═══════════════════════════════════════════════════════════════
-// SillyTavern 通过 manifest.json 的 html 字段自动注入 settings_panel.html，
-// 并将其包裹在 #ST-OpenAI-Image-Relay-settings 的 inline-drawer 中。
-// 此函数仅在自动注入失败时作为回退使用。
+// SillyTavern 不支持 manifest.json 的 html 字段，
+// 必须由扩展 JS 自行加载并注入设置面板到 #extensions_settings2。
+// settings_panel.html 已包含完整的 inline-drawer 折叠面板结构。
 
-async function injectUiFallback(container) {
-    let htmlContent = "";
-
+async function injectPanel() {
     try {
-        htmlContent = await $.get(`${extensionFolderPath}/settings_panel.html`);
+        const htmlContent = await $.get(`${extensionFolderPath}/settings_panel.html`);
+        // 第三方扩展注入到 #extensions_settings2（右侧扩展面板）
+        $("#extensions_settings2").append(htmlContent);
+        console.log(`[${extensionName}] Panel injected successfully`);
     } catch (error) {
-        console.error(`[${extensionName}] Failed to load settings_panel.html`, error);
-        return;
+        console.error(`[${extensionName}] Failed to load settings_panel.html, trying fallback`, error);
+        // Fallback: 尝试 #extensions_settings
+        try {
+            const htmlContent = await $.get(`${extensionFolderPath}/settings_panel.html`);
+            $("#extensions_settings").append(htmlContent);
+            console.log(`[${extensionName}] Panel injected to #extensions_settings (fallback)`);
+        } catch (e2) {
+            console.error(`[${extensionName}] All panel injection attempts failed`, e2);
+            return;
+        }
     }
 
-    const drawerHtml = `
-    <div id="ST-OpenAI-Image-Relay-settings" class="inline-drawer">
-        <div class="inline-drawer-toggle inline-drawer-header">
-            <b>🖼️ 图片中继</b>
-            <div class="inline-drawer-icon fa-solid fa-circle-chevron-down down"></div>
-        </div>
-        <div class="inline-drawer-content" style="display:none;">${htmlContent}</div>
-    </div>`;
-
-    container.prepend(drawerHtml);
+    // 注入成功后绑定事件和同步UI
     bindPanelEvents();
     syncAllUi();
     setStatus("就绪");

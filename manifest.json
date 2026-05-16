@@ -1,11 +1,8 @@
 {
-  "display_name": "OpenAI Image Relay",
-  "requires": [],
-  "optional": [],
+  "display_name": "图片中继",
   "js": "index.js",
-  "html": "settings_panel.html",
   "css": "style.css",
   "author": "Codex",
-  "version": "1.1.0",
+  "version": "1.2.0",
   "auto_update": true
 }
