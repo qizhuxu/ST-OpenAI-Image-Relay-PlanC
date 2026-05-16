@@ -419,7 +419,8 @@ function getFullPanelHtml() {
     .oair-field-label { display:block; font-size:0.75em; opacity:0.8; margin-top:6px; margin-bottom:2px; }
     .oair-hint { margin-top:4px; font-size:0.72em; opacity:0.6; line-height:1.4; }
     .oair-row { display:grid; grid-template-columns:1fr 1fr; gap:6px; margin-top:6px; }
-    .oair-btn-row { display:flex; gap:6px; margin-top:6px; }
+    .oair-btn-row { display:flex; gap:6px; margin-top:6px; flex-wrap:wrap; }
+    @media (max-width:500px) { .oair-row { grid-template-columns:1fr; } .oair-btn-row { flex-direction:column; } }
     .oair-optimized-box { background:rgba(0,200,100,0.08); border:1px solid rgba(0,200,100,0.25); border-radius:6px; padding:8px; margin-top:6px; font-size:0.85em; line-height:1.5; white-space:pre-wrap; word-break:break-all; }
     .oair-toggle-row { display:flex; justify-content:space-between; align-items:center; gap:8px; }
     .oair-toggle-label { display:flex; align-items:center; gap:6px; font-size:0.8em; }
@@ -591,6 +592,56 @@ function getFullPanelHtml() {
 // SECTION 8: UI — FLOATING PANEL (L2)
 // ═══════════════════════════════════════════════════════════════
 
+/**
+ * 判断当前是否为移动端视口
+ */
+function isMobileViewport() {
+    return window.innerWidth <= 768;
+}
+
+/**
+ * 计算并应用浮动面板的响应式定位
+ * 移动端 (≤768px)：全屏覆盖，由 CSS 控制
+ * 桌面端：居中定位，确保不超出视口
+ */
+function positionFloatingPanel(panel) {
+    if (!panel || !panel.length) return;
+
+    if (isMobileViewport()) {
+        // 移动端：CSS 已设置 top:0, left:0, width:100vw，无需 JS 定位
+        panel.css({ left: 0, top: 0, right: 0 });
+        return;
+    }
+
+    // 桌面端：居中定位
+    const panelWidth = Math.min(600, window.innerWidth - 24);
+    const panelHeight = Math.min(700, window.innerHeight - 40);
+    const left = Math.max(12, (window.innerWidth - panelWidth) / 2);
+    const top = Math.max(12, (window.innerHeight - panelHeight) / 2);
+    panel.css({ left: left + "px", top: top + "px", right: "auto" });
+}
+
+/**
+ * 限制面板位置不超出视口边界
+ */
+function clampPanelPosition(panel) {
+    if (!panel || !panel.length || isMobileViewport()) return;
+
+    const pw = panel.outerWidth();
+    const ph = panel.outerHeight();
+    const vw = window.innerWidth;
+    const vh = window.innerHeight;
+    let left = panel.offset().left;
+    let top = panel.offset().top;
+
+    // 至少保留 40px 可见区域用于拖拽
+    const minVisible = 40;
+    left = Math.max(-(pw - minVisible), Math.min(vw - minVisible, left));
+    top = Math.max(0, Math.min(vh - minVisible, top));
+
+    panel.css({ left: left + "px", top: top + "px", right: "auto" });
+}
+
 function createFloatingPanel() {
     if ($("#oair_floating_panel").length > 0) return;
 
@@ -606,18 +657,13 @@ function createFloatingPanel() {
 
     $("body").append(panel);
 
-    // 居中定位
-    const panelWidth = 480;
-    const panelHeight = 600;
-    panel.css({
-        left: Math.max(20, (window.innerWidth - panelWidth) / 2) + "px",
-        top: Math.max(20, (window.innerHeight - panelHeight) / 2) + "px",
-    });
+    // 响应式定位
+    positionFloatingPanel(panel);
 
     // 关闭按钮
     panel.find(".oair-floating-close").on("click", () => toggleFloatingPanel(false));
 
-    // ─── 标题栏拖拽 ──────────────────────────────────────
+    // ─── 标题栏拖拽（仅桌面端生效） ──────────────────────
     let isDragging = false;
     let startX = 0;
     let startY = 0;
@@ -625,6 +671,8 @@ function createFloatingPanel() {
     let startTop = 0;
 
     panel.find(".oair-floating-header").on("mousedown", function (e) {
+        // 移动端不允许拖拽（全屏模式无需拖拽）
+        if (isMobileViewport()) return;
         // 点击关闭按钮时不拖拽
         if ($(e.target).closest(".oair-floating-close").length) return;
         e.preventDefault();
@@ -642,6 +690,7 @@ function createFloatingPanel() {
                 top: (startTop + dy) + "px",
                 right: "auto",
             });
+            clampPanelPosition(panel);
         });
 
         $(document).on("mouseup.oair_panel", function () {
@@ -650,8 +699,10 @@ function createFloatingPanel() {
         });
     });
 
-    // 触摸拖拽
+    // 触摸拖拽（仅平板等中等屏幕，手机端全屏无需拖拽）
     panel.find(".oair-floating-header").on("touchstart", function (e) {
+        // 手机端全屏模式不拖拽
+        if (window.innerWidth <= 500) return;
         if ($(e.target).closest(".oair-floating-close").length) return;
         const touch = e.originalEvent.touches[0];
         isDragging = true;
@@ -670,12 +721,25 @@ function createFloatingPanel() {
                 top: (startTop + dy) + "px",
                 right: "auto",
             });
+            clampPanelPosition(panel);
         });
 
         $(document).on("touchend.oair_panel", function () {
             $(document).off(".oair_panel");
             isDragging = false;
         });
+    });
+
+    // ─── 窗口大小变化 / 屏幕旋转时重新定位 ─────────────────
+    let resizeTimer = null;
+    $(window).on("resize.oair orientationchange.oair", function () {
+        clearTimeout(resizeTimer);
+        resizeTimer = setTimeout(function () {
+            const p = $("#oair_floating_panel");
+            if (p.length && p.hasClass("oair-floating--visible")) {
+                positionFloatingPanel(p);
+            }
+        }, 150);
     });
 
     // ─── 内嵌 settings_full.html 内容 ─────────────────────
