@@ -156,8 +156,8 @@ $(function () {
 
         // ─── L0: 主动注入面板 HTML 到扩展设置区域 ──────
         // SillyTavern 不支持 manifest.json 的 html 字段，
-        // 必须由 JS 自行加载和注入设置面板。
-        await injectPanel();
+        // 必须由 JS 自行注入设置面板（内嵌HTML，不依赖外部文件）。
+        injectPanel();
 
         // ─── L1: 创建 FAB ─────────────────────────────────
         createFab();
@@ -177,27 +177,68 @@ $(function () {
 // SECTION 4: UI — PANEL INJECTION (L0)
 // ═══════════════════════════════════════════════════════════════
 // SillyTavern 不支持 manifest.json 的 html 字段，
-// 必须由扩展 JS 自行加载并注入设置面板到 #extensions_settings2。
-// settings_panel.html 已包含完整的 inline-drawer 折叠面板结构。
+// 必须由扩展 JS 自行注入设置面板。
+// 采用内嵌 HTML 方式，避免 $.get() 路径解析问题。
 
-async function injectPanel() {
-    try {
-        const htmlContent = await $.get(`${extensionFolderPath}/settings_panel.html`);
-        // 第三方扩展注入到 #extensions_settings2（右侧扩展面板）
-        $("#extensions_settings2").append(htmlContent);
-        console.log(`[${extensionName}] Panel injected successfully`);
-    } catch (error) {
-        console.error(`[${extensionName}] Failed to load settings_panel.html, trying fallback`, error);
-        // Fallback: 尝试 #extensions_settings
-        try {
-            const htmlContent = await $.get(`${extensionFolderPath}/settings_panel.html`);
-            $("#extensions_settings").append(htmlContent);
-            console.log(`[${extensionName}] Panel injected to #extensions_settings (fallback)`);
-        } catch (e2) {
-            console.error(`[${extensionName}] All panel injection attempts failed`, e2);
-            return;
-        }
+function injectPanel() {
+    console.log(`[${extensionName}] injectPanel() called, extensionFolderPath = ${extensionFolderPath}`);
+
+    // L0 面板 HTML — 直接内嵌，避免外部文件加载失败
+    const panelHtml = `
+<div id="ST-OpenAI-Image-Relay-settings">
+    <div class="inline-drawer">
+        <div class="inline-drawer-toggle inline-drawer-header">
+            <div class="flex-container alignitemscenter margin0">
+                <b>🖼️ 图片中继</b>
+            </div>
+            <div class="inline-drawer-icon fa-solid fa-circle-chevron-down down"></div>
+        </div>
+        <div class="inline-drawer-content oair-panel-ui" style="display:none;">
+            <div style="display:flex; justify-content:space-between; align-items:center; margin-bottom:8px; border-bottom:1px solid rgba(255,255,255,0.1); padding-bottom:5px; gap:8px;">
+                <div id="oair_status" style="font-size:0.8em; color:cyan;">就绪</div>
+                <label style="display:flex; align-items:center; gap:6px; font-size:0.8em; white-space:nowrap;">
+                    <input id="oair_enabled" type="checkbox">
+                    启用
+                </label>
+            </div>
+            <div class="oair-section">
+                <label class="oair-toggle-label">
+                    <input id="oair_fab_enabled" type="checkbox">
+                    显示悬浮快捷按钮
+                </label>
+                <div class="oair-hint">
+                    勾选后屏幕右下角出现可拖拽的快捷按钮，点击打开详细配置窗口。
+                </div>
+            </div>
+            <div class="oair-section" style="margin-top:4px;">
+                <button id="oair_btn_open_floating" class="menu_button" style="width:100%; justify-content:center;">
+                    🖼️ 打开详细配置窗口
+                </button>
+            </div>
+            <div class="oair-section" style="margin-top:4px;">
+                <button id="oair_btn_reset" class="menu_button" style="width:100%; justify-content:center;">
+                    🔄 恢复默认设置
+                </button>
+            </div>
+        </div>
+    </div>
+</div>`;
+
+    // 尝试注入到 #extensions_settings2（第三方扩展标准位置）
+    let container = $("#extensions_settings2");
+    if (container.length === 0) {
+        // Fallback: 某些 ST 版本可能只有 #extensions_settings
+        container = $("#extensions_settings");
+        console.warn(`[${extensionName}] #extensions_settings2 not found, using #extensions_settings`);
     }
+
+    if (container.length === 0) {
+        console.error(`[${extensionName}] No extension settings container found in DOM!`);
+        return;
+    }
+
+    container.append(panelHtml);
+    console.log(`[${extensionName}] Panel injected to ${container.attr('id')}`);
 
     // 注入成功后绑定事件和同步UI
     bindPanelEvents();
@@ -443,17 +484,21 @@ function createFloatingPanel() {
     });
 
     // ─── 加载 settings_full.html 内容 ─────────────────────
-    $.get(`${extensionFolderPath}/settings_full.html`)
+    const fullHtmlUrl = `${extensionFolderPath}/settings_full.html`;
+    console.log(`[${extensionName}] Loading floating panel HTML from: ${fullHtmlUrl}`);
+    $.get(fullHtmlUrl)
         .then(function (html) {
             panel.find(".oair-floating-body").html(html);
             bindFloatingEvents();
             syncAllUi();
+            console.log(`[${extensionName}] Floating panel HTML loaded successfully`);
         })
         .catch(function (error) {
-            console.error(`[${extensionName}] Failed to load settings_full.html`, error);
+            console.error(`[${extensionName}] Failed to load settings_full.html from ${fullHtmlUrl}`, error);
             panel.find(".oair-floating-body").html(
                 '<div style="padding:20px; text-align:center; color:#ff9090;">' +
                 '<p><b>配置页面加载失败</b></p>' +
+                `<p style="font-size:0.85em; opacity:0.7;">请求路径: ${fullHtmlUrl}</p>` +
                 '<p style="font-size:0.85em; opacity:0.7;">请检查插件文件是否完整，或尝试重新安装插件。</p>' +
                 '</div>'
             );
