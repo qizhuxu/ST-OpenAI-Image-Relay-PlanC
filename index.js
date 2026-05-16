@@ -20,8 +20,18 @@ import { regexFromString } from "../../../utils.js";
 // SECTION 1: IMPORTS & CONSTANTS
 // ═══════════════════════════════════════════════════════════════
 
+// 配置存储 key（固定，不随仓库/文件夹名变化，保留旧配置兼容）
 const extensionName = "ST-OpenAI-Image-Relay";
-const extensionFolderPath = `scripts/extensions/third-party/${extensionName}`;
+
+// 动态检测扩展文件夹路径 — 根据当前脚本的实际加载位置推导
+// 这样无论仓库命名为 ST-OpenAI-Image-Relay 还是 ST-OpenAI-Image-Relay-PlanC，
+// 都能正确找到同目录下的 settings_panel.html / settings_full.html 等文件
+const _scriptUrl = new URL(import.meta.url);
+const _pathParts = _scriptUrl.pathname.split('/');
+const _thirdPartyIdx = _pathParts.indexOf('third-party');
+const extensionFolderPath = _thirdPartyIdx >= 0
+    ? `scripts/extensions/third-party/${_pathParts[_thirdPartyIdx + 1]}`
+    : `scripts/extensions/third-party/${extensionName}`; // fallback
 const mainPromptKey = `${extensionName}-MAIN-PROMPT`;
 const markdownImageRegex = /!\[[^\]]*]\(([^)\s]+)\)/g;
 const looseImageUrlRegex = /((?:https?:\/\/|\/)[^\s)"']+\.(?:png|jpe?g|webp|gif|bmp|svg)(?:\?[^\s)"']*)?)/gi;
