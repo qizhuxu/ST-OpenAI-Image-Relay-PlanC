@@ -22,6 +22,7 @@
     transition: transform 0.2s ease, box-shadow 0.2s ease, border-color 0.3s ease;
     user-select: none;
     will-change: top, left;
+    touch-action: none;
 }
 
 #oair_fab:active {
@@ -76,6 +77,59 @@
 /* 移动端自动显示 FAB（可选，默认桌面也需要手动勾选才显示） */
 @media (max-width: 1000px) {
     /* 移动端可通过设置开启 */
+}
+
+/* ─── 移动端响应式 ──────────────────────────────────────────── */
+
+/* 平板和小屏 */
+@media (max-width: 1000px) {
+    #oair_floating_panel {
+        width: calc(100vw - 20px);
+        max-height: calc(100vh - 40px);
+    }
+}
+
+/* 手机 */
+@media (max-width: 768px) {
+    #oair_floating_panel {
+        width: calc(100vw - 10px);
+        max-height: calc(100vh - 20px);
+        border-radius: 8px;
+    }
+
+    .oair-floating-header {
+        padding: 8px 10px;
+    }
+
+    .oair-floating-header h3 {
+        font-size: 0.85em;
+    }
+
+    .oair-floating-body {
+        padding: 8px 10px;
+    }
+
+    /* 更紧凑的表单 */
+    #oair_floating_panel input,
+    #oair_floating_panel select,
+    #oair_floating_panel textarea {
+        font-size: 14px !important;
+    }
+
+    #oair_floating_panel .oair-tab-content {
+        padding: 6px 0;
+    }
+}
+
+/* 小手机 */
+@media (max-width: 400px) {
+    #oair_floating_panel {
+        width: 100vw;
+        max-height: 100vh;
+        top: 0 !important;
+        left: 0 !important;
+        border-radius: 0;
+    }
 }
 
 /* ─── 悬浮配置窗口 ──────────────────────────────────────────── */

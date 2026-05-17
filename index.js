@@ -98,7 +98,7 @@ const defaultSettings = {
 
     // ─── 后端 ──────────────────────────────────────────────
     apiMode: "chat",                            // "chat" | "images"
-    serviceUrl: "http://127.0.0.1:8199/v1/chat/completions",
+    serviceUrl: "http://127.0.0.1:8199/v1",
     apiKey: "sk-any",
     model: "any",
     timeoutMs: 120000,
@@ -266,24 +266,25 @@ function createFab() {
     fab.appendTo("body");
     fab.addClass("oair-fab--visible");
 
-    // Click → toggle floating panel
+    // Unified click/drag/longpress handling
     let clickTimer = null;
     let isDragging = false;
     let dragStarted = false;
     let startX, startY, origLeft, origTop;
+    let touchHandled = false; // prevent mousedown after touch
 
-    fab.on("mousedown", function (e) {
+    // Helper: handle pointer down
+    function handleDown(clientX, clientY) {
         isDragging = false;
         dragStarted = false;
-        startX = e.clientX;
-        startY = e.clientY;
+        startX = clientX;
+        startY = clientY;
         origLeft = fab.offset().left;
         origTop = fab.offset().top;
 
         // Long-press timer (1 second → hide FAB)
         clickTimer = setTimeout(() => {
             if (!dragStarted) {
-                // Long press detected — hide FAB
                 extension_settings[extensionName].fabEnabled = false;
                 extension_settings[extensionName].fabPosition = { top: null, left: null };
                 saveSettingsDebounced();
@@ -292,88 +293,16 @@ function createFab() {
                 toastr.info("悬浮按钮已隐藏，可在面板中重新启用。");
             }
         }, 1000);
+    }
 
-        e.preventDefault();
-    });
-
-    $(document).on("mousemove.oair_fab", function (e) {
-        if (clickTimer === null) return; // not in a mousedown session
-
-        const dx = e.clientX - startX;
-        const dy = e.clientY - startY;
-
-        if (!dragStarted && (Math.abs(dx) > 4 || Math.abs(dy) > 4)) {
-            dragStarted = true;
-            isDragging = true;
-            clearTimeout(clickTimer);
-            clickTimer = -1; // mark as cancelled
-        }
-
-        if (isDragging) {
-            fab.css({
-                left: origLeft + dx,
-                top: origTop + dy,
-                right: "auto",
-                bottom: "auto",
-            });
-        }
-    });
-
-    $(document).on("mouseup.oair_fab", function (e) {
+    // Helper: handle pointer move
+    function handleMove(clientX, clientY) {
         if (clickTimer === null) return;
+        const dx = clientX - startX;
+        const dy = clientY - startY;
+        const threshold = 8; // larger threshold for touch-friendly
 
-        if (clickTimer !== -1) {
-            clearTimeout(clickTimer);
-        }
-        clickTimer = null;
-
-        if (!isDragging) {
-            // It was a click, not a drag
-            toggleFloatingPanel();
-        } else {
-            // Save position
-            const pos = fab.offset();
-            extension_settings[extensionName].fabPosition = {
-                top: pos.top,
-                left: pos.left,
-            };
-            saveSettingsDebounced();
-        }
-
-        isDragging = false;
-        dragStarted = false;
-    });
-
-    // Touch support
-    fab.on("touchstart", function (e) {
-        const touch = e.originalEvent.touches[0];
-        isDragging = false;
-        dragStarted = false;
-        startX = touch.clientX;
-        startY = touch.clientY;
-        origLeft = fab.offset().left;
-        origTop = fab.offset().top;
-
-        clickTimer = setTimeout(() => {
-            if (!dragStarted) {
-                extension_settings[extensionName].fabEnabled = false;
-                extension_settings[extensionName].fabPosition = { top: null, left: null };
-                saveSettingsDebounced();
-                updatePanelUi();
-                removeFab();
-                toastr.info("悬浮按钮已隐藏，可在面板中重新启用。");
-            }
-        }, 1000);
-    });
-
-    fab.on("touchmove", function (e) {
-        if (clickTimer === null) return;
-
-        const touch = e.originalEvent.touches[0];
-        const dx = touch.clientX - startX;
-        const dy = touch.clientY - startY;
-
-        if (!dragStarted && (Math.abs(dx) > 4 || Math.abs(dy) > 4)) {
+        if (!dragStarted && (Math.abs(dx) > threshold || Math.abs(dy) > threshold)) {
             dragStarted = true;
             isDragging = true;
             clearTimeout(clickTimer);
@@ -387,13 +316,12 @@ function createFab() {
                 right: "auto",
                 bottom: "auto",
             });
-            e.preventDefault();
         }
-    });
+    }
 
-    fab.on("touchend", function (e) {
+    // Helper: handle pointer up
+    function handleUp() {
         if (clickTimer === null) return;
-
         if (clickTimer !== -1) {
             clearTimeout(clickTimer);
         }
@@ -412,6 +340,44 @@ function createFab() {
 
         isDragging = false;
         dragStarted = false;
+    }
+
+    // Mouse events (desktop)
+    fab.on("mousedown", function (e) {
+        if (touchHandled) { touchHandled = false; return; } // skip if touch already handled
+        handleDown(e.clientX, e.clientY);
+        e.preventDefault();
+    });
+
+    $(document).on("mousemove.oair_fab", function (e) {
+        handleMove(e.clientX, e.clientY);
+    });
+
+    $(document).on("mouseup.oair_fab", function () {
+        handleUp();
+    });
+
+    // Touch events (mobile) — these fire FIRST, then mousedown
+    fab.on("touchstart", function (e) {
+        touchHandled = true; // flag to skip the subsequent mousedown
+        const touch = e.originalEvent.touches[0];
+        handleDown(touch.clientX, touch.clientY);
+        // DON'T preventDefault here — let the touch sequence complete naturally
+    });
+
+    fab.on("touchmove", function (e) {
+        if (clickTimer === null) return;
+        const touch = e.originalEvent.touches[0];
+        handleMove(touch.clientX, touch.clientY);
+        if (isDragging) {
+            e.preventDefault(); // only prevent scroll when actually dragging
+        }
+    }, { passive: false });
+
+    fab.on("touchend", function () {
+        handleUp();
+        // Reset touchHandled after a small delay so next standalone mousedown works
+        setTimeout(() => { touchHandled = false; }, 300);
     });
 }
 
@@ -839,7 +805,7 @@ async function callLlmForText(systemPrompt, userPrompt) {
     const apiUrl = String(settings.optimizeApiUrl || "").trim() || settings.serviceUrl;
     const model = String(settings.optimizeModel || "").trim() || settings.model;
     const apiKey = String(settings.optimizeApiKey || "").trim() || settings.apiKey;
-    const endpoint = resolveChatCompletionsUrl(apiUrl);
+    const endpoint = resolveEndpoint(apiUrl, "chat");
 
     const body = {
         model,
@@ -950,7 +916,7 @@ async function requestImagesFromBackend(prompt) {
 
 async function requestViaChatCompletions(prompt) {
     const settings = extension_settings[extensionName];
-    const endpoint = resolveChatCompletionsUrl(settings.serviceUrl);
+    const endpoint = resolveEndpoint(settings.serviceUrl, "chat");
     const userPrompt = renderPrompt(settings.promptTemplate, prompt);
     const extraBody = parseOptionalJson(settings.extraBody, "额外请求体 JSON");
 
@@ -995,52 +961,14 @@ async function requestViaChatCompletions(prompt) {
 // SECTION 10: IMAGE REQUEST — IMAGES API MODE
 // ═══════════════════════════════════════════════════════════════
 
-/**
- * 解析服务地址为 /v1/images/generations 端点
- */
-function resolveImagesApiUrl(rawUrl) {
-    const input = String(rawUrl || "").trim();
-    if (!input) {
-        throw new Error("服务地址不能为空。");
-    }
-
-    let url;
-    try {
-        url = new URL(input);
-    } catch {
-        throw new Error("服务地址格式无效。");
-    }
-
-    const pathname = url.pathname.replace(/\/+$/, "");
-
-    // 已经是 images/generations 结尾
-    if (/\/images\/generations$/i.test(pathname)) {
-        return url.toString();
-    }
-
-    // 是 /v1/chat/completions 结尾 → 替换为 /v1/images/generations
-    if (/\/chat\/completions$/i.test(pathname)) {
-        url.pathname = pathname.replace(/\/chat\/completions$/i, "") + "/images/generations";
-        return url.toString();
-    }
-
-    // 是 /v1 结尾 → 追加 /images/generations
-    if (/\/v\d+$/i.test(pathname)) {
-        url.pathname = `${pathname}/images/generations`;
-        return url.toString();
-    }
-
-    // 其他 → 直接追加
-    url.pathname = `${pathname}/v1/images/generations`;
-    return url.toString();
-}
+// resolveImagesApiUrl 已被统一的 resolveEndpoint(rawUrl, "images") 替代
 
 /**
  * 通过 /v1/images/generations 接口生图
  */
 async function requestViaImagesGenerations(prompt) {
     const settings = extension_settings[extensionName];
-    const endpoint = resolveImagesApiUrl(settings.serviceUrl);
+    const endpoint = resolveEndpoint(settings.serviceUrl, "images");
     const template = settings.imagesPromptTemplate || defaultSettings.imagesPromptTemplate;
     const finalPrompt = renderPrompt(template, prompt);
     const extraBody = parseOptionalJson(settings.extraBody, "额外请求体 JSON");
@@ -1804,7 +1732,14 @@ function parseOptionalJson(value, label) {
     }
 }
 
-function resolveChatCompletionsUrl(rawUrl) {
+/**
+ * 从 serviceUrl 提取 base URL（到 /v1 为止），
+ * 然后根据 apiMode 自动拼接后续路径
+ * @param {string} rawUrl - 用户填写的服务地址
+ * @param {"chat"|"images"|"models"} apiMode - API 模式
+ * @returns {string} 完整端点 URL
+ */
+function resolveEndpoint(rawUrl, apiMode) {
     const input = String(rawUrl || "").trim();
     if (!input) {
         throw new Error("服务地址不能为空。");
@@ -1817,18 +1752,51 @@ function resolveChatCompletionsUrl(rawUrl) {
         throw new Error("服务地址格式无效。");
     }
 
-    const pathname = url.pathname.replace(/\/+$/, "");
-    if (/\/chat\/completions$/i.test(pathname)) {
-        return url.toString();
-    }
+    // Strip trailing slashes
+    let pathname = url.pathname.replace(/\/+$/, "");
 
-    if (!pathname || pathname === "") {
-        url.pathname = "/v1/chat/completions";
-        return url.toString();
-    }
+    // Strip known suffixes to get base path
+    pathname = pathname.replace(/\/(chat\/completions|images\/generations|models)$/i, "");
 
-    url.pathname = `${pathname}/chat/completions`;
+    // Append the correct path based on apiMode
+    const suffixMap = {
+        chat: "/chat/completions",
+        images: "/images/generations",
+        models: "/models",
+    };
+    const suffix = suffixMap[apiMode] || "/chat/completions";
+    url.pathname = pathname + suffix;
+
     return url.toString();
+}
+
+/**
+ * 获取模型列表 — 调用 /v1/models
+ */
+async function fetchModelList() {
+    const settings = extension_settings[extensionName];
+    const endpoint = resolveEndpoint(settings.serviceUrl, "models");
+    const apiKey = String(settings.apiKey || "").trim();
+
+    const headers = {};
+    if (apiKey) {
+        headers.Authorization = `Bearer ${apiKey}`;
+    }
+
+    const responseText = await fetchWithTimeout(
+        endpoint,
+        { method: "GET", headers },
+        10000, // 10s timeout for model list
+    );
+
+    const data = JSON.parse(responseText);
+    if (Array.isArray(data?.data)) {
+        return data.data
+            .map(m => m.id || m.name || "")
+            .filter(id => id.length > 0)
+            .sort();
+    }
+    throw new Error("模型列表格式无效");
 }
 
 function stripHtmlTags(html) {
