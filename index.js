@@ -46,8 +46,9 @@ function detectExtensionPath() {
 const extensionFolderPath = detectExtensionPath();
 
 const mainPromptKey = `${extensionName}-MAIN-PROMPT`;
-const markdownImageRegex = /!\[[^\]]*]\(([^)\s]+)\)/g;
-const looseImageUrlRegex = /((?:https?:\/\/|\/)[^\s)"']+\.(?:png|jpe?g|webp|gif|bmp|svg)(?:\?[^\s)"']*)?)/gi;
+// 使用工厂函数避免全局正则 lastIndex 状态共享问题
+const markdownImageRegex = () => /!\[[^\]]*]\(([^)\s]+)\)/g;
+const looseImageUrlRegex = () => /((?:https?:\/\/|\/)[^\s)"']+\.(?:png|jpe?g|webp|gif|bmp|svg)(?:\?[^\s)"']*)?)/gi;
 const inFlightMessages = new Set();
 
 // ═══════════════════════════════════════════════════════════════
@@ -201,7 +202,7 @@ $(function () {
 
         // Poll for #extensions_settings and inject the minimal panel
         let panelInjecting = false;
-        setInterval(() => {
+        const panelPollTimer = setInterval(() => {
             if ($("#oair_ui_drawer").length > 0 || panelInjecting) {
                 return;
             }
@@ -209,7 +210,13 @@ $(function () {
             const container = $("#extensions_settings");
             if (container.length > 0) {
                 panelInjecting = true;
-                injectPanelUi(container).finally(() => { panelInjecting = false; });
+                injectPanelUi(container).finally(() => {
+                    panelInjecting = false;
+                    // 面板注入成功后停止轮询，避免持续浪费资源
+                    if ($("#oair_ui_drawer").length > 0) {
+                        clearInterval(panelPollTimer);
+                    }
+                });
             }
         }, 1000);
 
@@ -220,6 +227,11 @@ $(function () {
 
         eventSource.on(event_types.MESSAGE_RECEIVED, onMessageReceived);
         eventSource.on(event_types.MESSAGE_RENDERED, onMessageRendered);
+
+        // 聊天切换时清理 inFlightMessages，避免旧聊天的 key 残留
+        eventSource.on(event_types.CHAT_CHANGED, () => {
+            inFlightMessages.clear();
+        });
     })();
 });
 
@@ -357,6 +369,10 @@ function createFab() {
                 extension_settings[extensionName].fabPosition = { top: null, left: null };
                 saveSettingsDebounced();
                 updatePanelUi();
+                // 同步悬浮窗内的 FAB 开关状态
+                if ($("#oair_floating_panel").hasClass("oair-floating--visible")) {
+                    updateFloatingUi();
+                }
                 removeFab();
                 toastr.info("悬浮按钮已隐藏，可在面板中重新启用。");
             }
@@ -460,7 +476,7 @@ function removeFab() {
 
 // ─── L2: Floating Panel ──────────────────────────────────────
 
-function createFloatingPanel() {
+async function createFloatingPanel() {
     if ($("#oair_floating_panel").length) return;
 
     const panel = $(`
@@ -496,27 +512,15 @@ function createFloatingPanel() {
     // Load settings_full.html content into the body
     const body = panel.find(".oair-floating-body");
 
-    // 先用内联HTML立即渲染，避免面板高度为0
-    loadFullSettings(body, SETTINGS_FULL_HTML);
-
-    // 异步尝试加载文件版本（如果成功则替换内联版本）
-    // 注意：仅当文件内容与内联版本不同时才替换，避免无意义的双重绑定
-    $.get(`${extensionFolderPath}/settings_full.html`)
-        .done((html) => {
-            // 仅在文件版本与内联版本不同时才重新加载
-            const currentHtml = body.html();
-            // 简单比较：如果长度差异超过10%，认为是不同版本
-            if (html && currentHtml && Math.abs(html.length - currentHtml.length) > currentHtml.length * 0.1) {
-                console.log(`[${extensionName}] File HTML differs from inline, reloading from file`);
-                loadFullSettings(body, html);
-            } else {
-                console.log(`[${extensionName}] Inline HTML matches file, skipping reload`);
-            }
-        })
-        .fail(() => {
-            // 内联版本已经加载，无需额外处理
-            console.log(`[${extensionName}] Using inline settings HTML (file load skipped)`);
-        });
+    // 先尝试从文件加载，失败则回退到内联 HTML
+    // 这样避免了双重加载导致的闪烁和事件重复绑定
+    try {
+        const html = await $.get(`${extensionFolderPath}/settings_full.html`);
+        loadFullSettings(body, html);
+    } catch {
+        console.log(`[${extensionName}] Using inline settings HTML (file load failed)`);
+        loadFullSettings(body, SETTINGS_FULL_HTML);
+    }
 
     // Draggable via header (mouse + touch)
     let headerDragging = false;
@@ -911,9 +915,19 @@ function bindFloatingEvents() {
             toastr.warning("没有已生成的图片可附加，请先生成图片");
             return;
         }
-        // 附加到最后一条助手消息
-        const lastMsg = chat[chat.length - 1];
-        attachGeneratedImages(lastMsg, previewImgs, ["手动生图"]);
+        // 附加到最后一条助手消息（而非任意最后一条消息）
+        let lastAssistantMsg = null;
+        for (let i = chat.length - 1; i >= 0; i--) {
+            if (!chat[i].is_user && !chat[i].is_system) {
+                lastAssistantMsg = chat[i];
+                break;
+            }
+        }
+        if (!lastAssistantMsg) {
+            // 回退：如果没有助手消息，取最后一条消息
+            lastAssistantMsg = chat[chat.length - 1];
+        }
+        attachGeneratedImages(lastAssistantMsg, previewImgs, ["手动生图"]);
         try { await context.saveChat(); } catch (_) {}
         toastr.success(`已附加 ${previewImgs.length} 张图片到消息`);
     });
@@ -1511,7 +1525,7 @@ async function onMessageReceived(messageId) {
         };
 
         updateMessageBlock(messageId, message);
-        await context.saveChat();
+        try { await context.saveChat(); } catch (e) { console.warn(`[${extensionName}] saveChat failed`, e); }
         setStatus(`已替换 ${successCount} 处匹配`, "success");
     } catch (error) {
         console.error(`[${extensionName}] Message processing failed`, error);
@@ -1545,8 +1559,9 @@ async function manualGenerate() {
             prompt = optimizedText;
         }
 
-        // 运行 NSFW 安全审查
-        prompt = await sanitizePrompt(prompt);
+        // 运行完整提示词处理流水线（优化 + NSFW安全审查）
+        // 如果已有手动优化结果，forceOptimize=false 跳过再次自动优化
+        prompt = await processPromptPipeline(prompt, { forceOptimize: !optimizedText });
 
         const result = await requestImagesFromBackend(prompt);
         renderManualPreview(result.images, result.content);
@@ -1718,7 +1733,7 @@ async function generateFromMessage(messageId) {
                 source: "message-gen",
             };
             updateMessageBlock(messageId, message);
-            await context.saveChat();
+            try { await context.saveChat(); } catch (e) { console.warn(`[${extensionName}] saveChat failed`, e); }
             setStatus("消息生图完成", "success");
             toastr.success("消息生图完成！");
         } else {
@@ -1772,7 +1787,7 @@ async function summarizeAndGenerate(messageId) {
                 source: "summarize-gen",
             };
             updateMessageBlock(messageId, message);
-            await context.saveChat();
+            try { await context.saveChat(); } catch (e) { console.warn(`[${extensionName}] saveChat failed`, e); }
             setStatus("总结生图完成", "success");
             toastr.success("总结生图完成！");
         } else {
@@ -1883,27 +1898,41 @@ function extractContentFromPayload(data) {
 
 function extractImagesFromPayload(data, endpoint, responseImageRegexSetting) {
     const collected = [];
+
+    // 优先处理结构化图片字段
     const structuredSources = [
         data?.media,
         data?.choices?.[0]?.message?.media,
         data?.images,
         data?.choices?.[0]?.message?.images,
-        data?.choices?.[0]?.message?.content,
     ];
 
     for (const source of structuredSources) {
         collectStructuredImages(source, endpoint, collected);
     }
 
-    const content = extractContentFromPayload(data);
-    if (content) {
+    // 处理多模态 content 数组中的 image_url 类型项（GPT-4V 风格响应）
+    const content = data?.choices?.[0]?.message?.content;
+    if (Array.isArray(content)) {
+        for (const item of content) {
+            if (item?.type === "image_url" && item?.image_url?.url) {
+                pushImageCandidate(item.image_url.url, endpoint, collected);
+            }
+            // 兼容其他可能的图片类型结构
+            collectStructuredImages(item, endpoint, collected);
+        }
+    }
+
+    // 从文本内容中提取图片（Markdown链接、宽松URL等）
+    const textContent = extractContentFromPayload(data);
+    if (textContent) {
         const customRegex = safeParseRegex(responseImageRegexSetting);
         if (customRegex) {
-            collectImagesFromText(content, customRegex, endpoint, collected);
+            collectImagesFromText(textContent, customRegex, endpoint, collected);
         }
 
-        collectImagesFromText(content, markdownImageRegex, endpoint, collected);
-        collectImagesFromText(content, looseImageUrlRegex, endpoint, collected);
+        collectImagesFromText(textContent, markdownImageRegex(), endpoint, collected);
+        collectImagesFromText(textContent, looseImageUrlRegex(), endpoint, collected);
     }
 
     return dedupeStrings(collected);
@@ -1969,8 +1998,7 @@ function looksLikeImageRef(value) {
         return true;
     }
 
-    looseImageUrlRegex.lastIndex = 0;
-    return looseImageUrlRegex.test(text);
+    return looseImageUrlRegex().test(text);
 }
 
 function collectImagesFromText(text, regex, endpoint, output) {
@@ -2164,7 +2192,7 @@ async function fetchModelList() {
     const responseText = await fetchWithTimeout(
         endpoint,
         { method: "GET", headers },
-        10000, // 10s timeout for model list
+        Math.min(30000, Number(settings.timeoutMs) || defaultSettings.timeoutMs),
     );
 
     const data = JSON.parse(responseText);
@@ -2199,7 +2227,7 @@ async function fetchOptimizeModelList() {
     const responseText = await fetchWithTimeout(
         endpoint,
         { method: "GET", headers },
-        10000,
+        Math.min(30000, Number(settings.timeoutMs) || defaultSettings.timeoutMs),
     );
 
     const data = JSON.parse(responseText);
