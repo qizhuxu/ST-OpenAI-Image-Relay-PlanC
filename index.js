@@ -362,8 +362,8 @@ function createFab() {
         touchHandled = true; // flag to skip the subsequent mousedown
         const touch = e.originalEvent.touches[0];
         handleDown(touch.clientX, touch.clientY);
-        // DON'T preventDefault here — let the touch sequence complete naturally
-    });
+        e.preventDefault(); // prevent ghost click, double-tap zoom, and scroll
+    }, { passive: false });
 
     fab.on("touchmove", function (e) {
         if (clickTimer === null) return;
@@ -374,11 +374,12 @@ function createFab() {
         }
     }, { passive: false });
 
-    fab.on("touchend", function () {
+    fab.on("touchend", function (e) {
+        e.preventDefault(); // prevent ghost click event
         handleUp();
         // Reset touchHandled after a small delay so next standalone mousedown works
-        setTimeout(() => { touchHandled = false; }, 300);
-    });
+        setTimeout(() => { touchHandled = false; }, 400);
+    }, { passive: false });
 }
 
 function removeFab() {
