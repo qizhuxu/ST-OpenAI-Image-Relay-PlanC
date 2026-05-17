@@ -550,14 +550,16 @@ $(function () {
         loadStylesheet();
 
         // Poll for #extensions_settings and inject the minimal panel
+        let panelInjecting = false;
         setInterval(() => {
-            if ($("#oair_ui_drawer").length > 0) {
+            if ($("#oair_ui_drawer").length > 0 || panelInjecting) {
                 return;
             }
 
             const container = $("#extensions_settings");
             if (container.length > 0) {
-                injectPanelUi(container);
+                panelInjecting = true;
+                injectPanelUi(container).finally(() => { panelInjecting = false; });
             }
         }, 1000);
 
@@ -645,11 +647,23 @@ function bindPanelEvents() {
         return val;
     });
 
-    // Open floating config button
+    // Open floating config button — 直绑 + 事件委托双保险
     $("#oair_btn_open_floating").off("click").on("click", (e) => {
         e.preventDefault();
+        e.stopPropagation();
+        console.log(`[${extensionName}] "打开详细配置" button clicked (direct bind)`);
         toggleFloatingPanel();
     });
+
+    // 事件委托后备：防止直绑因 DOM 重建丢失
+    $(document).off("click.oair_open_floating").on("click.oair_open_floating", "#oair_btn_open_floating", (e) => {
+        e.preventDefault();
+        e.stopPropagation();
+        console.log(`[${extensionName}] "打开详细配置" button clicked (delegated)`);
+        toggleFloatingPanel();
+    });
+
+    console.log(`[${extensionName}] Panel events bound`);
 }
 
 // ─── L1: FAB (Floating Action Button) ────────────────────────
@@ -800,7 +814,7 @@ function createFloatingPanel() {
     if ($("#oair_floating_panel").length) return;
 
     const panel = $(`
-        <div id="oair_floating_panel">
+        <div id="oair_floating_panel" style="min-height:400px; height:auto; position:fixed; z-index:3000; overflow:hidden; flex-direction:column;">
             <div class="oair-floating-header">
                 <h3>🖼️ 图片中继 - 详细配置</h3>
                 <button class="oair-floating-close" title="关闭"><i class="fa-solid fa-xmark"></i></button>
@@ -818,16 +832,24 @@ function createFloatingPanel() {
     panel.appendTo("body");
 
     // Load settings_full.html content into the body
-    // 优先尝试文件加载，失败时使用内联HTML
     const body = panel.find(".oair-floating-body");
 
     // 先用内联HTML立即渲染，避免面板高度为0
     loadFullSettings(body, SETTINGS_FULL_HTML);
 
     // 异步尝试加载文件版本（如果成功则替换内联版本）
+    // 注意：仅当文件内容与内联版本不同时才替换，避免无意义的双重绑定
     $.get(`${extensionFolderPath}/settings_full.html`)
         .done((html) => {
-            loadFullSettings(body, html);
+            // 仅在文件版本与内联版本不同时才重新加载
+            const currentHtml = body.html();
+            // 简单比较：如果长度差异超过10%，认为是不同版本
+            if (html && currentHtml && Math.abs(html.length - currentHtml.length) > currentHtml.length * 0.1) {
+                console.log(`[${extensionName}] File HTML differs from inline, reloading from file`);
+                loadFullSettings(body, html);
+            } else {
+                console.log(`[${extensionName}] Inline HTML matches file, skipping reload`);
+            }
         })
         .fail(() => {
             // 内联版本已经加载，无需额外处理
@@ -870,6 +892,8 @@ function createFloatingPanel() {
             closeFloatingPanel();
         }
     });
+
+    console.log(`[${extensionName}] Floating panel created`);
 }
 
 function closeFloatingPanel() {
@@ -878,11 +902,21 @@ function closeFloatingPanel() {
 
     panel.removeClass("oair-floating--visible");
 
+    // 清除 toggleFloatingPanel 添加的内联样式，让 CSS 接管
+    panel.css({
+        display: "",
+        visibility: "",
+        minHeight: "",
+        height: "",
+    });
+
     // Clean up document-level event handlers
     $(document).off("mousemove.oair_floating mouseup.oair_floating keydown.oair_floating");
 
     // Sync panel UI when closing (in case enabled/fabEnabled changed in floating window)
     updatePanelUi();
+
+    console.log(`[${extensionName}] Floating panel closed`);
 }
 
 function toggleFloatingPanel() {
@@ -891,7 +925,23 @@ function toggleFloatingPanel() {
     if (!panel.length) {
         // Create the panel lazily — 内容已同步加载，直接显示
         createFloatingPanel();
-        $("#oair_floating_panel").addClass("oair-floating--visible");
+        const newPanel = $("#oair_floating_panel");
+        newPanel.addClass("oair-floating--visible");
+
+        // 强制保障面板可见性和高度（防止 SillyTavern 主题 CSS 覆盖）
+        newPanel.css({
+            display: "flex",
+            visibility: "visible",
+            minHeight: "400px",
+            height: "auto",
+        });
+
+        // 强制浏览器重绘
+        void newPanel[0]?.offsetHeight;
+
+        // 调试日志：输出面板实际尺寸
+        const rect = newPanel[0]?.getBoundingClientRect();
+        console.log(`[${extensionName}] Panel shown: ${rect?.width}x${rect?.height} at (${rect?.left},${rect?.top})`);
         return;
     }
 
@@ -949,6 +999,21 @@ function toggleFloatingPanel() {
         $(targetTab).prop("checked", true);
 
         panel.addClass("oair-floating--visible");
+
+        // 强制保障面板可见性和高度
+        panel.css({
+            display: "flex",
+            visibility: "visible",
+            minHeight: "400px",
+            height: "auto",
+        });
+
+        // 强制浏览器重绘
+        void panel[0]?.offsetHeight;
+
+        // 调试日志
+        const rect = panel[0]?.getBoundingClientRect();
+        console.log(`[${extensionName}] Panel shown: ${rect?.width}x${rect?.height} at (${rect?.left},${rect?.top})`);
     }
 }
 

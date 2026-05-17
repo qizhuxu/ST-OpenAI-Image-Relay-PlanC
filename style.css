@@ -164,25 +164,32 @@
 
 /* ─── 悬浮配置窗口 ──────────────────────────────────────────── */
 #oair_floating_panel {
-    display: none;
-    position: fixed;
-    z-index: 3000;
-    width: 560px;
-    min-width: 480px;
-    max-width: 720px;
-    min-height: 400px;
-    max-height: 80vh;
-    background: var(--SmartThemeBlurTintColor, rgba(30, 30, 50, 0.98));
-    border: 1px solid var(--SmartThemeBorderColor, rgba(255,255,255,0.15));
-    border-radius: 12px;
-    box-shadow: 0 8px 40px rgba(0, 0, 0, 0.6);
+    display: none !important;
+    position: fixed !important;
+    z-index: 3000 !important;
+    width: 560px !important;
+    min-width: 480px !important;
+    max-width: 720px !important;
+    min-height: 400px !important;
+    max-height: 80vh !important;
+    background: var(--SmartThemeBlurTintColor, rgba(30, 30, 50, 0.98)) !important;
+    border: 1px solid var(--SmartThemeBorderColor, rgba(255,255,255,0.15)) !important;
+    border-radius: 12px !important;
+    box-shadow: 0 8px 40px rgba(0, 0, 0, 0.6) !important;
     backdrop-filter: blur(16px);
-    overflow: hidden;
-    flex-direction: column;
+    overflow: hidden !important;
+    flex-direction: column !important;
+    visibility: visible !important;
+    pointer-events: auto !important;
+    opacity: 1 !important;
 }
 
 #oair_floating_panel.oair-floating--visible {
-    display: flex;
+    display: flex !important;
+    min-height: 400px !important;
+    height: auto !important;
+    visibility: visible !important;
+    pointer-events: auto !important;
 }
 
 /* 悬浮窗标题栏 */
