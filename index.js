@@ -468,14 +468,20 @@ function createFloatingPanel() {
     panel.appendTo("body");
 
     // Load settings_full.html content into the body
+    // 优先尝试文件加载，失败时使用内联HTML
     const body = panel.find(".oair-floating-body");
+
+    // 先用内联HTML立即渲染，避免面板高度为0
+    loadFullSettings(body, SETTINGS_FULL_HTML);
+
+    // 异步尝试加载文件版本（如果成功则替换内联版本）
     $.get(`${extensionFolderPath}/settings_full.html`)
         .done((html) => {
             loadFullSettings(body, html);
         })
-        .fail((error) => {
-            console.warn(`[${extensionName}] Failed to load settings_full.html, using inline fallback`);
-            loadFullSettings(body, SETTINGS_FULL_HTML);
+        .fail(() => {
+            // 内联版本已经加载，无需额外处理
+            console.log(`[${extensionName}] Using inline settings HTML (file load skipped)`);
         });
 
     // Draggable via header
@@ -533,12 +539,9 @@ function toggleFloatingPanel() {
     const panel = $("#oair_floating_panel");
 
     if (!panel.length) {
-        // Create the panel lazily
+        // Create the panel lazily — 内容已同步加载，直接显示
         createFloatingPanel();
-        // The panel will be shown after content loads — add visible class after a tick
-        setTimeout(() => {
-            $("#oair_floating_panel").addClass("oair-floating--visible");
-        }, 50);
+        $("#oair_floating_panel").addClass("oair-floating--visible");
         return;
     }
 

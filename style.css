@@ -170,14 +170,14 @@
     width: 560px;
     min-width: 480px;
     max-width: 720px;
+    min-height: 400px;
     max-height: 80vh;
     background: var(--SmartThemeBlurTintColor, rgba(30, 30, 50, 0.98));
     border: 1px solid var(--SmartThemeBorderColor, rgba(255,255,255,0.15));
     border-radius: 12px;
     box-shadow: 0 8px 40px rgba(0, 0, 0, 0.6);
     backdrop-filter: blur(16px);
-    overflow-y: auto;
-    overflow-x: hidden;
+    overflow: hidden;
     flex-direction: column;
 }
 
