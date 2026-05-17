@@ -254,6 +254,14 @@
     .oair-details .oair-details-content {
         margin-top: 6px;
     }
+
+    /* ─── 新增：自定义优化LLM后端复选框展开 ────────────── */
+    .oair-custom-backend-content {
+        display: none;
+    }
+    .oair-custom-backend-content.oair-visible {
+        display: block;
+    }
 </style>
 
 <div class="oair-settings-ui">
@@ -288,7 +296,7 @@
     <div class="oair-tab-panel" id="oair_panel_basic">
         <div class="oair-section">
             <div class="oair-section-title">主模型提示注入</div>
-            <details open class="oair-details">
+            <details class="oair-details">
                 <summary>世界书式默认提示词</summary>
                 <div class="oair-details-content">
                     <textarea id="oair_main_prompt" class="text_pole" rows="12" style="width:100%; box-sizing:border-box;" placeholder="这里的内容会像常驻世界书一样注入到主模型提示链里。"></textarea>
@@ -461,25 +469,31 @@
             <label class="oair-field-label">优化模板</label>
             <textarea id="oair_optimize_template" class="text_pole" rows="10" style="width:100%; box-sizing:border-box;" placeholder="优化提示词的模板，使用 {{prompt}} 插入原始提示词。"></textarea>
 
-            <!-- 自定义优化 LLM 后端（展开，不在 details 里） -->
+            <!-- 自定义优化 LLM 后端（复选框控制展开） -->
             <div style="margin-top:10px;">
-                <div style="font-size:0.82em; font-weight:bold; opacity:0.85; margin-bottom:6px;">自定义优化 LLM 后端</div>
+                <label class="oair-toggle-label">
+                    <input id="oair_optimize_use_custom" type="checkbox">
+                    使用自定义优化 LLM 后端
+                </label>
+                <div class="oair-hint">勾选后展开自定义后端配置，留空时默认使用酒馆主API</div>
 
-                <label class="oair-field-label">优化 LLM 服务地址</label>
-                <input id="oair_optimize_api_url" class="text_pole" style="width:100%; box-sizing:border-box;" placeholder="留空则使用酒馆主API">
-                <div class="oair-hint">留空则使用酒馆主API</div>
+                <div class="oair-custom-backend-content" id="oair_custom_backend_fields">
+                    <label class="oair-field-label">优化 LLM 服务地址</label>
+                    <input id="oair_optimize_api_url" class="text_pole" style="width:100%; box-sizing:border-box;" placeholder="留空则使用酒馆主API">
+                    <div class="oair-hint">留空则使用酒馆主API</div>
 
-                <label class="oair-field-label">优化 LLM 模型</label>
-                <input id="oair_optimize_model" class="text_pole" style="width:100%; box-sizing:border-box;" placeholder="留空则使用酒馆主模型">
-                <div class="oair-hint">留空则使用酒馆主模型</div>
+                    <label class="oair-field-label">优化 LLM 模型</label>
+                    <input id="oair_optimize_model" class="text_pole" style="width:100%; box-sizing:border-box;" placeholder="留空则使用酒馆主模型">
+                    <div class="oair-hint">留空则使用酒馆主模型</div>
 
-                <label class="oair-field-label">优化 LLM API 密钥</label>
-                <div class="oair-password-row">
-                    <input id="oair_optimize_api_key" type="password" class="text_pole" placeholder="留空则使用酒馆主API密钥">
-                    <button type="button" class="oair-eye-btn" title="显示/隐藏密钥"><i class="fa-solid fa-eye"></i></button>
+                    <label class="oair-field-label">优化 LLM API 密钥</label>
+                    <div class="oair-password-row">
+                        <input id="oair_optimize_api_key" type="password" class="text_pole" placeholder="留空则使用酒馆主API密钥">
+                        <button type="button" class="oair-eye-btn" title="显示/隐藏密钥"><i class="fa-solid fa-eye"></i></button>
+                    </div>
+
+                    <div class="oair-hint" style="margin-top:6px;">留空时，优化功能将使用酒馆主API（而非图片生成API）进行提示词优化</div>
                 </div>
-
-                <div class="oair-hint" style="margin-top:6px;">留空时，优化功能将使用酒馆主API（而非图片生成API）进行提示词优化</div>
             </div>
         </div>
 

@@ -167,10 +167,10 @@
     display: none;
     position: fixed;
     z-index: 3000;
-    width: 480px;
-    min-width: 420px;
-    max-width: 560px;
-    max-height: calc(100vh - 40px);
+    width: 560px;
+    min-width: 480px;
+    max-width: 720px;
+    max-height: 80vh;
     background: var(--SmartThemeBlurTintColor, rgba(30, 30, 50, 0.98));
     border: 1px solid var(--SmartThemeBorderColor, rgba(255,255,255,0.15));
     border-radius: 12px;
@@ -343,4 +343,12 @@
 }
 .oair-details[open] summary {
     opacity: 0.85;
+}
+
+/* ─── 自定义优化LLM后端复选框展开 ───────────────────────── */
+.oair-custom-backend-content {
+    display: none;
+}
+.oair-custom-backend-content.oair-visible {
+    display: block;
 }
