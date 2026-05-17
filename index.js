@@ -23,13 +23,24 @@ const extensionName = "ST-OpenAI-Image-Relay";
 
 // 动态检测实际扩展文件夹名（仓库名可能与 extensionName 不同）
 function detectExtensionPath() {
-    // 从当前 <script> 标签的 src 属性提取路径
+    // 方法1: 使用 import.meta.url（ES模块最可靠的方式）
+    try {
+        const url = new URL(import.meta.url);
+        const match = url.pathname.match(/^\/(scripts\/extensions\/third-party\/[^/]+)/);
+        if (match) return match[1];
+    } catch (e) {
+        // import.meta 可能不可用，继续尝试其他方法
+    }
+
+    // 方法2: 从 <script> 标签的 src 属性提取路径
     const scripts = document.querySelectorAll('script[src*="extensions/third-party"]');
     for (const s of scripts) {
         const m = s.src.match(/scripts\/extensions\/third-party\/([^/]+)\//);
         if (m) return `scripts/extensions/third-party/${m[1]}`;
     }
-    // 回退到默认
+
+    // 方法3: 回退到默认（使用 extensionName）
+    console.warn(`[${extensionName}] Could not detect extension folder path, using default: ${extensionName}`);
     return `scripts/extensions/third-party/${extensionName}`;
 }
 const extensionFolderPath = detectExtensionPath();
