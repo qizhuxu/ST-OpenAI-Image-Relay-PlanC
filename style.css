@@ -112,7 +112,9 @@
 @media (max-width: 768px) {
     #oair_floating_panel {
         width: calc(100vw - 16px);
-        max-width: 360px;
+        max-width: none;
+        min-width: unset;
+        left: 8px !important;
         max-height: 70vh;
         border-radius: 10px;
     }
@@ -127,6 +129,7 @@
 
     .oair-floating-body {
         padding: 6px 8px;
+        overflow-x: hidden;
     }
 
     /* 更紧凑的表单 */
@@ -150,10 +153,10 @@
 @media (max-width: 400px) {
     #oair_floating_panel {
         width: calc(100vw - 8px);
+        left: 4px !important;
         max-width: none;
         max-height: 65vh;
         top: 50% !important;
-        left: 50% !important;
         transform: translate(-50%, -50%);
         border-radius: 10px;
     }
@@ -165,14 +168,16 @@
     position: fixed;
     z-index: 3000;
     width: 480px;
-    max-width: calc(100vw - 20px);
-    max-height: calc(100vh - 80px);
+    min-width: 420px;
+    max-width: 560px;
+    max-height: calc(100vh - 40px);
     background: var(--SmartThemeBlurTintColor, rgba(30, 30, 50, 0.98));
     border: 1px solid var(--SmartThemeBorderColor, rgba(255,255,255,0.15));
     border-radius: 12px;
     box-shadow: 0 8px 40px rgba(0, 0, 0, 0.6);
     backdrop-filter: blur(16px);
-    overflow: hidden;
+    overflow-y: auto;
+    overflow-x: hidden;
     flex-direction: column;
 }
 
@@ -250,4 +255,92 @@
     font-size: 0.72em;
     opacity: 0.6;
     line-height: 1.4;
+}
+
+/* ─── 密码行与眼睛按钮 ──────────────────────────────────── */
+.oair-password-row {
+    display: flex;
+    gap: 4px;
+    align-items: center;
+}
+.oair-password-row input {
+    flex: 1;
+    min-width: 0;
+}
+.oair-eye-btn {
+    flex-shrink: 0;
+    width: 34px;
+    height: 34px;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    border: 1px solid rgba(255,255,255,0.15);
+    border-radius: 4px;
+    background: rgba(255,255,255,0.05);
+    color: rgba(255,255,255,0.6);
+    cursor: pointer;
+    transition: all 0.15s;
+    font-size: 0.85em;
+}
+.oair-eye-btn:hover {
+    background: rgba(255,255,255,0.12);
+    color: rgba(255,255,255,0.9);
+}
+
+/* ─── 模型行与获取按钮 ──────────────────────────────────── */
+.oair-model-row {
+    display: flex;
+    gap: 4px;
+    align-items: center;
+}
+.oair-model-row input {
+    flex: 1;
+    min-width: 0;
+}
+#oair_model_select {
+    display: none;
+    width: 100%;
+    margin-top: 4px;
+}
+#oair_model_select.oair-visible {
+    display: block;
+}
+
+/* ─── 保存行（超时 + 保存按钮） ────────────────────────── */
+.oair-save-row {
+    display: flex;
+    gap: 6px;
+    align-items: center;
+}
+.oair-save-row input {
+    flex: 1;
+    min-width: 0;
+}
+
+/* ─── 折叠区域 details/summary ─────────────────────────── */
+.oair-details {
+    margin-top: 8px;
+}
+.oair-details summary {
+    font-size: 0.78em;
+    cursor: pointer;
+    opacity: 0.7;
+    padding: 4px 0;
+    user-select: none;
+    list-style: none;
+}
+.oair-details summary::-webkit-details-marker {
+    display: none;
+}
+.oair-details summary::before {
+    content: "▶ ";
+    font-size: 0.7em;
+    display: inline-block;
+    transition: transform 0.15s;
+}
+.oair-details[open] summary::before {
+    transform: rotate(90deg);
+}
+.oair-details[open] summary {
+    opacity: 0.85;
 }

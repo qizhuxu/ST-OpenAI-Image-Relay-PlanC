@@ -135,6 +135,125 @@
         background: rgba(255,80,80,0.2);
         color: #ff9090;
     }
+
+    /* ─── 新增：输入+按钮组合行 ─────────────────────────── */
+    .oair-input-with-btn {
+        display: flex;
+        gap: 6px;
+        align-items: center;
+    }
+    .oair-input-with-btn .text_pole {
+        flex: 1;
+        min-width: 0;
+    }
+    .oair-input-with-btn .menu_button {
+        flex-shrink: 0;
+        white-space: nowrap;
+    }
+
+    /* ─── 新增：密码行（输入+眼睛按钮） ─────────────────── */
+    .oair-password-row {
+        display: flex;
+        gap: 6px;
+        align-items: center;
+    }
+    .oair-password-row .text_pole {
+        flex: 1;
+        min-width: 0;
+    }
+    .oair-password-row .oair-eye-btn {
+        flex-shrink: 0;
+        width: 32px;
+        height: 32px;
+        display: flex;
+        align-items: center;
+        justify-content: center;
+        background: rgba(255,255,255,0.08);
+        border: 1px solid rgba(255,255,255,0.15);
+        border-radius: 4px;
+        color: var(--SmartThemeBodyColor, #ccc);
+        cursor: pointer;
+        font-size: 13px;
+        transition: background 0.15s;
+    }
+    .oair-password-row .oair-eye-btn:hover {
+        background: rgba(255,255,255,0.15);
+    }
+
+    /* ─── 新增：模型行（输入+获取按钮） ─────────────────── */
+    .oair-model-row {
+        display: flex;
+        gap: 6px;
+        align-items: center;
+    }
+    .oair-model-row .text_pole {
+        flex: 1;
+        min-width: 0;
+    }
+    .oair-model-row .menu_button {
+        flex-shrink: 0;
+        white-space: nowrap;
+    }
+
+    /* ─── 新增：模型选择下拉 ─────────────────────────────── */
+    #oair_model_select {
+        width: 100%;
+        margin-top: 4px;
+        display: none;
+    }
+    #oair_model_select.oair-visible {
+        display: block;
+    }
+
+    /* ─── 新增：保存行（超时+保存按钮） ─────────────────── */
+    .oair-save-row {
+        display: flex;
+        gap: 6px;
+        align-items: center;
+    }
+    .oair-save-row .text_pole {
+        flex: 1;
+        min-width: 0;
+    }
+    .oair-save-row .menu_button {
+        flex-shrink: 0;
+        white-space: nowrap;
+    }
+
+    /* ─── 新增：Details/Summary 折叠样式 ──────────────── */
+    .oair-details {
+        margin-top: 8px;
+    }
+    .oair-details summary {
+        font-size: 0.78em;
+        cursor: pointer;
+        opacity: 0.7;
+        padding: 4px 0;
+        user-select: none;
+        list-style: none;
+        display: flex;
+        align-items: center;
+        gap: 4px;
+    }
+    .oair-details summary::-webkit-details-marker {
+        display: none;
+    }
+    .oair-details summary::before {
+        content: "▸";
+        display: inline-block;
+        width: 12px;
+        text-align: center;
+        transition: transform 0.15s;
+    }
+    .oair-details[open] summary::before {
+        transform: rotate(90deg);
+    }
+    .oair-details summary:hover {
+        opacity: 1;
+    }
+    .oair-details .oair-details-content {
+        margin-top: 6px;
+    }
 </style>
 
 <div class="oair-settings-ui">
@@ -169,9 +288,13 @@
     <div class="oair-tab-panel" id="oair_panel_basic">
         <div class="oair-section">
             <div class="oair-section-title">主模型提示注入</div>
-            <label class="oair-field-label">世界书式默认提示词</label>
-            <textarea id="oair_main_prompt" class="text_pole" rows="12" style="width:100%; box-sizing:border-box;" placeholder="这里的内容会像常驻世界书一样注入到主模型提示链里。"></textarea>
-            <div class="oair-hint">这段文字会以系统规则的方式自动注入到主模型提示链开头，不会发送给图片后端。</div>
+            <details open class="oair-details">
+                <summary>世界书式默认提示词</summary>
+                <div class="oair-details-content">
+                    <textarea id="oair_main_prompt" class="text_pole" rows="12" style="width:100%; box-sizing:border-box;" placeholder="这里的内容会像常驻世界书一样注入到主模型提示链里。"></textarea>
+                    <div class="oair-hint">这段文字会以系统规则的方式自动注入到主模型提示链开头，不会发送给图片后端。</div>
+                </div>
+            </details>
         </div>
 
         <div class="oair-section">
@@ -206,60 +329,79 @@
 
         <div class="oair-section">
             <div class="oair-section-title">连接配置</div>
-            <label class="oair-field-label">服务地址</label>
-            <input id="oair_service_url" class="text_pole" style="width:100%; box-sizing:border-box;" placeholder="http://127.0.0.1:8199/v1/chat/completions">
 
-            <div class="oair-row">
-                <div>
-                    <label class="oair-field-label">API 密钥</label>
-                    <input id="oair_api_key" class="text_pole" style="width:100%; box-sizing:border-box;" placeholder="sk-any">
-                </div>
-                <div>
-                    <label class="oair-field-label">模型</label>
-                    <input id="oair_model" class="text_pole" style="width:100%; box-sizing:border-box;" placeholder="any">
-                </div>
+            <!-- 服务地址 -->
+            <label class="oair-field-label">服务地址</label>
+            <input id="oair_service_url" class="text_pole" style="width:100%; box-sizing:border-box;" placeholder="http://127.0.0.1:8199/v1">
+            <div class="oair-hint">只填到 /v1，路径后缀根据API模式自动补全</div>
+
+            <!-- API 密钥（带眼睛按钮） -->
+            <label class="oair-field-label">API 密钥</label>
+            <div class="oair-password-row">
+                <input id="oair_api_key" type="password" class="text_pole" placeholder="sk-any">
+                <button type="button" class="oair-eye-btn" title="显示/隐藏密钥"><i class="fa-solid fa-eye"></i></button>
             </div>
 
+            <!-- 模型（输入+获取按钮+隐藏下拉） -->
+            <label class="oair-field-label">模型</label>
+            <div class="oair-model-row">
+                <input id="oair_model" class="text_pole" placeholder="any">
+                <button id="oair_btn_fetch_model" class="menu_button">获取模型</button>
+            </div>
+            <select id="oair_model_select" class="text_pole"></select>
+
+            <!-- 超时+保存按钮 -->
             <label class="oair-field-label">超时（毫秒）</label>
-            <input id="oair_timeout_ms" type="number" min="1000" step="1000" class="text_pole" style="width:100%; box-sizing:border-box;">
+            <div class="oair-save-row">
+                <input id="oair_timeout_ms" type="number" min="1000" step="1000" class="text_pole" placeholder="120000">
+                <button id="oair_btn_save_api" class="menu_button">💾 保存设置</button>
+            </div>
         </div>
 
         <!-- Chat Completions 专属字段 -->
         <div class="oair-section oair-chat-api-fields">
-            <div class="oair-section-title">Chat Completions 模板</div>
-            <label class="oair-field-label">发送给图片后端的模板</label>
-            <textarea id="oair_prompt_template" class="text_pole" rows="3" style="width:100%; box-sizing:border-box;" placeholder="在需要插入提取内容的位置使用 {{prompt}}。"></textarea>
-            <div class="oair-hint">将提取出的提示词包装后发给 chat completions 后端。</div>
+            <details class="oair-details">
+                <summary>Chat Completions 模板</summary>
+                <div class="oair-details-content">
+                    <label class="oair-field-label">发送给图片后端的模板</label>
+                    <textarea id="oair_prompt_template" class="text_pole" rows="3" style="width:100%; box-sizing:border-box;" placeholder="在需要插入提取内容的位置使用 {{prompt}}。"></textarea>
+                    <div class="oair-hint">将提取出的提示词包装后发给 chat completions 后端。</div>
+                </div>
+            </details>
         </div>
 
         <!-- Images API 专属字段 -->
         <div class="oair-section oair-images-api-fields" style="display:none;">
-            <div class="oair-section-title">Images API 参数</div>
-            <label class="oair-field-label">发送给图片后端的模板</label>
-            <textarea id="oair_images_prompt_template" class="text_pole" rows="2" style="width:100%; box-sizing:border-box;" placeholder="{{prompt}}（默认直通，不包装）"></textarea>
+            <details class="oair-details">
+                <summary>Images API 参数</summary>
+                <div class="oair-details-content">
+                    <label class="oair-field-label">发送给图片后端的模板</label>
+                    <textarea id="oair_images_prompt_template" class="text_pole" rows="2" style="width:100%; box-sizing:border-box;" placeholder="{{prompt}}（默认直通，不包装）"></textarea>
 
-            <div class="oair-row">
-                <div>
-                    <label class="oair-field-label">图片尺寸</label>
-                    <select id="oair_image_size" class="text_pole" style="width:100%; box-sizing:border-box;">
-                        <option value="256x256">256x256</option>
-                        <option value="512x512">512x512</option>
-                        <option value="1024x1024">1024x1024</option>
-                        <option value="1024x1792">1024x1792</option>
-                        <option value="1792x1024">1792x1024</option>
+                    <div class="oair-row">
+                        <div>
+                            <label class="oair-field-label">图片尺寸</label>
+                            <select id="oair_image_size" class="text_pole" style="width:100%; box-sizing:border-box;">
+                                <option value="256x256">256x256</option>
+                                <option value="512x512">512x512</option>
+                                <option value="1024x1024">1024x1024</option>
+                                <option value="1024x1792">1024x1792</option>
+                                <option value="1792x1024">1792x1024</option>
+                            </select>
+                        </div>
+                        <div>
+                            <label class="oair-field-label">生成数量</label>
+                            <input id="oair_image_count" type="number" min="1" max="10" class="text_pole" style="width:100%; box-sizing:border-box;">
+                        </div>
+                    </div>
+
+                    <label class="oair-field-label">响应格式</label>
+                    <select id="oair_image_response_format" class="text_pole" style="width:100%; box-sizing:border-box;">
+                        <option value="url">URL（返回图片链接）</option>
+                        <option value="b64_json">Base64（返回图片数据）</option>
                     </select>
                 </div>
-                <div>
-                    <label class="oair-field-label">生成数量</label>
-                    <input id="oair_image_count" type="number" min="1" max="10" class="text_pole" style="width:100%; box-sizing:border-box;">
-                </div>
-            </div>
-
-            <label class="oair-field-label">响应格式</label>
-            <select id="oair_image_response_format" class="text_pole" style="width:100%; box-sizing:border-box;">
-                <option value="url">URL（返回图片链接）</option>
-                <option value="b64_json">Base64（返回图片数据）</option>
-            </select>
+            </details>
         </div>
 
         <div class="oair-section">
@@ -275,15 +417,23 @@
     <div class="oair-tab-panel" id="oair_panel_extract">
         <div class="oair-section">
             <div class="oair-section-title">提取提示词正则</div>
-            <label class="oair-field-label">从助手回复中提取生图提示词</label>
-            <textarea id="oair_extraction_regex" class="text_pole" rows="3" style="width:100%; box-sizing:border-box;" placeholder='/&lt;pic[^&gt;]*prompt="([^"]+)"[^&gt;]*&gt;/g'></textarea>
+            <details class="oair-details">
+                <summary>从助手回复中提取生图提示词</summary>
+                <div class="oair-details-content">
+                    <textarea id="oair_extraction_regex" class="text_pole" rows="3" style="width:100%; box-sizing:border-box;" placeholder='/&lt;pic[^&gt;]*prompt="([^"]+)"[^&gt;]*&gt;/g'></textarea>
+                </div>
+            </details>
         </div>
 
         <div class="oair-section">
             <div class="oair-section-title">返回图片正则回退</div>
-            <label class="oair-field-label">当后端把图片链接放在文本里返回时使用</label>
-            <textarea id="oair_response_image_regex" class="text_pole" rows="2" style="width:100%; box-sizing:border-box;" placeholder='/!\\[[^\\]]*\\]\\(([^)\\s]+)\\)/g'></textarea>
-            <div class="oair-hint">扩展会优先读取 <code>media</code> 这类结构化图片字段。只有当后端把图片链接放在文本里返回时，才会使用这里的回退正则。</div>
+            <details class="oair-details">
+                <summary>当后端把图片链接放在文本里返回时使用</summary>
+                <div class="oair-details-content">
+                    <textarea id="oair_response_image_regex" class="text_pole" rows="2" style="width:100%; box-sizing:border-box;" placeholder='/!\\[[^\\]]*\\]\\(([^)\\s]+)\\)/g'></textarea>
+                    <div class="oair-hint">扩展会优先读取 <code>media</code> 这类结构化图片字段。只有当后端把图片链接放在文本里返回时，才会使用这里的回退正则。</div>
+                </div>
+            </details>
         </div>
     </div>
 
@@ -311,24 +461,26 @@
             <label class="oair-field-label">优化模板</label>
             <textarea id="oair_optimize_template" class="text_pole" rows="10" style="width:100%; box-sizing:border-box;" placeholder="优化提示词的模板，使用 {{prompt}} 插入原始提示词。"></textarea>
 
-            <details style="margin-top:8px;">
-                <summary style="font-size:0.78em; cursor:pointer; opacity:0.7;">自定义优化 LLM 后端（可选）</summary>
-                <div style="margin-top:6px;">
-                    <label class="oair-field-label">优化 LLM 服务地址（留空则使用主后端）</label>
-                    <input id="oair_optimize_api_url" class="text_pole" style="width:100%; box-sizing:border-box;" placeholder="http://127.0.0.1:8080/v1/chat/completions">
+            <!-- 自定义优化 LLM 后端（展开，不在 details 里） -->
+            <div style="margin-top:10px;">
+                <div style="font-size:0.82em; font-weight:bold; opacity:0.85; margin-bottom:6px;">自定义优化 LLM 后端</div>
 
-                    <div class="oair-row">
-                        <div>
-                            <label class="oair-field-label">优化 LLM 模型</label>
-                            <input id="oair_optimize_model" class="text_pole" style="width:100%; box-sizing:border-box;" placeholder="留空则使用主模型">
-                        </div>
-                        <div>
-                            <label class="oair-field-label">优化 LLM API 密钥</label>
-                            <input id="oair_optimize_api_key" class="text_pole" style="width:100%; box-sizing:border-box;" placeholder="留空则使用主密钥">
-                        </div>
-                    </div>
+                <label class="oair-field-label">优化 LLM 服务地址</label>
+                <input id="oair_optimize_api_url" class="text_pole" style="width:100%; box-sizing:border-box;" placeholder="留空则使用酒馆主API">
+                <div class="oair-hint">留空则使用酒馆主API</div>
+
+                <label class="oair-field-label">优化 LLM 模型</label>
+                <input id="oair_optimize_model" class="text_pole" style="width:100%; box-sizing:border-box;" placeholder="留空则使用酒馆主模型">
+                <div class="oair-hint">留空则使用酒馆主模型</div>
+
+                <label class="oair-field-label">优化 LLM API 密钥</label>
+                <div class="oair-password-row">
+                    <input id="oair_optimize_api_key" type="password" class="text_pole" placeholder="留空则使用酒馆主API密钥">
+                    <button type="button" class="oair-eye-btn" title="显示/隐藏密钥"><i class="fa-solid fa-eye"></i></button>
                 </div>
-            </details>
+
+                <div class="oair-hint" style="margin-top:6px;">留空时，优化功能将使用酒馆主API（而非图片生成API）进行提示词优化</div>
+            </div>
         </div>
 
         <!-- NSFW 规避 -->
@@ -343,16 +495,24 @@
                 <b>建议开启</b>：即使主提示词已要求 SFW，此功能可作为额外安全网。
             </div>
 
-            <label class="oair-field-label">NSFW 审查模板</label>
-            <textarea id="oair_nsfw_avoidance_template" class="text_pole" rows="8" style="width:100%; box-sizing:border-box;" placeholder="NSFW 审查模板，使用 {{prompt}} 插入原始提示词。"></textarea>
+            <details class="oair-details">
+                <summary>NSFW 审查模板</summary>
+                <div class="oair-details-content">
+                    <textarea id="oair_nsfw_avoidance_template" class="text_pole" rows="8" style="width:100%; box-sizing:border-box;" placeholder="NSFW 审查模板，使用 {{prompt}} 插入原始提示词。"></textarea>
+                </div>
+            </details>
         </div>
 
         <!-- 消息总结模板 -->
         <div class="oair-section">
             <div class="oair-section-title">消息总结模板</div>
-            <label class="oair-field-label">将聊天消息转化为生图提示词的模板</label>
-            <textarea id="oair_summarize_template" class="text_pole" rows="8" style="width:100%; box-sizing:border-box;" placeholder="使用 {{message}} 插入消息内容。"></textarea>
-            <div class="oair-hint">点击消息上的「总结生图」按钮时使用此模板。</div>
+            <details class="oair-details">
+                <summary>将聊天消息转化为生图提示词的模板</summary>
+                <div class="oair-details-content">
+                    <textarea id="oair_summarize_template" class="text_pole" rows="8" style="width:100%; box-sizing:border-box;" placeholder="使用 {{message}} 插入消息内容。"></textarea>
+                    <div class="oair-hint">点击消息上的「总结生图」按钮时使用此模板。</div>
+                </div>
+            </details>
         </div>
     </div>
 
@@ -373,6 +533,9 @@
             </div>
 
             <div class="oair-btn-row">
+                <button id="oair_btn_import_msg" class="menu_button" style="flex:1; justify-content:center;">
+                    📥 导入消息
+                </button>
                 <button id="oair_btn_optimize" class="menu_button" style="flex:1; justify-content:center;">
                     ✨ 优化提示词
                 </button>
@@ -385,9 +548,15 @@
                 <button id="oair_btn_clear_manual" class="menu_button" style="flex:1; justify-content:center;">
                     清空
                 </button>
+                <button id="oair_btn_attach" class="menu_button" style="flex:1; justify-content:center;">
+                    📎 附加到消息
+                </button>
             </div>
 
             <div class="oair-hint" style="margin-top:4px;">
+                📥 导入消息：将当前聊天最后一条消息导入为提示词
+            </div>
+            <div class="oair-hint">
                 💡 提示：先输入提示词 → 点击「优化提示词」查看优化效果 → 点击「生成图片」
             </div>
         </div>
