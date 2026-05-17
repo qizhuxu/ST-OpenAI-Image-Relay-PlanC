@@ -464,7 +464,7 @@ function createFloatingPanel() {
     if ($("#oair_floating_panel").length) return;
 
     const panel = $(`
-        <div id="oair_floating_panel" style="min-height:400px; height:auto; position:fixed; z-index:3000; overflow:hidden; flex-direction:column;">
+        <div id="oair_floating_panel" style="min-height:460px; height:auto; position:fixed; z-index:3000; overflow:hidden; flex-direction:column;">
             <div class="oair-floating-header">
                 <h3>🖼️ 图片中继 - 详细配置</h3>
                 <button class="oair-floating-close" title="关闭"><i class="fa-solid fa-xmark"></i></button>
@@ -473,11 +473,23 @@ function createFloatingPanel() {
         </div>
     `);
 
-    // Default position: centered on screen
-    panel.css({
-        top: Math.max(40, (window.innerHeight - 500) / 2),
-        left: Math.max(10, (window.innerWidth - 560) / 2),
-    });
+    // Default position: centered on screen (responsive)
+    const isMobile = window.innerWidth <= 1000;
+    if (isMobile) {
+        // Mobile: CSS handles centering via left:50% + transform, JS only sets vertical position
+        panel.css({
+            top: Math.max(20, (window.innerHeight * 0.2)),
+            left: "50%",
+            transform: "translateX(-50%)",
+        });
+    } else {
+        // Desktop: manual centering based on panel width
+        const panelWidth = 640;
+        panel.css({
+            top: Math.max(40, (window.innerHeight - 520) / 2),
+            left: Math.max(10, (window.innerWidth - panelWidth) / 2),
+        });
+    }
 
     panel.appendTo("body");
 
@@ -506,31 +518,67 @@ function createFloatingPanel() {
             console.log(`[${extensionName}] Using inline settings HTML (file load skipped)`);
         });
 
-    // Draggable via header
+    // Draggable via header (mouse + touch)
     let headerDragging = false;
     let headerStartX, headerStartY, panelOrigLeft, panelOrigTop;
 
-    panel.find(".oair-floating-header").on("mousedown", function (e) {
-        if ($(e.target).closest(".oair-floating-close").length) return;
+    function startDrag(clientX, clientY) {
         headerDragging = true;
-        headerStartX = e.clientX;
-        headerStartY = e.clientY;
+        headerStartX = clientX;
+        headerStartY = clientY;
         const pos = panel.offset();
         panelOrigLeft = pos.left;
         panelOrigTop = pos.top;
+        // Remove CSS centering transform when user starts dragging
+        panel.css("transform", "none");
+    }
+
+    function moveDrag(clientX, clientY) {
+        if (!headerDragging) return;
+        panel.css({
+            left: panelOrigLeft + (clientX - headerStartX),
+            top: panelOrigTop + (clientY - headerStartY),
+        });
+    }
+
+    function endDrag() {
+        headerDragging = false;
+    }
+
+    // Mouse events
+    panel.find(".oair-floating-header").on("mousedown", function (e) {
+        if ($(e.target).closest(".oair-floating-close").length) return;
+        startDrag(e.clientX, e.clientY);
         e.preventDefault();
     });
 
     $(document).on("mousemove.oair_floating", function (e) {
-        if (!headerDragging) return;
-        panel.css({
-            left: panelOrigLeft + (e.clientX - headerStartX),
-            top: panelOrigTop + (e.clientY - headerStartY),
-        });
+        moveDrag(e.clientX, e.clientY);
     });
 
     $(document).on("mouseup.oair_floating", function () {
-        headerDragging = false;
+        endDrag();
+    });
+
+    // Touch events
+    panel.find(".oair-floating-header").on("touchstart", function (e) {
+        if ($(e.target).closest(".oair-floating-close").length) return;
+        const touch = e.originalEvent?.touches?.[0];
+        if (!touch) return;
+        startDrag(touch.clientX, touch.clientY);
+        e.preventDefault();
+    }, { passive: false });
+
+    $(document).on("touchmove.oair_floating", function (e) {
+        if (!headerDragging) return;
+        const touch = e.originalEvent?.touches?.[0];
+        if (!touch) return;
+        moveDrag(touch.clientX, touch.clientY);
+        e.preventDefault();
+    }, { passive: false });
+
+    $(document).on("touchend.oair_floating touchcancel.oair_floating", function () {
+        endDrag();
     });
 
     // Close button
@@ -560,8 +608,8 @@ function closeFloatingPanel() {
         height: "",
     });
 
-    // Clean up document-level event handlers
-    $(document).off("mousemove.oair_floating mouseup.oair_floating keydown.oair_floating");
+    // Clean up document-level event handlers (mouse + touch + keyboard)
+    $(document).off("mousemove.oair_floating mouseup.oair_floating touchmove.oair_floating touchend.oair_floating touchcancel.oair_floating keydown.oair_floating");
 
     // Sync panel UI when closing (in case enabled/fabEnabled changed in floating window)
     updatePanelUi();
@@ -582,7 +630,7 @@ function toggleFloatingPanel() {
         newPanel.css({
             display: "flex",
             visibility: "visible",
-            minHeight: "400px",
+            minHeight: "460px",
             height: "auto",
         });
 
@@ -598,32 +646,63 @@ function toggleFloatingPanel() {
     if (panel.hasClass("oair-floating--visible")) {
         closeFloatingPanel();
     } else {
-        // Rebind document-level handlers
+        // Rebind document-level handlers (mouse + touch)
         let headerDragging = false;
         let headerStartX, headerStartY, panelOrigLeft, panelOrigTop;
 
-        panel.find(".oair-floating-header").off("mousedown").on("mousedown", function (e) {
-            if ($(e.target).closest(".oair-floating-close").length) return;
+        function rebindStartDrag(clientX, clientY) {
             headerDragging = true;
-            headerStartX = e.clientX;
-            headerStartY = e.clientY;
+            headerStartX = clientX;
+            headerStartY = clientY;
             const pos = panel.offset();
             panelOrigLeft = pos.left;
             panelOrigTop = pos.top;
+            panel.css("transform", "none");
+        }
+
+        function rebindMoveDrag(clientX, clientY) {
+            if (!headerDragging) return;
+            panel.css({
+                left: panelOrigLeft + (clientX - headerStartX),
+                top: panelOrigTop + (clientY - headerStartY),
+            });
+        }
+
+        // Mouse events
+        panel.find(".oair-floating-header").off("mousedown").on("mousedown", function (e) {
+            if ($(e.target).closest(".oair-floating-close").length) return;
+            rebindStartDrag(e.clientX, e.clientY);
             e.preventDefault();
         });
 
-        $(document).off("mousemove.oair_floating mouseup.oair_floating keydown.oair_floating");
+        $(document).off("mousemove.oair_floating mouseup.oair_floating touchmove.oair_floating touchend.oair_floating touchcancel.oair_floating keydown.oair_floating");
 
         $(document).on("mousemove.oair_floating", function (e) {
-            if (!headerDragging) return;
-            panel.css({
-                left: panelOrigLeft + (e.clientX - headerStartX),
-                top: panelOrigTop + (e.clientY - headerStartY),
-            });
+            rebindMoveDrag(e.clientX, e.clientY);
         });
 
         $(document).on("mouseup.oair_floating", function () {
+            headerDragging = false;
+        });
+
+        // Touch events
+        panel.find(".oair-floating-header").off("touchstart").on("touchstart", function (e) {
+            if ($(e.target).closest(".oair-floating-close").length) return;
+            const touch = e.originalEvent?.touches?.[0];
+            if (!touch) return;
+            rebindStartDrag(touch.clientX, touch.clientY);
+            e.preventDefault();
+        }, { passive: false });
+
+        $(document).on("touchmove.oair_floating", function (e) {
+            if (!headerDragging) return;
+            const touch = e.originalEvent?.touches?.[0];
+            if (!touch) return;
+            rebindMoveDrag(touch.clientX, touch.clientY);
+            e.preventDefault();
+        }, { passive: false });
+
+        $(document).on("touchend.oair_floating touchcancel.oair_floating", function () {
             headerDragging = false;
         });
 
@@ -654,7 +733,7 @@ function toggleFloatingPanel() {
         panel.css({
             display: "flex",
             visibility: "visible",
-            minHeight: "400px",
+            minHeight: "460px",
             height: "auto",
         });
 

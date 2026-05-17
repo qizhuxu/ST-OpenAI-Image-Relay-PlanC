@@ -102,9 +102,13 @@
 /* 平板和小屏 */
 @media (max-width: 1000px) {
     #oair_floating_panel {
-        width: calc(100vw - 20px);
-        max-width: 420px;
-        max-height: calc(100vh - 60px);
+        width: calc(100vw - 24px);
+        max-width: 480px;
+        min-width: unset !important;
+        max-height: 75vh !important;
+        /* 自动居中：左右各留 12px */
+        left: 50% !important;
+        transform: translateX(-50%);
     }
 }
 
@@ -113,9 +117,11 @@
     #oair_floating_panel {
         width: calc(100vw - 16px);
         max-width: none;
-        min-width: unset;
-        left: 8px !important;
-        max-height: 70vh;
+        min-width: unset !important;
+        /* 自动水平居中 */
+        left: 50% !important;
+        transform: translateX(-50%);
+        max-height: 60vh !important;
         border-radius: 10px;
     }
 
@@ -153,11 +159,13 @@
 @media (max-width: 400px) {
     #oair_floating_panel {
         width: calc(100vw - 8px);
-        left: 4px !important;
         max-width: none;
-        max-height: 65vh;
+        min-width: unset !important;
+        /* 自动水平+垂直居中 */
+        left: 50% !important;
         top: 50% !important;
         transform: translate(-50%, -50%);
+        max-height: 55vh !important;
         border-radius: 10px;
     }
 }
@@ -167,11 +175,11 @@
     display: none !important;
     position: fixed !important;
     z-index: 3000 !important;
-    width: 560px !important;
-    min-width: 480px !important;
-    max-width: 720px !important;
-    min-height: 400px !important;
-    max-height: 80vh !important;
+    width: 640px !important;
+    min-width: 520px !important;
+    max-width: 880px !important;
+    min-height: 460px !important;
+    max-height: 82vh !important;
     background: var(--SmartThemeBlurTintColor, rgba(30, 30, 50, 0.98)) !important;
     border: 1px solid var(--SmartThemeBorderColor, rgba(255,255,255,0.15)) !important;
     border-radius: 12px !important;
@@ -186,7 +194,7 @@
 
 #oair_floating_panel.oair-floating--visible {
     display: flex !important;
-    min-height: 400px !important;
+    min-height: 460px !important;
     height: auto !important;
     visibility: visible !important;
     pointer-events: auto !important;
