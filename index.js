@@ -13,7 +13,7 @@ import {
     extension_prompt_types,
     extension_prompt_roles,
 } from "../../../../script.js";
-import { regexFromString } from "../../../utils.js";
+import { regexFromString, saveBase64AsFile } from "../../../utils.js";
 
 // ═══════════════════════════════════════════════════════════════
 // SECTION 1: IMPORTS & CONSTANTS
@@ -74,18 +74,37 @@ const DEFAULT_MAIN_PROMPT = [
 ].join('\n');
 
 const DEFAULT_OPTIMIZE_TEMPLATE = [
-    '你是一个专业的图片提示词优化专家。请将用户提供的描述优化为一段可直接用于生成【单张】图片的中文提示词。',
+    '你是一个专业的图片提示词优化专家。请把下列信息整合成一段可直接用于生成【单张】图片的中文提示词。',
     '',
-    '优化要求：',
-    '1. 若原文包含多个场景或时间段，只选取其中【最后出现的、或最具视觉冲击力的高潮场景】作为画面主体，不要停留在开场的过渡画面。',
-    '2. 在选定的这一个场景内，尽量完整保留所有具体可视信息：人物姓名与身份称谓、发型发色、瞳色、体型特征、服装与配饰、指甲与妆容、随身武器道具，以及场景里的关键物件、建筑结构、光效与环境氛围。',
-    '3. 严禁把具名角色替换成「女孩」「男子」等泛称，也不要笼统概括掉上述细节；宁可句子长一些，也不要丢掉具体的外观与场景特征。',
-    '4. 不要凭空虚构原文没有的人物身份或外貌特征。',
-    '5. 可以补充利于出图的画面细节（构图、视角、色彩、光线），但不得改变或削弱原文已有的关键信息。',
-    '6. 使用中文连贯句子描述，而不是关键词堆砌。',
-    '7. 只输出最终提示词，不要包含任何解释、前言或后记。',
+    '【风格】（固定，必须严格遵循）：',
+    '{{style}}',
     '',
-    '原始描述：',
+    '【人物特征】（固定，出现的角色必须逐字保留以下外貌设定，不得改写或省略）：',
+    '{{characters}}',
+    '',
+    '【本次场景原文】：',
+    '{{prompt}}',
+    '',
+    '整合要求：',
+    '1. 从场景原文中提炼〔场景环境〕〔人物空间位置〕〔行为动作〕三部分，与上面的风格、人物特征融合成统一画面。',
+    '2. 若原文含多个场景或时间段，只取最后出现的、或最具视觉冲击力的高潮场景作为画面主体。',
+    '3. 出现的具名角色必须套用上面【人物特征】里的固定外貌，严禁替换成「女孩」「男子」等泛称，也不要省略其外观细节。',
+    '4. 不要凭空虚构未提供的人物身份或外貌；可补充利于出图的构图、视角、色彩、光线，但不得削弱原文已有关键信息。',
+    '5. 使用中文连贯句子描述，而不是关键词堆砌。',
+    '6. 只输出最终提示词，不要包含任何解释、前言或后记。',
+].join('\n');
+
+const DEFAULT_ANALYSIS_TEMPLATE = [
+    '你是图片场景分析助手。阅读【场景原文】后判断两件事：',
+    '1. characters：从【候选人物】里挑出本场景实际出场的人物名（数组；没有就空数组）。',
+    '2. style：从【候选风格】里挑出最贴合本场景氛围的一个风格名（字符串；无合适就空字符串）。',
+    '',
+    '只输出一行紧凑 JSON，不要任何解释或代码块标记，例如：',
+    '{"characters":["卡提希娅","齐齐"],"style":"写实"}',
+    '',
+    '【候选人物】：{{characters}}',
+    '【候选风格】：{{styles}}',
+    '【场景原文】：',
     '{{prompt}}',
 ].join('\n');
 
@@ -149,7 +168,21 @@ const defaultSettings = {
     optimizeApiUrl: "",
     optimizeModel: "",
     optimizeApiKey: "",
-    characterAppearance: "",                       // 固定角色外貌注入：每行「名字：外貌」，生图时按出场角色自动并入
+    textMaxTokens: 8192,                           // 优化/审查/总结等文本调用的回复上限(max_tokens)；推理模型需较大值，太小会截断思考导致质量低，太大可能被后端拒绝/挂起
+    characterAppearance: "",                       // 人物库：每行「名字：外貌」，出场角色的外貌逐字注入优化模板（世界书作补充来源）
+
+    // ─── 世界书注入 ──────────────────────────────────────────
+    // 从当前激活世界书按关键词命中注入人物外貌/固定场景设定（characterAppearance 作兜底）
+    worldBookEnabled: false,
+    worldBookSectionHeadings: "外貌,长相,外观,appearance,场景,环境,setting,scene",
+    worldBookMaxChars: 800,
+
+    // ─── 固定设定（风格库 / 人物库）─────────────────────────
+    styleLibrary: "",                              // 风格库：每行「风格名：风格描述」
+    styleActive: "",                               // 当前激活（默认固定）的风格名
+    styleAutoSelect: false,                        // LLM 按场景自动选风格（覆盖 styleActive）
+    characterLlmExtract: false,                    // LLM 智能识别出场人物（默认子串匹配）
+    analysisTemplate: DEFAULT_ANALYSIS_TEMPLATE,   // 场景分析调用模板（出人物 + 选风格）
 
     // ─── NSFW 规避 ──────────────────────────────────────────
     nsfwAvoidance: false,
@@ -171,7 +204,7 @@ const defaultSettings = {
 
 const SETTINGS_PANEL_HTML = "<!-- \u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550 -->\n<!-- \u9762\u677f\u7cbe\u7b80\u7248 \u2014 \u53ea\u4fdd\u7559\u57fa\u7840\u5f00\u5173\u548c\u72b6\u6001 -->\n<!-- \u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550 -->\n<div class=\"oair-panel-ui\">\n    <!-- \u72b6\u6001\u680f -->\n    <div style=\"display:flex; justify-content:space-between; align-items:center; margin-bottom:8px; border-bottom:1px solid rgba(255,255,255,0.1); padding-bottom:5px; gap:8px;\">\n        <div id=\"oair_status\" style=\"font-size:0.8em; color:cyan;\">\u5c31\u7eea</div>\n        <label style=\"display:flex; align-items:center; gap:6px; font-size:0.8em; white-space:nowrap;\">\n            <input id=\"oair_enabled\" type=\"checkbox\">\n            \u542f\u7528\n        </label>\n    </div>\n\n    <!-- \u60ac\u6d6e\u5feb\u6377\u6309\u94ae\u5f00\u5173 -->\n    <div class=\"oair-section\">\n        <label class=\"oair-toggle-label\">\n            <input id=\"oair_fab_enabled\" type=\"checkbox\">\n            \u663e\u793a\u60ac\u6d6e\u5feb\u6377\u6309\u94ae\n        </label>\n        <div class=\"oair-hint\">\n            \u52fe\u9009\u540e\u5c4f\u5e55\u53f3\u4e0b\u89d2\u51fa\u73b0\u53ef\u62d6\u62fd\u7684\u5feb\u6377\u6309\u94ae\uff0c\u70b9\u51fb\u6253\u5f00\u8be6\u7ec6\u914d\u7f6e\u7a97\u53e3\u3002<br>\n            \u9002\u5408\u9700\u8981\u9891\u7e41\u4f7f\u7528\u624b\u52a8\u751f\u56fe\u6216\u8c03\u6574\u914d\u7f6e\u7684\u573a\u666f\u3002\n        </div>\n    </div>\n\n    <!-- \u5feb\u6377\u5165\u53e3 -->\n    <div class=\"oair-section\" style=\"margin-top:4px;\">\n        <button id=\"oair_btn_open_floating\" class=\"menu_button\" style=\"width:100%; justify-content:center;\">\n            \ud83d\uddbc\ufe0f \u6253\u5f00\u8be6\u7ec6\u914d\u7f6e\u7a97\u53e3\n        </button>\n        <div class=\"oair-hint\" style=\"margin-top:4px; text-align:center;\">\n            \u6216\u4f7f\u7528\u60ac\u6d6e\u5feb\u6377\u6309\u94ae\u5feb\u901f\u8bbf\u95ee\n        </div>\n    </div>\n</div>\n";
 
-const SETTINGS_FULL_HTML = "<!-- \u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550 -->\n<!-- \u5b8c\u6574\u914d\u7f6e\u7248 \u2014 \u7528\u4e8e\u60ac\u6d6e\u7a97\uff085\u6807\u7b7e\u9875\u5b8c\u6574\u914d\u7f6e\uff09 -->\n<!-- \u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550 -->\n<style>\n    /* \u2500\u2500\u2500 \u6807\u7b7e\u9875\u5bb9\u5668 \u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500 */\n    .oair-tabs-container {\n        display: flex;\n        flex-direction: column;\n        gap: 0;\n    }\n    .oair-tab-bar {\n        display: flex;\n        gap: 2px;\n        border-bottom: 1px solid rgba(255,255,255,0.15);\n        margin-bottom: 8px;\n        flex-wrap: wrap;\n    }\n    .oair-tab-label {\n        padding: 5px 10px;\n        font-size: 0.78em;\n        cursor: pointer;\n        border-radius: 4px 4px 0 0;\n        opacity: 0.55;\n        transition: all 0.15s;\n        user-select: none;\n        white-space: nowrap;\n    }\n    .oair-tab-label:hover {\n        opacity: 0.85;\n        background: rgba(255,255,255,0.05);\n    }\n    .oair-tab-panel {\n        display: none;\n    }\n\n    /* \u6fc0\u6d3b\u6807\u7b7e\u6837\u5f0f */\n    #oair_tab_basic:checked ~ .oair-tab-bar label[for=\"oair_tab_basic\"],\n    #oair_tab_backend:checked ~ .oair-tab-bar label[for=\"oair_tab_backend\"],\n    #oair_tab_extract:checked ~ .oair-tab-bar label[for=\"oair_tab_extract\"],\n    #oair_tab_optimize:checked ~ .oair-tab-bar label[for=\"oair_tab_optimize\"],\n    #oair_tab_manual:checked ~ .oair-tab-bar label[for=\"oair_tab_manual\"] {\n        opacity: 1;\n        background: rgba(255,255,255,0.1);\n        border-bottom: 2px solid cyan;\n    }\n\n    /* \u663e\u793a\u5bf9\u5e94\u9762\u677f */\n    #oair_tab_basic:checked ~ #oair_panel_basic,\n    #oair_tab_backend:checked ~ #oair_panel_backend,\n    #oair_tab_extract:checked ~ #oair_panel_extract,\n    #oair_tab_optimize:checked ~ #oair_panel_optimize,\n    #oair_tab_manual:checked ~ #oair_panel_manual {\n        display: block;\n    }\n\n    /* \u2500\u2500\u2500 \u901a\u7528\u7ec4\u4ef6\u6837\u5f0f \u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500 */\n    .oair-section {\n        background: rgba(0,0,0,0.15);\n        padding: 10px;\n        border-radius: 6px;\n        margin-bottom: 8px;\n    }\n    .oair-section-title {\n        font-weight: bold;\n        font-size: 0.88em;\n        margin-bottom: 8px;\n        display: flex;\n        align-items: center;\n        gap: 6px;\n    }\n    .oair-field-label {\n        display: block;\n        font-size: 0.75em;\n        opacity: 0.8;\n        margin-top: 6px;\n        margin-bottom: 2px;\n    }\n    .oair-hint {\n        margin-top: 4px;\n        font-size: 0.72em;\n        opacity: 0.6;\n        line-height: 1.4;\n    }\n    .oair-row {\n        display: grid;\n        grid-template-columns: 1fr 1fr;\n        gap: 6px;\n        margin-top: 6px;\n    }\n    .oair-btn-row {\n        display: flex;\n        gap: 6px;\n        margin-top: 6px;\n    }\n    .oair-optimized-box {\n        background: rgba(0,200,100,0.08);\n        border: 1px solid rgba(0,200,100,0.25);\n        border-radius: 6px;\n        padding: 8px;\n        margin-top: 6px;\n        font-size: 0.85em;\n        line-height: 1.5;\n        white-space: pre-wrap;\n        word-break: break-all;\n    }\n    .oair-toggle-row {\n        display: flex;\n        justify-content: space-between;\n        align-items: center;\n        gap: 8px;\n    }\n    .oair-toggle-label {\n        display: flex;\n        align-items: center;\n        gap: 6px;\n        font-size: 0.8em;\n    }\n    .oair-badge {\n        display: inline-block;\n        padding: 1px 6px;\n        border-radius: 3px;\n        font-size: 0.7em;\n        font-weight: bold;\n        vertical-align: middle;\n    }\n    .oair-badge-green {\n        background: rgba(0,200,100,0.2);\n        color: #60ff90;\n    }\n    .oair-badge-orange {\n        background: rgba(255,180,60,0.2);\n        color: #ffd280;\n    }\n    .oair-badge-red {\n        background: rgba(255,80,80,0.2);\n        color: #ff9090;\n    }\n\n    /* \u2500\u2500\u2500 \u65b0\u589e\uff1a\u8f93\u5165+\u6309\u94ae\u7ec4\u5408\u884c \u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500 */\n    .oair-input-with-btn {\n        display: flex;\n        gap: 6px;\n        align-items: center;\n    }\n    .oair-input-with-btn .text_pole {\n        flex: 1;\n        min-width: 0;\n    }\n    .oair-input-with-btn .menu_button {\n        flex-shrink: 0;\n        white-space: nowrap;\n    }\n\n    /* \u2500\u2500\u2500 \u65b0\u589e\uff1a\u5bc6\u7801\u884c\uff08\u8f93\u5165+\u773c\u775b\u6309\u94ae\uff09 \u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500 */\n    .oair-password-row {\n        display: flex;\n        gap: 6px;\n        align-items: center;\n    }\n    .oair-password-row .text_pole {\n        flex: 1;\n        min-width: 0;\n    }\n    .oair-password-row .oair-eye-btn {\n        flex-shrink: 0;\n        width: 32px;\n        height: 32px;\n        display: flex;\n        align-items: center;\n        justify-content: center;\n        background: rgba(255,255,255,0.08);\n        border: 1px solid rgba(255,255,255,0.15);\n        border-radius: 4px;\n        color: var(--SmartThemeBodyColor, #ccc);\n        cursor: pointer;\n        font-size: 13px;\n        transition: background 0.15s;\n    }\n    .oair-password-row .oair-eye-btn:hover {\n        background: rgba(255,255,255,0.15);\n    }\n\n    /* \u2500\u2500\u2500 \u65b0\u589e\uff1a\u6a21\u578b\u884c\uff08\u8f93\u5165+\u83b7\u53d6\u6309\u94ae\uff09 \u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500 */\n    .oair-model-row {\n        display: flex;\n        gap: 6px;\n        align-items: center;\n    }\n    .oair-model-row .text_pole {\n        flex: 1;\n        min-width: 0;\n    }\n    .oair-model-row .menu_button {\n        flex-shrink: 0;\n        white-space: nowrap;\n    }\n\n    /* \u2500\u2500\u2500 \u65b0\u589e\uff1a\u6a21\u578b\u9009\u62e9\u4e0b\u62c9 \u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500 */\n    #oair_model_select,\n    #oair_optimize_model_select {\n        width: 100%;\n        margin-top: 4px;\n        display: none;\n    }\n    #oair_model_select.oair-visible,\n    #oair_optimize_model_select.oair-visible {\n        display: block;\n    }\n\n    /* \u2500\u2500\u2500 \u65b0\u589e\uff1a\u4fdd\u5b58\u884c\uff08\u8d85\u65f6+\u4fdd\u5b58\u6309\u94ae\uff09 \u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500 */\n    .oair-save-row {\n        display: flex;\n        gap: 6px;\n        align-items: center;\n    }\n    .oair-save-row .text_pole {\n        flex: 1;\n        min-width: 0;\n    }\n    .oair-save-row .menu_button {\n        flex-shrink: 0;\n        white-space: nowrap;\n    }\n\n    /* \u2500\u2500\u2500 \u65b0\u589e\uff1aDetails/Summary \u6298\u53e0\u6837\u5f0f \u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500 */\n    .oair-details {\n        margin-top: 8px;\n    }\n    .oair-details summary {\n        font-size: 0.78em;\n        cursor: pointer;\n        opacity: 0.7;\n        padding: 4px 0;\n        user-select: none;\n        list-style: none;\n        display: flex;\n        align-items: center;\n        gap: 4px;\n    }\n    .oair-details summary::-webkit-details-marker {\n        display: none;\n    }\n    .oair-details summary::before {\n        content: \"\u25b8\";\n        display: inline-block;\n        width: 12px;\n        text-align: center;\n        transition: transform 0.15s;\n    }\n    .oair-details[open] summary::before {\n        transform: rotate(90deg);\n    }\n    .oair-details summary:hover {\n        opacity: 1;\n    }\n    .oair-details .oair-details-content {\n        margin-top: 6px;\n    }\n\n    /* \u2500\u2500\u2500 \u65b0\u589e\uff1a\u81ea\u5b9a\u4e49\u4f18\u5316LLM\u540e\u7aef\u590d\u9009\u6846\u5c55\u5f00 \u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500 */\n    .oair-custom-backend-content {\n        display: none;\n    }\n    .oair-custom-backend-content.oair-visible {\n        display: block;\n    }\n</style>\n\n<div class=\"oair-settings-ui\">\n    <!-- \u72b6\u6001\u680f\uff08\u60ac\u6d6e\u7a97\u5185\u4e5f\u6709\uff09 -->\n    <div style=\"display:flex; justify-content:space-between; align-items:center; margin-bottom:10px; border-bottom:1px solid rgba(255,255,255,0.1); padding-bottom:5px; gap:8px;\">\n        <div id=\"oair_floating_status\" style=\"font-size:0.8em; color:cyan;\">\u5c31\u7eea</div>\n        <label style=\"display:flex; align-items:center; gap:6px; font-size:0.8em; white-space:nowrap;\">\n            <input id=\"oair_floating_enabled\" type=\"checkbox\">\n            \u542f\u7528\n        </label>\n    </div>\n\n    <!-- \u9690\u85cf\u7684 radio \u8f93\u5165 -->\n    <input type=\"radio\" name=\"oair_tab\" id=\"oair_tab_basic\" checked style=\"display:none\">\n    <input type=\"radio\" name=\"oair_tab\" id=\"oair_tab_backend\" style=\"display:none\">\n    <input type=\"radio\" name=\"oair_tab\" id=\"oair_tab_extract\" style=\"display:none\">\n    <input type=\"radio\" name=\"oair_tab\" id=\"oair_tab_optimize\" style=\"display:none\">\n    <input type=\"radio\" name=\"oair_tab\" id=\"oair_tab_manual\" style=\"display:none\">\n\n    <!-- \u6807\u7b7e\u680f -->\n    <div class=\"oair-tab-bar\">\n        <label for=\"oair_tab_basic\" class=\"oair-tab-label\">\ud83d\udccb \u57fa\u7840</label>\n        <label for=\"oair_tab_backend\" class=\"oair-tab-label\">\u2699\ufe0f \u540e\u7aef</label>\n        <label for=\"oair_tab_extract\" class=\"oair-tab-label\">\ud83d\udd0d \u63d0\u53d6</label>\n        <label for=\"oair_tab_optimize\" class=\"oair-tab-label\">\u2728 \u4f18\u5316</label>\n        <label for=\"oair_tab_manual\" class=\"oair-tab-label\">\ud83c\udfa8 \u624b\u52a8</label>\n    </div>\n\n    <!-- \u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550 -->\n    <!-- TAB 1: \u57fa\u7840                                           -->\n    <!-- \u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550 -->\n    <div class=\"oair-tab-panel\" id=\"oair_panel_basic\">\n        <div class=\"oair-section\">\n            <div class=\"oair-section-title\">\u4e3b\u6a21\u578b\u63d0\u793a\u6ce8\u5165</div>\n            <details class=\"oair-details\">\n                <summary>\u4e16\u754c\u4e66\u5f0f\u9ed8\u8ba4\u63d0\u793a\u8bcd</summary>\n                <div class=\"oair-details-content\">\n                    <textarea id=\"oair_main_prompt\" class=\"text_pole\" rows=\"12\" style=\"width:100%; box-sizing:border-box;\" placeholder=\"\u8fd9\u91cc\u7684\u5185\u5bb9\u4f1a\u50cf\u5e38\u9a7b\u4e16\u754c\u4e66\u4e00\u6837\u6ce8\u5165\u5230\u4e3b\u6a21\u578b\u63d0\u793a\u94fe\u91cc\u3002\"></textarea>\n                    <div class=\"oair-hint\">\u8fd9\u6bb5\u6587\u5b57\u4f1a\u4ee5\u7cfb\u7edf\u89c4\u5219\u7684\u65b9\u5f0f\u81ea\u52a8\u6ce8\u5165\u5230\u4e3b\u6a21\u578b\u63d0\u793a\u94fe\u5f00\u5934\uff0c\u4e0d\u4f1a\u53d1\u9001\u7ed9\u56fe\u7247\u540e\u7aef\u3002</div>\n                </div>\n            </details>\n        </div>\n\n        <div class=\"oair-section\">\n            <div class=\"oair-section-title\">\u6d88\u606f\u751f\u56fe\u6309\u94ae</div>\n            <label class=\"oair-toggle-label\">\n                <input id=\"oair_message_gen_enabled\" type=\"checkbox\">\n                \u5728\u804a\u5929\u6d88\u606f\u4e0a\u663e\u793a\u751f\u56fe\u6309\u94ae\n            </label>\n            <div class=\"oair-hint\">\u542f\u7528\u540e\uff0c\u6bcf\u6761\u6d88\u606f\u7684\u64cd\u4f5c\u680f\u4f1a\u51fa\u73b0\u4e24\u4e2a\u6309\u94ae\uff1a<br>\n                \ud83d\uddbc\ufe0f \u76f4\u63a5\u751f\u56fe \u2014 \u4f7f\u7528\u6d88\u606f\u539f\u6587\u4f5c\u4e3a\u63d0\u793a\u8bcd<br>\n                \u2728 \u603b\u7ed3\u751f\u56fe \u2014 \u5148\u5c06\u6d88\u606f\u603b\u7ed3\u4e3a\u63d0\u793a\u8bcd\u518d\u751f\u56fe\n            </div>\n        </div>\n    </div>\n\n    <!-- \u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550 -->\n    <!-- TAB 2: \u540e\u7aef                                           -->\n    <!-- \u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550 -->\n    <div class=\"oair-tab-panel\" id=\"oair_panel_backend\">\n        <div class=\"oair-section\">\n            <div class=\"oair-section-title\">\u5feb\u6377\u9884\u8bbe</div>\n            <button id=\"oair_btn_chatgpt2api_preset\" class=\"menu_button\" style=\"width:100%; justify-content:center;\">\u26a1 \u4e00\u952e chatgpt2api \u9884\u8bbe</button>\n            <div class=\"oair-hint\">\u4e00\u952e\u5207\u6362\u4e3a chatgpt2api \u63a8\u8350\u914d\u7f6e\uff1aImages \u6a21\u5f0f\u3001\u6a21\u578b gpt-image-2\u3001\u54cd\u5e94 b64_json\u3001\u63d0\u793a\u8bcd\u76f4\u901a\u3001\u6587\u672c\u6b65\u9aa4\u8d70\u9152\u9986\u4e3b\u6a21\u578b\u3002\u5e94\u7528\u540e\u8bf7\u786e\u8ba4\u670d\u52a1\u5730\u5740\u4e0e API \u5bc6\u94a5\u662f\u5426\u6b63\u786e\u3002</div>\n        </div>\n\n        <div class=\"oair-section\">\n            <div class=\"oair-section-title\">API \u6a21\u5f0f</div>\n            <label class=\"oair-field-label\">\u9009\u62e9\u63a5\u53e3\u7c7b\u578b</label>\n            <select id=\"oair_api_mode\" class=\"text_pole\" style=\"width:100%; box-sizing:border-box;\">\n                <option value=\"chat\">Chat Completions (/v1/chat/completions)</option>\n                <option value=\"images\">Images API (/v1/images/generations)</option>\n            </select>\n            <div class=\"oair-hint\">\n                <b>Chat Completions</b>\uff1a\u901a\u8fc7\u804a\u5929\u63a5\u53e3\u751f\u56fe\uff0c\u540e\u7aef\u5728\u6587\u672c\u56de\u590d\u4e2d\u8fd4\u56de\u56fe\u7247\u94fe\u63a5<br>\n                <b>Images API</b>\uff1a\u4f7f\u7528 OpenAI \u6807\u51c6\u56fe\u7247\u751f\u6210\u63a5\u53e3\uff0c\u76f4\u63a5\u8fd4\u56de\u56fe\u7247\u6570\u636e\n            </div>\n        </div>\n\n        <div class=\"oair-section\">\n            <div class=\"oair-section-title\">\u8fde\u63a5\u914d\u7f6e</div>\n\n            <!-- \u670d\u52a1\u5730\u5740 -->\n            <label class=\"oair-field-label\">\u670d\u52a1\u5730\u5740</label>\n            <input id=\"oair_service_url\" class=\"text_pole\" style=\"width:100%; box-sizing:border-box;\" placeholder=\"http://127.0.0.1:8199/v1\">\n            <div class=\"oair-hint\">\u53ea\u586b\u5230 /v1\uff0c\u8def\u5f84\u540e\u7f00\u6839\u636eAPI\u6a21\u5f0f\u81ea\u52a8\u8865\u5168</div>\n\n            <!-- API \u5bc6\u94a5\uff08\u5e26\u773c\u775b\u6309\u94ae\uff09 -->\n            <label class=\"oair-field-label\">API \u5bc6\u94a5</label>\n            <div class=\"oair-password-row\">\n                <input id=\"oair_api_key\" type=\"password\" class=\"text_pole\" placeholder=\"sk-any\">\n                <button type=\"button\" class=\"oair-eye-btn\" title=\"\u663e\u793a/\u9690\u85cf\u5bc6\u94a5\"><i class=\"fa-solid fa-eye\"></i></button>\n            </div>\n\n            <!-- \u6a21\u578b\uff08\u8f93\u5165+\u83b7\u53d6\u6309\u94ae+\u9690\u85cf\u4e0b\u62c9\uff09 -->\n            <label class=\"oair-field-label\">\u6a21\u578b</label>\n            <div class=\"oair-model-row\">\n                <input id=\"oair_model\" class=\"text_pole\" placeholder=\"any\">\n                <button id=\"oair_btn_fetch_model\" class=\"menu_button\">\u83b7\u53d6\u6a21\u578b</button>\n            </div>\n            <select id=\"oair_model_select\" class=\"text_pole\"></select>\n\n            <!-- \u8d85\u65f6+\u4fdd\u5b58\u6309\u94ae -->\n            <label class=\"oair-field-label\">\u8d85\u65f6\uff08\u6beb\u79d2\uff09</label>\n            <div class=\"oair-save-row\">\n                <input id=\"oair_timeout_ms\" type=\"number\" min=\"1000\" step=\"1000\" class=\"text_pole\" placeholder=\"120000\">\n                <button id=\"oair_btn_save_api\" class=\"menu_button\">\ud83d\udcbe \u4fdd\u5b58\u8bbe\u7f6e</button>\n            </div>\n        </div>\n\n        <!-- Chat Completions \u4e13\u5c5e\u5b57\u6bb5 -->\n        <div class=\"oair-section oair-chat-api-fields\">\n            <details class=\"oair-details\">\n                <summary>Chat Completions \u6a21\u677f</summary>\n                <div class=\"oair-details-content\">\n                    <label class=\"oair-field-label\">\u53d1\u9001\u7ed9\u56fe\u7247\u540e\u7aef\u7684\u6a21\u677f</label>\n                    <textarea id=\"oair_prompt_template\" class=\"text_pole\" rows=\"3\" style=\"width:100%; box-sizing:border-box;\" placeholder=\"\u5728\u9700\u8981\u63d2\u5165\u63d0\u53d6\u5185\u5bb9\u7684\u4f4d\u7f6e\u4f7f\u7528 {{prompt}}\u3002\"></textarea>\n                    <div class=\"oair-hint\">\u5c06\u63d0\u53d6\u51fa\u7684\u63d0\u793a\u8bcd\u5305\u88c5\u540e\u53d1\u7ed9 chat completions \u540e\u7aef\u3002</div>\n                </div>\n            </details>\n        </div>\n\n        <!-- Images API \u4e13\u5c5e\u5b57\u6bb5 -->\n        <div class=\"oair-section oair-images-api-fields\" style=\"display:none;\">\n            <details class=\"oair-details\">\n                <summary>Images API \u53c2\u6570</summary>\n                <div class=\"oair-details-content\">\n                    <label class=\"oair-field-label\">\u53d1\u9001\u7ed9\u56fe\u7247\u540e\u7aef\u7684\u6a21\u677f</label>\n                    <textarea id=\"oair_images_prompt_template\" class=\"text_pole\" rows=\"2\" style=\"width:100%; box-sizing:border-box;\" placeholder=\"{{prompt}}\uff08\u9ed8\u8ba4\u76f4\u901a\uff0c\u4e0d\u5305\u88c5\uff09\"></textarea>\n\n                    <div class=\"oair-row\">\n                        <div>\n                            <label class=\"oair-field-label\">\u56fe\u7247\u5c3a\u5bf8</label>\n                            <select id=\"oair_image_size\" class=\"text_pole\" style=\"width:100%; box-sizing:border-box;\">\n                                <option value=\"256x256\">256x256</option>\n                                <option value=\"512x512\">512x512</option>\n                                <option value=\"1024x1024\">1024x1024</option>\n                                <option value=\"1024x1792\">1024x1792</option>\n                                <option value=\"1792x1024\">1792x1024</option>\n                            </select>\n                        </div>\n                        <div>\n                            <label class=\"oair-field-label\">\u751f\u6210\u6570\u91cf</label>\n                            <input id=\"oair_image_count\" type=\"number\" min=\"1\" max=\"10\" class=\"text_pole\" style=\"width:100%; box-sizing:border-box;\">\n                        </div>\n                    </div>\n\n                    <label class=\"oair-field-label\">\u54cd\u5e94\u683c\u5f0f</label>\n                    <select id=\"oair_image_response_format\" class=\"text_pole\" style=\"width:100%; box-sizing:border-box;\">\n                        <option value=\"url\">URL\uff08\u8fd4\u56de\u56fe\u7247\u94fe\u63a5\uff09</option>\n                        <option value=\"b64_json\">Base64\uff08\u8fd4\u56de\u56fe\u7247\u6570\u636e\uff09</option>\n                    </select>\n                </div>\n            </details>\n        </div>\n\n        <div class=\"oair-section\">\n            <div class=\"oair-section-title\">\u989d\u5916\u8bf7\u6c42\u4f53</div>\n            <label class=\"oair-field-label\">\u989d\u5916\u8bf7\u6c42\u4f53 JSON\uff08\u53ef\u9009\uff09</label>\n            <textarea id=\"oair_extra_body\" class=\"text_pole\" rows=\"3\" style=\"width:100%; box-sizing:border-box;\" placeholder='{\"preset_name\":\"image\"}'></textarea>\n        </div>\n    </div>\n\n    <!-- \u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550 -->\n    <!-- TAB 3: \u63d0\u53d6                                           -->\n    <!-- \u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550 -->\n    <div class=\"oair-tab-panel\" id=\"oair_panel_extract\">\n        <div class=\"oair-section\">\n            <div class=\"oair-section-title\">\u63d0\u53d6\u63d0\u793a\u8bcd\u6b63\u5219</div>\n            <details class=\"oair-details\">\n                <summary>\u4ece\u52a9\u624b\u56de\u590d\u4e2d\u63d0\u53d6\u751f\u56fe\u63d0\u793a\u8bcd</summary>\n                <div class=\"oair-details-content\">\n                    <textarea id=\"oair_extraction_regex\" class=\"text_pole\" rows=\"3\" style=\"width:100%; box-sizing:border-box;\" placeholder='/&lt;pic[^&gt;]*prompt=\"([^\"]+)\"[^&gt;]*&gt;/g'></textarea>\n                </div>\n            </details>\n        </div>\n\n        <div class=\"oair-section\">\n            <div class=\"oair-section-title\">\u8fd4\u56de\u56fe\u7247\u6b63\u5219\u56de\u9000</div>\n            <details class=\"oair-details\">\n                <summary>\u5f53\u540e\u7aef\u628a\u56fe\u7247\u94fe\u63a5\u653e\u5728\u6587\u672c\u91cc\u8fd4\u56de\u65f6\u4f7f\u7528</summary>\n                <div class=\"oair-details-content\">\n                    <textarea id=\"oair_response_image_regex\" class=\"text_pole\" rows=\"2\" style=\"width:100%; box-sizing:border-box;\" placeholder='/!\\\\[[^\\\\]]*\\\\]\\\\(([^)\\\\s]+)\\\\)/g'></textarea>\n                    <div class=\"oair-hint\">\u6269\u5c55\u4f1a\u4f18\u5148\u8bfb\u53d6 <code>media</code> \u8fd9\u7c7b\u7ed3\u6784\u5316\u56fe\u7247\u5b57\u6bb5\u3002\u53ea\u6709\u5f53\u540e\u7aef\u628a\u56fe\u7247\u94fe\u63a5\u653e\u5728\u6587\u672c\u91cc\u8fd4\u56de\u65f6\uff0c\u624d\u4f1a\u4f7f\u7528\u8fd9\u91cc\u7684\u56de\u9000\u6b63\u5219\u3002</div>\n                </div>\n            </details>\n        </div>\n    </div>\n\n    <!-- \u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550 -->\n    <!-- TAB 4: \u4f18\u5316                                           -->\n    <!-- \u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550 -->\n    <div class=\"oair-tab-panel\" id=\"oair_panel_optimize\">\n        <!-- \u63d0\u793a\u8bcd\u4f18\u5316 -->\n        <div class=\"oair-section\">\n            <div class=\"oair-section-title\">\u63d0\u793a\u8bcd\u4f18\u5316 <span class=\"oair-badge oair-badge-orange\">\u65b0</span></div>\n            <label class=\"oair-toggle-label\">\n                <input id=\"oair_optimize_enabled\" type=\"checkbox\">\n                \u542f\u7528\u63d0\u793a\u8bcd\u4f18\u5316\n            </label>\n            <div class=\"oair-hint\">\u4f7f\u7528 LLM \u81ea\u52a8\u4f18\u5316\u63d0\u793a\u8bcd\uff0c\u6dfb\u52a0\u753b\u9762\u7ec6\u8282\u3001\u6784\u56fe\u3001\u5149\u7ebf\u7b49\u63cf\u8ff0\u3002</div>\n\n            <div style=\"margin-top:8px;\">\n                <label class=\"oair-toggle-label\">\n                    <input id=\"oair_optimize_auto\" type=\"checkbox\">\n                    \u81ea\u52a8\u4f18\u5316\uff08\u5e94\u7528\u4e8e\u81ea\u52a8\u63d0\u53d6\u7684\u63d0\u793a\u8bcd\uff09\n                </label>\n                <div class=\"oair-hint\">\u5173\u95ed\u65f6\uff0c\u4ec5\u5728\u624b\u52a8\u70b9\u51fb\u300c\u4f18\u5316\u63d0\u793a\u8bcd\u300d\u6309\u94ae\u65f6\u751f\u6548\u3002</div>\n            </div>\n\n            <details class=\"oair-details\">\n                <summary>\u4f18\u5316\u63d0\u793a\u8bcd\u6a21\u677f</summary>\n                <div class=\"oair-details-content\">\n                    <textarea id=\"oair_optimize_template\" class=\"text_pole\" rows=\"10\" style=\"width:100%; box-sizing:border-box;\" placeholder=\"\u4f18\u5316\u63d0\u793a\u8bcd\u7684\u6a21\u677f\uff0c\u4f7f\u7528 {{prompt}} \u63d2\u5165\u539f\u59cb\u63d0\u793a\u8bcd\u3002\"></textarea>\n                    <div class=\"oair-hint\">\u4f7f\u7528 {{prompt}} \u63d2\u5165\u539f\u59cb\u63d0\u793a\u8bcd\u3002\u4f18\u5316\u540e\u7684\u63d0\u793a\u8bcd\u5c06\u66ff\u4ee3\u539f\u59cb\u63d0\u793a\u8bcd\u53d1\u9001\u7ed9\u56fe\u7247\u751f\u6210\u540e\u7aef\u3002</div>\n                </div>\n            </details>\n\n            <!-- \u81ea\u5b9a\u4e49\u4f18\u5316 LLM \u540e\u7aef\uff08\u590d\u9009\u6846\u63a7\u5236\u5c55\u5f00\uff09 -->\n            <div style=\"margin-top:10px;\">\n                <label class=\"oair-toggle-label\">\n                    <input id=\"oair_optimize_use_custom\" type=\"checkbox\">\n                    \u4f7f\u7528\u81ea\u5b9a\u4e49\u4f18\u5316 LLM \u540e\u7aef\n                </label>\n                <div class=\"oair-hint\">\u52fe\u9009\u540e\u5c55\u5f00\u81ea\u5b9a\u4e49\u540e\u7aef\u914d\u7f6e\uff0c\u7559\u7a7a\u65f6\u9ed8\u8ba4\u4f7f\u7528\u9152\u9986\u4e3bAPI</div>\n\n                <div class=\"oair-custom-backend-content\" id=\"oair_custom_backend_fields\">\n                    <label class=\"oair-field-label\">\u4f18\u5316 LLM \u670d\u52a1\u5730\u5740</label>\n                    <input id=\"oair_optimize_api_url\" class=\"text_pole\" style=\"width:100%; box-sizing:border-box;\" placeholder=\"http://127.0.0.1:11434/v1\">\n                    <div class=\"oair-hint\" data-hint-id=\"optimize_url\">\u81ea\u5b9a\u4e49\u4f18\u5316LLM\u7684\u670d\u52a1\u5730\u5740\uff0c\u586b\u5230 /v1</div>\n\n                    <label class=\"oair-field-label\">\u4f18\u5316 LLM API \u5bc6\u94a5</label>\n                    <div class=\"oair-password-row\">\n                        <input id=\"oair_optimize_api_key\" type=\"password\" class=\"text_pole\" placeholder=\"sk-...\">\n                        <button type=\"button\" class=\"oair-eye-btn\" title=\"\u663e\u793a/\u9690\u85cf\u5bc6\u94a5\"><i class=\"fa-solid fa-eye\"></i></button>\n                    </div>\n                    <div class=\"oair-hint\" data-hint-id=\"optimize_key\">\u81ea\u5b9a\u4e49\u4f18\u5316LLM\u7684API\u5bc6\u94a5</div>\n\n                    <label class=\"oair-field-label\">\u4f18\u5316 LLM \u6a21\u578b</label>\n                    <div class=\"oair-model-row\">\n                        <input id=\"oair_optimize_model\" class=\"text_pole\" placeholder=\"gpt-4o-mini\">\n                        <button id=\"oair_btn_fetch_optimize_model\" class=\"menu_button\">\u83b7\u53d6\u6a21\u578b</button>\n                    </div>\n                    <select id=\"oair_optimize_model_select\" class=\"text_pole\"></select>\n                    <div class=\"oair-hint\" data-hint-id=\"optimize_model\">\u81ea\u5b9a\u4e49\u4f18\u5316LLM\u4f7f\u7528\u7684\u6a21\u578b</div>\n                </div>\n            </div>\n        </div>\n\n        <!-- \u56fa\u5b9a\u89d2\u8272\u5916\u8c8c\u6ce8\u5165 -->\n        <div class=\"oair-section\">\n            <div class=\"oair-section-title\">\u56fa\u5b9a\u89d2\u8272\u5916\u8c8c\u6ce8\u5165 <span class=\"oair-badge oair-badge-green\">\u753b\u5bf9\u4eba</span></div>\n            <label class=\"oair-field-label\">\u89d2\u8272\u5916\u8c8c\u8bbe\u5b9a\uff08\u6bcf\u884c\u4e00\u4e2a\u89d2\u8272\uff0c\u683c\u5f0f\u300c\u540d\u5b57\uff1a\u5916\u8c8c\u63cf\u8ff0\u300d\uff09</label>\n            <textarea id=\"oair_character_appearance\" class=\"text_pole\" rows=\"5\" style=\"width:100%; box-sizing:border-box;\" placeholder=\"\u5361\u63d0\u5e0c\u5a05\uff1a\u91d1\u8272\u957f\u53d1\uff0c\u84dd\u8272\u773c\u7738\uff0c\u5c16\u8033\uff0c\u5c11\u5973\u4f53\u578b\uff0c\u524d\u5723\u5973\u6c14\u8d28\uff0c\u786c\u6bdb\u732a\u76ae\u8f6f\u7532\uff0c\u7ec6\u5e26\u51c9\u978b\uff0c\u84dd\u8272\u811a\u8dbe\u7532\u6cb9&#10;\u9f50\u9f50\uff1a\u9ed1\u53d1\u9752\u5e74\uff0c\u4e0d\u6b7b\u4eba\uff0c\u61d2\u6563\u7684\u6076\u8da3\u5473\u795e\u60c5\"></textarea>\n            <div class=\"oair-hint\">\u751f\u6210\u56fe\u7247\u65f6\uff0c\u51e1\u662f\u63d0\u793a\u8bcd\u91cc\u51fa\u73b0\u7684\u89d2\u8272\uff0c\u4f1a\u81ea\u52a8\u628a\u5176\u5916\u8c8c\u5e76\u5165\u63d0\u793a\u8bcd\u672b\u5c3e\uff0c\u786e\u4fdd\u753b\u5bf9\u4eba\u3002\u7559\u7a7a\u5219\u4e0d\u6ce8\u5165\uff1b\u82e5\u586b\u5199\u4e00\u6bb5\u4e0d\u5e26\u300c\u540d\u5b57\uff1a\u300d\u7684\u6587\u5b57\uff0c\u5219\u6574\u4f53\u6ce8\u5165\u3002</div>\n        </div>\n\n        <!-- NSFW \u89c4\u907f -->\n        <div class=\"oair-section\">\n            <div class=\"oair-section-title\">NSFW \u89c4\u907f <span class=\"oair-badge oair-badge-red\">\u5b89\u5168</span></div>\n            <label class=\"oair-toggle-label\">\n                <input id=\"oair_nsfw_avoidance\" type=\"checkbox\">\n                \u542f\u7528 NSFW \u5185\u5bb9\u89c4\u907f\n            </label>\n            <div class=\"oair-hint\">\n                \u4f7f\u7528 LLM \u81ea\u52a8\u5ba1\u67e5\u63d0\u793a\u8bcd\uff0c\u79fb\u9664\u4e0d\u5b89\u5168\u5185\u5bb9\uff0c\u907f\u514d\u5c01\u53f7\u3002<br>\n                <b>\u5efa\u8bae\u5f00\u542f</b>\uff1a\u5373\u4f7f\u4e3b\u63d0\u793a\u8bcd\u5df2\u8981\u6c42 SFW\uff0c\u6b64\u529f\u80fd\u53ef\u4f5c\u4e3a\u989d\u5916\u5b89\u5168\u7f51\u3002\n            </div>\n\n            <details class=\"oair-details\">\n                <summary>NSFW \u5ba1\u67e5\u6a21\u677f</summary>\n                <div class=\"oair-details-content\">\n                    <textarea id=\"oair_nsfw_avoidance_template\" class=\"text_pole\" rows=\"8\" style=\"width:100%; box-sizing:border-box;\" placeholder=\"NSFW \u5ba1\u67e5\u6a21\u677f\uff0c\u4f7f\u7528 {{prompt}} \u63d2\u5165\u539f\u59cb\u63d0\u793a\u8bcd\u3002\"></textarea>\n                </div>\n            </details>\n        </div>\n\n        <!-- \u6d88\u606f\u603b\u7ed3\u6a21\u677f -->\n        <div class=\"oair-section\">\n            <div class=\"oair-section-title\">\u6d88\u606f\u603b\u7ed3\u6a21\u677f</div>\n            <details class=\"oair-details\">\n                <summary>\u5c06\u804a\u5929\u6d88\u606f\u8f6c\u5316\u4e3a\u751f\u56fe\u63d0\u793a\u8bcd\u7684\u6a21\u677f</summary>\n                <div class=\"oair-details-content\">\n                    <textarea id=\"oair_summarize_template\" class=\"text_pole\" rows=\"8\" style=\"width:100%; box-sizing:border-box;\" placeholder=\"\u4f7f\u7528 {{message}} \u63d2\u5165\u6d88\u606f\u5185\u5bb9\u3002\"></textarea>\n                    <div class=\"oair-hint\">\u70b9\u51fb\u6d88\u606f\u4e0a\u7684\u300c\u603b\u7ed3\u751f\u56fe\u300d\u6309\u94ae\u65f6\u4f7f\u7528\u6b64\u6a21\u677f\u3002</div>\n                </div>\n            </details>\n        </div>\n    </div>\n\n    <!-- \u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550 -->\n    <!-- TAB 5: \u624b\u52a8\u751f\u56fe                                       -->\n    <!-- \u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550 -->\n    <div class=\"oair-tab-panel\" id=\"oair_panel_manual\">\n        <div class=\"oair-section\">\n            <div class=\"oair-section-title\">\u624b\u52a8\u751f\u56fe</div>\n            <label class=\"oair-field-label\">\u8f93\u5165\u63d0\u793a\u8bcd</label>\n            <textarea id=\"oair_manual_prompt\" class=\"text_pole\" rows=\"4\" style=\"width:100%; box-sizing:border-box;\" placeholder=\"\u63cf\u8ff0\u4f60\u60f3\u751f\u6210\u7684\u56fe\u7247...\"></textarea>\n\n            <!-- \u4f18\u5316\u540e\u63d0\u793a\u8bcd\u5c55\u793a\u533a -->\n            <div id=\"oair_manual_optimized_prompt\" style=\"display:none;\">\n                <label class=\"oair-field-label\" style=\"color:#60ff90;\">\u2728 \u4f18\u5316\u540e\u7684\u63d0\u793a\u8bcd</label>\n                <div id=\"oair_manual_optimized_text\" class=\"oair-optimized-box\"></div>\n                <div class=\"oair-hint\" style=\"color:#60ff90;\">\u751f\u6210\u56fe\u7247\u65f6\u5c06\u4f7f\u7528\u6b64\u4f18\u5316\u7248\u672c</div>\n            </div>\n\n            <div class=\"oair-btn-row\">\n                <button id=\"oair_btn_import_msg\" class=\"menu_button\" style=\"flex:1; justify-content:center;\">\n                    \ud83d\udce5 \u5bfc\u5165\u6d88\u606f\n                </button>\n                <button id=\"oair_btn_optimize\" class=\"menu_button\" style=\"flex:1; justify-content:center;\">\n                    \u2728 \u4f18\u5316\u63d0\u793a\u8bcd\n                </button>\n                <button id=\"oair_btn_manual_gen\" class=\"menu_button\" style=\"flex:1; justify-content:center;\">\n                    \ud83c\udfa8 \u751f\u6210\u56fe\u7247\n                </button>\n            </div>\n\n            <div class=\"oair-btn-row\">\n                <button id=\"oair_btn_clear_manual\" class=\"menu_button\" style=\"flex:1; justify-content:center;\">\n                    \u6e05\u7a7a\n                </button>\n                <button id=\"oair_btn_attach\" class=\"menu_button\" style=\"flex:1; justify-content:center;\">\n                    \ud83d\udcce \u9644\u52a0\u5230\u6d88\u606f\n                </button>\n            </div>\n\n            <div class=\"oair-hint\" style=\"margin-top:4px;\">\n                \ud83d\udce5 \u5bfc\u5165\u6d88\u606f\uff1a\u5c06\u5f53\u524d\u804a\u5929\u6700\u540e\u4e00\u6761 AI \u6d88\u606f\u5bfc\u5165\u4e3a\u63d0\u793a\u8bcd\n            </div>\n            <div class=\"oair-hint\">\n                \ud83d\udca1 \u63d0\u793a\uff1a\u5148\u8f93\u5165\u63d0\u793a\u8bcd \u2192 \u70b9\u51fb\u300c\u4f18\u5316\u63d0\u793a\u8bcd\u300d\u67e5\u770b\u4f18\u5316\u6548\u679c \u2192 \u70b9\u51fb\u300c\u751f\u6210\u56fe\u7247\u300d\n            </div>\n        </div>\n\n        <div class=\"oair-section\">\n            <div class=\"oair-section-title\">\u9884\u89c8</div>\n            <div id=\"oair_manual_preview\" style=\"display:grid; gap:8px;\"></div>\n        </div>\n    </div>\n</div>\n";
+const SETTINGS_FULL_HTML = "<!-- \u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550 -->\n<!-- \u5b8c\u6574\u914d\u7f6e\u7248 \u2014 \u7528\u4e8e\u60ac\u6d6e\u7a97\uff085\u6807\u7b7e\u9875\u5b8c\u6574\u914d\u7f6e\uff09 -->\n<!-- \u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550 -->\n<style>\n    /* \u2500\u2500\u2500 \u6807\u7b7e\u9875\u5bb9\u5668 \u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500 */\n    .oair-tabs-container {\n        display: flex;\n        flex-direction: column;\n        gap: 0;\n    }\n    .oair-tab-bar {\n        display: flex;\n        gap: 2px;\n        border-bottom: 1px solid rgba(255,255,255,0.15);\n        margin-bottom: 8px;\n        flex-wrap: nowrap;\n        overflow-x: auto;\n        scrollbar-width: thin;\n    }\n    .oair-tab-label {\n        padding: 5px 10px;\n        font-size: 0.78em;\n        cursor: pointer;\n        border-radius: 4px 4px 0 0;\n        opacity: 0.55;\n        transition: all 0.15s;\n        user-select: none;\n        white-space: nowrap;\n        flex: 0 0 auto;\n    }\n    .oair-tab-label:hover {\n        opacity: 0.85;\n        background: rgba(255,255,255,0.05);\n    }\n    .oair-tab-panel {\n        display: none;\n    }\n\n    /* \u6fc0\u6d3b\u6807\u7b7e\u6837\u5f0f */\n    #oair_tab_basic:checked ~ .oair-tab-bar label[for=\"oair_tab_basic\"],\n    #oair_tab_backend:checked ~ .oair-tab-bar label[for=\"oair_tab_backend\"],\n    #oair_tab_extract:checked ~ .oair-tab-bar label[for=\"oair_tab_extract\"],\n    #oair_tab_optimize:checked ~ .oair-tab-bar label[for=\"oair_tab_optimize\"],\n    #oair_tab_worldbook:checked ~ .oair-tab-bar label[for=\"oair_tab_worldbook\"],\n    #oair_tab_manual:checked ~ .oair-tab-bar label[for=\"oair_tab_manual\"],\n    #oair_tab_gallery:checked ~ .oair-tab-bar label[for=\"oair_tab_gallery\"] {\n        opacity: 1;\n        background: rgba(255,255,255,0.1);\n        border-bottom: 2px solid var(--SmartThemeQuoteColor, #68a0ff);\n    }\n\n    /* \u663e\u793a\u5bf9\u5e94\u9762\u677f */\n    #oair_tab_basic:checked ~ #oair_panel_basic,\n    #oair_tab_backend:checked ~ #oair_panel_backend,\n    #oair_tab_extract:checked ~ #oair_panel_extract,\n    #oair_tab_optimize:checked ~ #oair_panel_optimize,\n    #oair_tab_worldbook:checked ~ #oair_panel_worldbook,\n    #oair_tab_manual:checked ~ #oair_panel_manual,\n    #oair_tab_gallery:checked ~ #oair_panel_gallery {\n        display: block;\n    }\n\n    /* \u2500\u2500\u2500 \u901a\u7528\u7ec4\u4ef6\u6837\u5f0f \u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500 */\n    .oair-section {\n        background: rgba(0,0,0,0.15);\n        padding: 10px;\n        border-radius: 6px;\n        margin-bottom: 8px;\n    }\n    .oair-section-title {\n        font-weight: bold;\n        font-size: 0.88em;\n        margin-bottom: 8px;\n        display: flex;\n        align-items: center;\n        gap: 6px;\n    }\n    .oair-field-label {\n        display: block;\n        font-size: 0.75em;\n        opacity: 0.8;\n        margin-top: 6px;\n        margin-bottom: 2px;\n    }\n    .oair-hint {\n        margin-top: 4px;\n        font-size: 0.72em;\n        opacity: 0.6;\n        line-height: 1.4;\n    }\n    .oair-row {\n        display: grid;\n        grid-template-columns: 1fr 1fr;\n        gap: 6px;\n        margin-top: 6px;\n    }\n    .oair-btn-row {\n        display: flex;\n        gap: 6px;\n        margin-top: 6px;\n    }\n    .oair-optimized-box {\n        background: rgba(0,200,100,0.08);\n        border: 1px solid rgba(0,200,100,0.25);\n        border-radius: 6px;\n        padding: 8px;\n        margin-top: 6px;\n        font-size: 0.85em;\n        line-height: 1.5;\n        white-space: pre-wrap;\n        word-break: break-all;\n    }\n    .oair-toggle-row {\n        display: flex;\n        justify-content: space-between;\n        align-items: center;\n        gap: 8px;\n    }\n    .oair-toggle-label {\n        display: flex;\n        align-items: center;\n        gap: 6px;\n        font-size: 0.8em;\n    }\n    .oair-badge {\n        display: inline-block;\n        padding: 1px 6px;\n        border-radius: 3px;\n        font-size: 0.7em;\n        font-weight: bold;\n        vertical-align: middle;\n    }\n    .oair-badge-green {\n        background: rgba(0,200,100,0.2);\n        color: #60ff90;\n    }\n    .oair-badge-orange {\n        background: rgba(255,180,60,0.2);\n        color: #ffd280;\n    }\n    .oair-badge-red {\n        background: rgba(255,80,80,0.2);\n        color: #ff9090;\n    }\n\n    /* \u2500\u2500\u2500 \u65b0\u589e\uff1a\u8f93\u5165+\u6309\u94ae\u7ec4\u5408\u884c \u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500 */\n    .oair-input-with-btn {\n        display: flex;\n        gap: 6px;\n        align-items: center;\n    }\n    .oair-input-with-btn .text_pole {\n        flex: 1;\n        min-width: 0;\n    }\n    .oair-input-with-btn .menu_button {\n        flex-shrink: 0;\n        white-space: nowrap;\n    }\n\n    /* \u2500\u2500\u2500 \u65b0\u589e\uff1a\u5bc6\u7801\u884c\uff08\u8f93\u5165+\u773c\u775b\u6309\u94ae\uff09 \u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500 */\n    .oair-password-row {\n        display: flex;\n        gap: 6px;\n        align-items: center;\n    }\n    .oair-password-row .text_pole {\n        flex: 1;\n        min-width: 0;\n    }\n    .oair-password-row .oair-eye-btn {\n        flex-shrink: 0;\n        width: 32px;\n        height: 32px;\n        display: flex;\n        align-items: center;\n        justify-content: center;\n        background: rgba(255,255,255,0.08);\n        border: 1px solid rgba(255,255,255,0.15);\n        border-radius: 4px;\n        color: var(--SmartThemeBodyColor, #ccc);\n        cursor: pointer;\n        font-size: 13px;\n        transition: background 0.15s;\n    }\n    .oair-password-row .oair-eye-btn:hover {\n        background: rgba(255,255,255,0.15);\n    }\n\n    /* \u2500\u2500\u2500 \u65b0\u589e\uff1a\u6a21\u578b\u884c\uff08\u8f93\u5165+\u83b7\u53d6\u6309\u94ae\uff09 \u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500 */\n    .oair-model-row {\n        display: flex;\n        gap: 6px;\n        align-items: center;\n    }\n    .oair-model-row .text_pole {\n        flex: 1;\n        min-width: 0;\n    }\n    .oair-model-row .menu_button {\n        flex-shrink: 0;\n        white-space: nowrap;\n    }\n\n    /* \u2500\u2500\u2500 \u65b0\u589e\uff1a\u6a21\u578b\u9009\u62e9\u4e0b\u62c9 \u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500 */\n    #oair_model_select,\n    #oair_optimize_model_select {\n        width: 100%;\n        margin-top: 4px;\n        display: none;\n    }\n    #oair_model_select.oair-visible,\n    #oair_optimize_model_select.oair-visible {\n        display: block;\n    }\n\n    /* \u2500\u2500\u2500 \u65b0\u589e\uff1a\u4fdd\u5b58\u884c\uff08\u8d85\u65f6+\u4fdd\u5b58\u6309\u94ae\uff09 \u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500 */\n    .oair-save-row {\n        display: flex;\n        gap: 6px;\n        align-items: center;\n    }\n    .oair-save-row .text_pole {\n        flex: 1;\n        min-width: 0;\n    }\n    .oair-save-row .menu_button {\n        flex-shrink: 0;\n        white-space: nowrap;\n    }\n\n    /* \u2500\u2500\u2500 \u65b0\u589e\uff1aDetails/Summary \u6298\u53e0\u6837\u5f0f \u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500 */\n    .oair-details {\n        margin-top: 8px;\n    }\n    .oair-details summary {\n        font-size: 0.78em;\n        cursor: pointer;\n        opacity: 0.7;\n        padding: 4px 0;\n        user-select: none;\n        list-style: none;\n        display: flex;\n        align-items: center;\n        gap: 4px;\n    }\n    .oair-details summary::-webkit-details-marker {\n        display: none;\n    }\n    .oair-details summary::before {\n        content: \"\u25b8\";\n        display: inline-block;\n        width: 12px;\n        text-align: center;\n        transition: transform 0.15s;\n    }\n    .oair-details[open] summary::before {\n        transform: rotate(90deg);\n    }\n    .oair-details summary:hover {\n        opacity: 1;\n    }\n    .oair-details .oair-details-content {\n        margin-top: 6px;\n    }\n\n    /* \u2500\u2500\u2500 \u65b0\u589e\uff1a\u81ea\u5b9a\u4e49\u4f18\u5316LLM\u540e\u7aef\u590d\u9009\u6846\u5c55\u5f00 \u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500 */\n    .oair-custom-backend-content {\n        display: none;\n    }\n    .oair-custom-backend-content.oair-visible {\n        display: block;\n    }\n\n    /* \u2500\u2500\u2500 \u533a\u5757\u5de6\u5f3a\u8c03\u8fb9\uff08\u4e3b\u9898\u8272\uff09 \u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500 */\n    .oair-settings-ui .oair-section {\n        border-left: 2px solid var(--SmartThemeQuoteColor, #68a0ff);\n    }\n\n    /* \u2500\u2500\u2500 \u56fe\u5e93 \u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500 */\n    .oair-gallery-toolbar {\n        display: flex;\n        align-items: center;\n        justify-content: space-between;\n        gap: 8px;\n    }\n    .oair-gallery-grid {\n        display: grid;\n        grid-template-columns: repeat(auto-fill, minmax(90px, 1fr));\n        gap: 8px;\n    }\n    .oair-gallery-cell {\n        position: relative;\n        border-radius: 6px;\n        overflow: hidden;\n        background: rgba(0,0,0,0.2);\n        aspect-ratio: 1 / 1;\n    }\n    .oair-gallery-cell img {\n        width: 100%;\n        height: 100%;\n        object-fit: cover;\n        cursor: pointer;\n        display: block;\n    }\n    .oair-gallery-cell-bar {\n        position: absolute;\n        bottom: 0;\n        left: 0;\n        right: 0;\n        display: flex;\n        justify-content: center;\n        gap: 2px;\n        padding: 2px;\n        background: rgba(0,0,0,0.55);\n        opacity: 0;\n        transition: opacity 0.15s;\n    }\n    .oair-gallery-cell:hover .oair-gallery-cell-bar {\n        opacity: 1;\n    }\n    .oair-gallery-mini {\n        border: none;\n        background: transparent;\n        cursor: pointer;\n        font-size: 13px;\n        padding: 2px 4px;\n        line-height: 1;\n    }\n    /* \u79fb\u52a8\u7aef\u65e0 hover\uff1a\u64cd\u4f5c\u6761\u5e38\u663e */\n    @media (max-width: 1000px) {\n        .oair-gallery-cell-bar { opacity: 0.9; }\n    }\n</style>\n\n<div class=\"oair-settings-ui\">\n    <!-- \u72b6\u6001\u680f\uff08\u60ac\u6d6e\u7a97\u5185\u4e5f\u6709\uff09 -->\n    <div style=\"display:flex; justify-content:space-between; align-items:center; margin-bottom:10px; border-bottom:1px solid rgba(255,255,255,0.1); padding-bottom:5px; gap:8px;\">\n        <div id=\"oair_floating_status\" style=\"font-size:0.8em; color:var(--SmartThemeQuoteColor, #68a0ff);\">\u5c31\u7eea</div>\n        <label style=\"display:flex; align-items:center; gap:6px; font-size:0.8em; white-space:nowrap;\">\n            <input id=\"oair_floating_enabled\" type=\"checkbox\">\n            \u542f\u7528\n        </label>\n    </div>\n\n    <!-- \u9690\u85cf\u7684 radio \u8f93\u5165 -->\n    <input type=\"radio\" name=\"oair_tab\" id=\"oair_tab_basic\" checked style=\"display:none\">\n    <input type=\"radio\" name=\"oair_tab\" id=\"oair_tab_backend\" style=\"display:none\">\n    <input type=\"radio\" name=\"oair_tab\" id=\"oair_tab_extract\" style=\"display:none\">\n    <input type=\"radio\" name=\"oair_tab\" id=\"oair_tab_optimize\" style=\"display:none\">\n    <input type=\"radio\" name=\"oair_tab\" id=\"oair_tab_worldbook\" style=\"display:none\">\n    <input type=\"radio\" name=\"oair_tab\" id=\"oair_tab_manual\" style=\"display:none\">\n    <input type=\"radio\" name=\"oair_tab\" id=\"oair_tab_gallery\" style=\"display:none\">\n\n    <!-- \u6807\u7b7e\u680f -->\n    <div class=\"oair-tab-bar\">\n        <label for=\"oair_tab_basic\" class=\"oair-tab-label\">\ud83d\udccb \u57fa\u7840</label>\n        <label for=\"oair_tab_backend\" class=\"oair-tab-label\">\u2699\ufe0f \u540e\u7aef</label>\n        <label for=\"oair_tab_extract\" class=\"oair-tab-label\">\ud83d\udd0d \u63d0\u53d6</label>\n        <label for=\"oair_tab_optimize\" class=\"oair-tab-label\">\u2728 \u4f18\u5316</label>\n        <label for=\"oair_tab_worldbook\" class=\"oair-tab-label\">\ud83c\udfad \u8bbe\u5b9a</label>\n        <label for=\"oair_tab_manual\" class=\"oair-tab-label\">\ud83c\udfa8 \u624b\u52a8</label>\n        <label for=\"oair_tab_gallery\" class=\"oair-tab-label\">\ud83d\uddbc\ufe0f \u56fe\u5e93</label>\n    </div>\n\n    <!-- \u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550 -->\n    <!-- TAB 1: \u57fa\u7840                                           -->\n    <!-- \u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550 -->\n    <div class=\"oair-tab-panel\" id=\"oair_panel_basic\">\n        <div class=\"oair-section\">\n            <div class=\"oair-section-title\">\u4e3b\u6a21\u578b\u63d0\u793a\u6ce8\u5165</div>\n            <details class=\"oair-details\">\n                <summary>\u4e16\u754c\u4e66\u5f0f\u9ed8\u8ba4\u63d0\u793a\u8bcd</summary>\n                <div class=\"oair-details-content\">\n                    <textarea id=\"oair_main_prompt\" class=\"text_pole\" rows=\"12\" style=\"width:100%; box-sizing:border-box;\" placeholder=\"\u8fd9\u91cc\u7684\u5185\u5bb9\u4f1a\u50cf\u5e38\u9a7b\u4e16\u754c\u4e66\u4e00\u6837\u6ce8\u5165\u5230\u4e3b\u6a21\u578b\u63d0\u793a\u94fe\u91cc\u3002\"></textarea>\n                    <div class=\"oair-hint\">\u8fd9\u6bb5\u6587\u5b57\u4f1a\u4ee5\u7cfb\u7edf\u89c4\u5219\u7684\u65b9\u5f0f\u81ea\u52a8\u6ce8\u5165\u5230\u4e3b\u6a21\u578b\u63d0\u793a\u94fe\u5f00\u5934\uff0c\u4e0d\u4f1a\u53d1\u9001\u7ed9\u56fe\u7247\u540e\u7aef\u3002</div>\n                </div>\n            </details>\n        </div>\n\n        <div class=\"oair-section\">\n            <div class=\"oair-section-title\">\u6d88\u606f\u751f\u56fe\u6309\u94ae</div>\n            <label class=\"oair-toggle-label\">\n                <input id=\"oair_message_gen_enabled\" type=\"checkbox\">\n                \u5728\u804a\u5929\u6d88\u606f\u4e0a\u663e\u793a\u751f\u56fe\u6309\u94ae\n            </label>\n            <div class=\"oair-hint\">\u542f\u7528\u540e\uff0c\u6bcf\u6761\u6d88\u606f\u7684\u64cd\u4f5c\u680f\u4f1a\u51fa\u73b0\u4e24\u4e2a\u6309\u94ae\uff1a<br>\n                \ud83d\uddbc\ufe0f \u76f4\u63a5\u751f\u56fe \u2014 \u4f7f\u7528\u6d88\u606f\u539f\u6587\u4f5c\u4e3a\u63d0\u793a\u8bcd<br>\n                \u2728 \u603b\u7ed3\u751f\u56fe \u2014 \u5148\u5c06\u6d88\u606f\u603b\u7ed3\u4e3a\u63d0\u793a\u8bcd\u518d\u751f\u56fe\n            </div>\n        </div>\n    </div>\n\n    <!-- \u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550 -->\n    <!-- TAB 2: \u540e\u7aef                                           -->\n    <!-- \u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550 -->\n    <div class=\"oair-tab-panel\" id=\"oair_panel_backend\">\n        <div class=\"oair-section\">\n            <div class=\"oair-section-title\">\u5feb\u6377\u9884\u8bbe</div>\n            <button id=\"oair_btn_chatgpt2api_preset\" class=\"menu_button\" style=\"width:100%; justify-content:center;\">\u26a1 \u4e00\u952e chatgpt2api \u9884\u8bbe</button>\n            <div class=\"oair-hint\">\u4e00\u952e\u5207\u6362\u4e3a chatgpt2api \u63a8\u8350\u914d\u7f6e\uff1aImages \u6a21\u5f0f\u3001\u6a21\u578b gpt-image-2\u3001\u54cd\u5e94 b64_json\u3001\u63d0\u793a\u8bcd\u76f4\u901a\u3001\u6587\u672c\u6b65\u9aa4\u8d70\u9152\u9986\u4e3b\u6a21\u578b\u3002\u5e94\u7528\u540e\u8bf7\u786e\u8ba4\u670d\u52a1\u5730\u5740\u4e0e API \u5bc6\u94a5\u662f\u5426\u6b63\u786e\u3002</div>\n        </div>\n\n        <div class=\"oair-section\">\n            <div class=\"oair-section-title\">API \u6a21\u5f0f</div>\n            <label class=\"oair-field-label\">\u9009\u62e9\u63a5\u53e3\u7c7b\u578b</label>\n            <select id=\"oair_api_mode\" class=\"text_pole\" style=\"width:100%; box-sizing:border-box;\">\n                <option value=\"chat\">Chat Completions (/v1/chat/completions)</option>\n                <option value=\"images\">Images API (/v1/images/generations)</option>\n            </select>\n            <div class=\"oair-hint\">\n                <b>Chat Completions</b>\uff1a\u901a\u8fc7\u804a\u5929\u63a5\u53e3\u751f\u56fe\uff0c\u540e\u7aef\u5728\u6587\u672c\u56de\u590d\u4e2d\u8fd4\u56de\u56fe\u7247\u94fe\u63a5<br>\n                <b>Images API</b>\uff1a\u4f7f\u7528 OpenAI \u6807\u51c6\u56fe\u7247\u751f\u6210\u63a5\u53e3\uff0c\u76f4\u63a5\u8fd4\u56de\u56fe\u7247\u6570\u636e\n            </div>\n        </div>\n\n        <div class=\"oair-section\">\n            <div class=\"oair-section-title\">\u8fde\u63a5\u914d\u7f6e</div>\n\n            <!-- \u670d\u52a1\u5730\u5740 -->\n            <label class=\"oair-field-label\">\u670d\u52a1\u5730\u5740</label>\n            <input id=\"oair_service_url\" class=\"text_pole\" style=\"width:100%; box-sizing:border-box;\" placeholder=\"http://127.0.0.1:8199/v1\">\n            <div class=\"oair-hint\">\u53ea\u586b\u5230 /v1\uff0c\u8def\u5f84\u540e\u7f00\u6839\u636eAPI\u6a21\u5f0f\u81ea\u52a8\u8865\u5168</div>\n\n            <!-- API \u5bc6\u94a5\uff08\u5e26\u773c\u775b\u6309\u94ae\uff09 -->\n            <label class=\"oair-field-label\">API \u5bc6\u94a5</label>\n            <div class=\"oair-password-row\">\n                <input id=\"oair_api_key\" type=\"password\" class=\"text_pole\" placeholder=\"sk-any\">\n                <button type=\"button\" class=\"oair-eye-btn\" title=\"\u663e\u793a/\u9690\u85cf\u5bc6\u94a5\"><i class=\"fa-solid fa-eye\"></i></button>\n            </div>\n\n            <!-- \u6a21\u578b\uff08\u8f93\u5165+\u83b7\u53d6\u6309\u94ae+\u9690\u85cf\u4e0b\u62c9\uff09 -->\n            <label class=\"oair-field-label\">\u6a21\u578b</label>\n            <div class=\"oair-model-row\">\n                <input id=\"oair_model\" class=\"text_pole\" placeholder=\"any\">\n                <button id=\"oair_btn_fetch_model\" class=\"menu_button\">\u83b7\u53d6\u6a21\u578b</button>\n            </div>\n            <select id=\"oair_model_select\" class=\"text_pole\"></select>\n\n            <!-- \u8d85\u65f6+\u4fdd\u5b58\u6309\u94ae -->\n            <label class=\"oair-field-label\">\u8d85\u65f6\uff08\u6beb\u79d2\uff09</label>\n            <div class=\"oair-save-row\">\n                <input id=\"oair_timeout_ms\" type=\"number\" min=\"1000\" step=\"1000\" class=\"text_pole\" placeholder=\"120000\">\n                <button id=\"oair_btn_save_api\" class=\"menu_button\">\ud83d\udcbe \u4fdd\u5b58\u8bbe\u7f6e</button>\n            </div>\n        </div>\n\n        <!-- Chat Completions \u4e13\u5c5e\u5b57\u6bb5 -->\n        <div class=\"oair-section oair-chat-api-fields\">\n            <details class=\"oair-details\">\n                <summary>Chat Completions \u6a21\u677f</summary>\n                <div class=\"oair-details-content\">\n                    <label class=\"oair-field-label\">\u53d1\u9001\u7ed9\u56fe\u7247\u540e\u7aef\u7684\u6a21\u677f</label>\n                    <textarea id=\"oair_prompt_template\" class=\"text_pole\" rows=\"3\" style=\"width:100%; box-sizing:border-box;\" placeholder=\"\u5728\u9700\u8981\u63d2\u5165\u63d0\u53d6\u5185\u5bb9\u7684\u4f4d\u7f6e\u4f7f\u7528 {{prompt}}\u3002\"></textarea>\n                    <div class=\"oair-hint\">\u5c06\u63d0\u53d6\u51fa\u7684\u63d0\u793a\u8bcd\u5305\u88c5\u540e\u53d1\u7ed9 chat completions \u540e\u7aef\u3002</div>\n                </div>\n            </details>\n        </div>\n\n        <!-- Images API \u4e13\u5c5e\u5b57\u6bb5 -->\n        <div class=\"oair-section oair-images-api-fields\" style=\"display:none;\">\n            <details class=\"oair-details\">\n                <summary>Images API \u53c2\u6570</summary>\n                <div class=\"oair-details-content\">\n                    <label class=\"oair-field-label\">\u53d1\u9001\u7ed9\u56fe\u7247\u540e\u7aef\u7684\u6a21\u677f</label>\n                    <textarea id=\"oair_images_prompt_template\" class=\"text_pole\" rows=\"2\" style=\"width:100%; box-sizing:border-box;\" placeholder=\"{{prompt}}\uff08\u9ed8\u8ba4\u76f4\u901a\uff0c\u4e0d\u5305\u88c5\uff09\"></textarea>\n\n                    <div class=\"oair-row\">\n                        <div>\n                            <label class=\"oair-field-label\">\u56fe\u7247\u5c3a\u5bf8</label>\n                            <select id=\"oair_image_size\" class=\"text_pole\" style=\"width:100%; box-sizing:border-box;\">\n                                <option value=\"256x256\">256x256</option>\n                                <option value=\"512x512\">512x512</option>\n                                <option value=\"1024x1024\">1024x1024</option>\n                                <option value=\"1024x1792\">1024x1792</option>\n                                <option value=\"1792x1024\">1792x1024</option>\n                            </select>\n                        </div>\n                        <div>\n                            <label class=\"oair-field-label\">\u751f\u6210\u6570\u91cf</label>\n                            <input id=\"oair_image_count\" type=\"number\" min=\"1\" max=\"10\" class=\"text_pole\" style=\"width:100%; box-sizing:border-box;\">\n                        </div>\n                    </div>\n\n                    <label class=\"oair-field-label\">\u54cd\u5e94\u683c\u5f0f</label>\n                    <select id=\"oair_image_response_format\" class=\"text_pole\" style=\"width:100%; box-sizing:border-box;\">\n                        <option value=\"url\">URL\uff08\u8fd4\u56de\u56fe\u7247\u94fe\u63a5\uff09</option>\n                        <option value=\"b64_json\">Base64\uff08\u8fd4\u56de\u56fe\u7247\u6570\u636e\uff09</option>\n                    </select>\n                </div>\n            </details>\n        </div>\n\n        <div class=\"oair-section\">\n            <div class=\"oair-section-title\">\u989d\u5916\u8bf7\u6c42\u4f53</div>\n            <label class=\"oair-field-label\">\u989d\u5916\u8bf7\u6c42\u4f53 JSON\uff08\u53ef\u9009\uff09</label>\n            <textarea id=\"oair_extra_body\" class=\"text_pole\" rows=\"3\" style=\"width:100%; box-sizing:border-box;\" placeholder='{\"preset_name\":\"image\"}'></textarea>\n        </div>\n    </div>\n\n    <!-- \u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550 -->\n    <!-- TAB 3: \u63d0\u53d6                                           -->\n    <!-- \u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550 -->\n    <div class=\"oair-tab-panel\" id=\"oair_panel_extract\">\n        <div class=\"oair-section\">\n            <div class=\"oair-section-title\">\u63d0\u53d6\u63d0\u793a\u8bcd\u6b63\u5219</div>\n            <details class=\"oair-details\">\n                <summary>\u4ece\u52a9\u624b\u56de\u590d\u4e2d\u63d0\u53d6\u751f\u56fe\u63d0\u793a\u8bcd</summary>\n                <div class=\"oair-details-content\">\n                    <textarea id=\"oair_extraction_regex\" class=\"text_pole\" rows=\"3\" style=\"width:100%; box-sizing:border-box;\" placeholder='/&lt;pic[^&gt;]*prompt=\"([^\"]+)\"[^&gt;]*&gt;/g'></textarea>\n                </div>\n            </details>\n        </div>\n\n        <div class=\"oair-section\">\n            <div class=\"oair-section-title\">\u8fd4\u56de\u56fe\u7247\u6b63\u5219\u56de\u9000</div>\n            <details class=\"oair-details\">\n                <summary>\u5f53\u540e\u7aef\u628a\u56fe\u7247\u94fe\u63a5\u653e\u5728\u6587\u672c\u91cc\u8fd4\u56de\u65f6\u4f7f\u7528</summary>\n                <div class=\"oair-details-content\">\n                    <textarea id=\"oair_response_image_regex\" class=\"text_pole\" rows=\"2\" style=\"width:100%; box-sizing:border-box;\" placeholder='/!\\\\[[^\\\\]]*\\\\]\\\\(([^)\\\\s]+)\\\\)/g'></textarea>\n                    <div class=\"oair-hint\">\u6269\u5c55\u4f1a\u4f18\u5148\u8bfb\u53d6 <code>media</code> \u8fd9\u7c7b\u7ed3\u6784\u5316\u56fe\u7247\u5b57\u6bb5\u3002\u53ea\u6709\u5f53\u540e\u7aef\u628a\u56fe\u7247\u94fe\u63a5\u653e\u5728\u6587\u672c\u91cc\u8fd4\u56de\u65f6\uff0c\u624d\u4f1a\u4f7f\u7528\u8fd9\u91cc\u7684\u56de\u9000\u6b63\u5219\u3002</div>\n                </div>\n            </details>\n        </div>\n    </div>\n\n    <!-- \u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550 -->\n    <!-- TAB 4: \u4f18\u5316                                           -->\n    <!-- \u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550 -->\n    <div class=\"oair-tab-panel\" id=\"oair_panel_optimize\">\n        <!-- \u63d0\u793a\u8bcd\u4f18\u5316 -->\n        <div class=\"oair-section\">\n            <div class=\"oair-section-title\">\u63d0\u793a\u8bcd\u4f18\u5316 <span class=\"oair-badge oair-badge-orange\">\u65b0</span></div>\n            <label class=\"oair-toggle-label\">\n                <input id=\"oair_optimize_enabled\" type=\"checkbox\">\n                \u542f\u7528\u63d0\u793a\u8bcd\u4f18\u5316\n            </label>\n            <div class=\"oair-hint\">\u4f7f\u7528 LLM \u81ea\u52a8\u4f18\u5316\u63d0\u793a\u8bcd\uff0c\u6dfb\u52a0\u753b\u9762\u7ec6\u8282\u3001\u6784\u56fe\u3001\u5149\u7ebf\u7b49\u63cf\u8ff0\u3002</div>\n\n            <div style=\"margin-top:8px;\">\n                <label class=\"oair-toggle-label\">\n                    <input id=\"oair_optimize_auto\" type=\"checkbox\">\n                    \u81ea\u52a8\u4f18\u5316\uff08\u5e94\u7528\u4e8e\u81ea\u52a8\u63d0\u53d6\u7684\u63d0\u793a\u8bcd\uff09\n                </label>\n                <div class=\"oair-hint\">\u5173\u95ed\u65f6\uff0c\u4ec5\u5728\u624b\u52a8\u70b9\u51fb\u300c\u4f18\u5316\u63d0\u793a\u8bcd\u300d\u6309\u94ae\u65f6\u751f\u6548\u3002</div>\n            </div>\n\n            <label class=\"oair-field-label\">\u6587\u672c\u56de\u590d\u957f\u5ea6\u4e0a\u9650 max_tokens\uff08\u4f18\u5316 / \u5ba1\u67e5 / \u603b\u7ed3\u8c03\u7528\uff09</label>\n            <input id=\"oair_text_max_tokens\" class=\"text_pole\" type=\"number\" min=\"256\" step=\"256\" placeholder=\"8192\">\n            <div class=\"oair-hint\"><b>\u63a8\u7406\u6a21\u578b(glm / o1 \u7b49)\u5efa\u8bae 4096~16384</b>\uff1a\u592a\u5c0f\uff08\u5982 1500\uff09\u4f1a\u8ba9\u300c\u601d\u8003\u300d\u5403\u5149\u9884\u7b97\u3001\u6700\u7ec8\u63d0\u793a\u8bcd\u88ab\u622a\u65ad\u5bfc\u81f4\u8d28\u91cf\u5f88\u4f4e\uff1b\u592a\u5927\uff08\u5982 65535\uff09\u90e8\u5206\u540e\u7aef\u4f1a\u6302\u8d77\u6216\u62d2\u7edd\u3002\u4e3b API \u4e0e\u81ea\u5b9a\u4e49\u540e\u7aef\u90fd\u4f1a\u7528\u8fd9\u4e2a\u503c\u3002</div>\n\n            <details class=\"oair-details\">\n                <summary>\u4f18\u5316\u63d0\u793a\u8bcd\u6a21\u677f</summary>\n                <div class=\"oair-details-content\">\n                    <textarea id=\"oair_optimize_template\" class=\"text_pole\" rows=\"10\" style=\"width:100%; box-sizing:border-box;\" placeholder=\"\u4f18\u5316\u63d0\u793a\u8bcd\u7684\u6a21\u677f\uff0c\u4f7f\u7528 {{prompt}} \u63d2\u5165\u539f\u59cb\u63d0\u793a\u8bcd\u3002\"></textarea>\n                    <div class=\"oair-hint\">\u4f7f\u7528 {{prompt}} \u63d2\u5165\u539f\u59cb\u63d0\u793a\u8bcd\u3002\u4f18\u5316\u540e\u7684\u63d0\u793a\u8bcd\u5c06\u66ff\u4ee3\u539f\u59cb\u63d0\u793a\u8bcd\u53d1\u9001\u7ed9\u56fe\u7247\u751f\u6210\u540e\u7aef\u3002</div>\n                </div>\n            </details>\n\n            <div class=\"oair-btn-row\">\n                <button id=\"oair_btn_reset_optimize_template\" class=\"menu_button\" style=\"flex:1; justify-content:center;\">\u21ba \u91cd\u7f6e\u4e3a 5 \u6a21\u5757\u65b0\u6a21\u677f</button>\n            </div>\n            <div class=\"oair-hint\">\u628a\u4f18\u5316\u6a21\u677f\u91cd\u7f6e\u4e3a\u5185\u7f6e 5 \u6a21\u5757\u7248\uff08\u542b {{style}} / {{characters}} / {{prompt}} \u5360\u4f4d\u7b26\uff09\u3002\u8001\u7528\u6237\u5347\u7ea7\u7528\uff1b\u4f1a\u8986\u76d6\u5f53\u524d\u6a21\u677f\u5185\u5bb9\u3002</div>\n\n            <!-- \u81ea\u5b9a\u4e49\u4f18\u5316 LLM \u540e\u7aef\uff08\u590d\u9009\u6846\u63a7\u5236\u5c55\u5f00\uff09 -->\n            <div style=\"margin-top:10px;\">\n                <label class=\"oair-toggle-label\">\n                    <input id=\"oair_optimize_use_custom\" type=\"checkbox\">\n                    \u4f7f\u7528\u81ea\u5b9a\u4e49\u4f18\u5316 LLM \u540e\u7aef\n                </label>\n                <div class=\"oair-hint\">\u52fe\u9009\u540e\u5c55\u5f00\u81ea\u5b9a\u4e49\u540e\u7aef\u914d\u7f6e\uff0c\u7559\u7a7a\u65f6\u9ed8\u8ba4\u4f7f\u7528\u9152\u9986\u4e3bAPI</div>\n\n                <div class=\"oair-custom-backend-content\" id=\"oair_custom_backend_fields\">\n                    <label class=\"oair-field-label\">\u4f18\u5316 LLM \u670d\u52a1\u5730\u5740</label>\n                    <input id=\"oair_optimize_api_url\" class=\"text_pole\" style=\"width:100%; box-sizing:border-box;\" placeholder=\"http://127.0.0.1:11434/v1\">\n                    <div class=\"oair-hint\" data-hint-id=\"optimize_url\">\u81ea\u5b9a\u4e49\u4f18\u5316LLM\u7684\u670d\u52a1\u5730\u5740\uff0c\u586b\u5230 /v1</div>\n\n                    <label class=\"oair-field-label\">\u4f18\u5316 LLM API \u5bc6\u94a5</label>\n                    <div class=\"oair-password-row\">\n                        <input id=\"oair_optimize_api_key\" type=\"password\" class=\"text_pole\" placeholder=\"sk-...\">\n                        <button type=\"button\" class=\"oair-eye-btn\" title=\"\u663e\u793a/\u9690\u85cf\u5bc6\u94a5\"><i class=\"fa-solid fa-eye\"></i></button>\n                    </div>\n                    <div class=\"oair-hint\" data-hint-id=\"optimize_key\">\u81ea\u5b9a\u4e49\u4f18\u5316LLM\u7684API\u5bc6\u94a5</div>\n\n                    <label class=\"oair-field-label\">\u4f18\u5316 LLM \u6a21\u578b</label>\n                    <div class=\"oair-model-row\">\n                        <input id=\"oair_optimize_model\" class=\"text_pole\" placeholder=\"gpt-4o-mini\">\n                        <button id=\"oair_btn_fetch_optimize_model\" class=\"menu_button\">\u83b7\u53d6\u6a21\u578b</button>\n                    </div>\n                    <select id=\"oair_optimize_model_select\" class=\"text_pole\"></select>\n                    <div class=\"oair-hint\" data-hint-id=\"optimize_model\">\u81ea\u5b9a\u4e49\u4f18\u5316LLM\u4f7f\u7528\u7684\u6a21\u578b</div>\n                </div>\n            </div>\n        </div>\n\n        <!-- NSFW \u89c4\u907f -->\n        <div class=\"oair-section\">\n            <div class=\"oair-section-title\">NSFW \u89c4\u907f <span class=\"oair-badge oair-badge-red\">\u5b89\u5168</span></div>\n            <label class=\"oair-toggle-label\">\n                <input id=\"oair_nsfw_avoidance\" type=\"checkbox\">\n                \u542f\u7528 NSFW \u5185\u5bb9\u89c4\u907f\n            </label>\n            <div class=\"oair-hint\">\n                \u4f7f\u7528 LLM \u81ea\u52a8\u5ba1\u67e5\u63d0\u793a\u8bcd\uff0c\u79fb\u9664\u4e0d\u5b89\u5168\u5185\u5bb9\uff0c\u907f\u514d\u5c01\u53f7\u3002<br>\n                <b>\u5efa\u8bae\u5f00\u542f</b>\uff1a\u5373\u4f7f\u4e3b\u63d0\u793a\u8bcd\u5df2\u8981\u6c42 SFW\uff0c\u6b64\u529f\u80fd\u53ef\u4f5c\u4e3a\u989d\u5916\u5b89\u5168\u7f51\u3002\n            </div>\n\n            <details class=\"oair-details\">\n                <summary>NSFW \u5ba1\u67e5\u6a21\u677f</summary>\n                <div class=\"oair-details-content\">\n                    <textarea id=\"oair_nsfw_avoidance_template\" class=\"text_pole\" rows=\"8\" style=\"width:100%; box-sizing:border-box;\" placeholder=\"NSFW \u5ba1\u67e5\u6a21\u677f\uff0c\u4f7f\u7528 {{prompt}} \u63d2\u5165\u539f\u59cb\u63d0\u793a\u8bcd\u3002\"></textarea>\n                </div>\n            </details>\n        </div>\n\n        <!-- \u6d88\u606f\u603b\u7ed3\u6a21\u677f -->\n        <div class=\"oair-section\">\n            <div class=\"oair-section-title\">\u6d88\u606f\u603b\u7ed3\u6a21\u677f</div>\n            <details class=\"oair-details\">\n                <summary>\u5c06\u804a\u5929\u6d88\u606f\u8f6c\u5316\u4e3a\u751f\u56fe\u63d0\u793a\u8bcd\u7684\u6a21\u677f</summary>\n                <div class=\"oair-details-content\">\n                    <textarea id=\"oair_summarize_template\" class=\"text_pole\" rows=\"8\" style=\"width:100%; box-sizing:border-box;\" placeholder=\"\u4f7f\u7528 {{message}} \u63d2\u5165\u6d88\u606f\u5185\u5bb9\u3002\"></textarea>\n                    <div class=\"oair-hint\">\u70b9\u51fb\u6d88\u606f\u4e0a\u7684\u300c\u603b\u7ed3\u751f\u56fe\u300d\u6309\u94ae\u65f6\u4f7f\u7528\u6b64\u6a21\u677f\u3002</div>\n                </div>\n            </details>\n        </div>\n    </div>\n\n    <!-- \u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550 -->\n    <!-- TAB: \u4e16\u754c\u4e66                                            -->\n    <!-- \u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550 -->\n    <div class=\"oair-tab-panel\" id=\"oair_panel_worldbook\">\n        <!-- \u98ce\u683c\u5e93 -->\n        <div class=\"oair-section\">\n            <div class=\"oair-section-title\">\u98ce\u683c\u5e93 <span class=\"oair-badge oair-badge-orange\">\u56fa\u5b9a\u00b7\u753b\u98ce</span></div>\n            <label class=\"oair-field-label\">\u98ce\u683c\u9884\u8bbe\uff08\u6bcf\u884c\u4e00\u4e2a\uff0c\u683c\u5f0f\u300c\u98ce\u683c\u540d\uff1a\u98ce\u683c\u63cf\u8ff0\u300d\uff09</label>\n            <textarea id=\"oair_style_library\" class=\"text_pole\" rows=\"4\" style=\"width:100%; box-sizing:border-box;\" placeholder=\"\u5199\u5b9e\uff1a\u5199\u5b9e\u6444\u5f71\u98ce\u683c\uff0c\u7535\u5f71\u7ea7\u5e03\u5149\uff0c\u9ad8\u7ec6\u8282&#10;\u52a8\u6f2b\uff1a\u65e5\u5f0f\u52a8\u6f2b\u8d5b\u7490\u7490\u98ce\u683c\uff0c\u9c9c\u8273\u8272\u5f69\uff0c\u5e72\u51c0\u7ebf\u6761\"></textarea>\n            <label class=\"oair-field-label\">\u5f53\u524d\u56fa\u5b9a\u98ce\u683c</label>\n            <select id=\"oair_style_active\" class=\"text_pole\" style=\"width:100%; box-sizing:border-box;\"></select>\n            <label class=\"oair-toggle-label\" style=\"margin-top:8px;\">\n                <input id=\"oair_style_auto_select\" type=\"checkbox\">\n                \u7531 LLM \u6309\u573a\u666f\u81ea\u52a8\u9009\u98ce\u683c\uff08\u8986\u76d6\u4e0a\u9762\u7684\u56fa\u5b9a\u9009\u62e9\uff09\n            </label>\n            <div class=\"oair-hint\">\u4e0d\u52fe\u9009\u65f6\u59cb\u7ec8\u7528\u300c\u5f53\u524d\u56fa\u5b9a\u98ce\u683c\u300d\uff0c\u4f1a\u8bdd\u5185\u4e00\u81f4\uff1b\u52fe\u9009\u540e\u6bcf\u6b21\u751f\u56fe\u591a\u4e00\u6b21\u8f7b\u91cf LLM \u5206\u6790\u6311\u98ce\u683c\u3002\u98ce\u683c\u4f1a\u6ce8\u5165\u4f18\u5316\u6a21\u677f\u7684\u3010\u98ce\u683c\u3011\u6a21\u5757\u3002</div>\n        </div>\n\n        <!-- \u4eba\u7269\u5e93 -->\n        <div class=\"oair-section\">\n            <div class=\"oair-section-title\">\u4eba\u7269\u5e93 <span class=\"oair-badge oair-badge-green\">\u56fa\u5b9a\u00b7\u753b\u5bf9\u4eba</span></div>\n            <label class=\"oair-field-label\">\u89d2\u8272\u5916\u8c8c\u8bbe\u5b9a\uff08\u6bcf\u884c\u4e00\u4e2a\u89d2\u8272\uff0c\u683c\u5f0f\u300c\u540d\u5b57\uff1a\u5916\u8c8c\u63cf\u8ff0\u300d\uff09</label>\n            <textarea id=\"oair_character_appearance\" class=\"text_pole\" rows=\"5\" style=\"width:100%; box-sizing:border-box;\" placeholder=\"\u5361\u63d0\u5e0c\u5a05\uff1a\u91d1\u8272\u957f\u53d1\uff0c\u84dd\u8272\u773c\u7738\uff0c\u5c16\u8033\uff0c\u5c11\u5973\u4f53\u578b\uff0c\u524d\u5723\u5973\u6c14\u8d28\uff0c\u786c\u6bdb\u732a\u76ae\u8f6f\u7532\uff0c\u7ec6\u5e26\u51c9\u978b\uff0c\u84dd\u8272\u811a\u8dbe\u7532\u6cb9&#10;\u9f50\u9f50\uff1a\u9ed1\u53d1\u9752\u5e74\uff0c\u4e0d\u6b7b\u4eba\uff0c\u61d2\u6563\u7684\u6076\u8da3\u5473\u795e\u60c5\"></textarea>\n            <label class=\"oair-toggle-label\" style=\"margin-top:8px;\">\n                <input id=\"oair_character_llm_extract\" type=\"checkbox\">\n                \u7531 LLM \u667a\u80fd\u8bc6\u522b\u51fa\u573a\u4eba\u7269\uff08\u9ed8\u8ba4\u6309\u540d\u5b57\u5339\u914d\uff09\n            </label>\n            <div class=\"oair-hint\">\u9ed8\u8ba4\uff1a\u540d\u5b57\u5728\u573a\u666f\u91cc\u51fa\u73b0\u5c31\u6ce8\u5165\u5176\u5916\u8c8c\uff080 \u989d\u5916\u8c03\u7528\uff09\u3002\u52fe\u9009\u540e\u7528 LLM \u8bc6\u522b\u51fa\u573a\u4eba\u7269\uff08\u4ee3\u8bcd/\u522b\u540d\u4e5f\u80fd\u8ba4\uff09\uff0c\u4e0e\u98ce\u683c\u81ea\u52a8\u9009\u5408\u5e76\u4e3a\u4e00\u6b21\u5206\u6790\u8c03\u7528\u3002\u51fa\u573a\u89d2\u8272\u5916\u8c8c\u4f1a\u9010\u5b57\u6ce8\u5165\u4f18\u5316\u6a21\u677f\u7684\u3010\u4eba\u7269\u7279\u5f81\u3011\u6a21\u5757\u3002</div>\n        </div>\n\n        <!-- \u81ea\u52a8\u6765\u6e90\uff1a\u4e16\u754c\u4e66 -->\n        <div class=\"oair-section\">\n            <div class=\"oair-section-title\">\u81ea\u52a8\u6765\u6e90 \u00b7 \u4e16\u754c\u4e66 <span class=\"oair-badge oair-badge-green\">\u81ea\u52a8\u8bfb\u8bbe\u5b9a</span></div>\n            <label class=\"oair-toggle-label\">\n                <input id=\"oair_worldbook_enabled\" type=\"checkbox\">\n                \u4ece\u4e16\u754c\u4e66\u81ea\u52a8\u8865\u5145\u4eba\u7269\u5916\u8c8c / \u573a\u666f\u8bbe\u5b9a\n            </label>\n            <div class=\"oair-hint\">\n                \u5f00\u542f\u540e\uff1a\u4eba\u7269\u5e93\u672a\u5199\u5230\u7684\u89d2\u8272\uff0c\u4f1a\u81ea\u52a8\u4ece\u300c\u5f53\u524d\u804a\u5929 / \u89d2\u8272\u5361\u7ed1\u5b9a\u7684\u4e16\u754c\u4e66\u300d\u547d\u4e2d\u6761\u76ee\u5e76\u53d6\u5176\u76f8\u5173\u6bb5\uff0c\u4f5c\u4e3a\u4eba\u7269\u5e93\u7684\u8865\u5145\u6765\u6e90\u3002<br>\n                \u4e16\u754c\u4e66\u4f18\u5148\u3001\u4eba\u7269\u5e93\u8865\u672a\u8986\u76d6\u8005\u3002\u5f53\u524d\u573a\u666f\u72b6\u6001\u4e0e\u52a8\u4f5c\u4ecd\u7531\u5bf9\u8bdd\u4e0a\u4e0b\u6587\u51b3\u5b9a\u3002\n            </div>\n            <label class=\"oair-field-label\">\u62bd\u53d6\u7684\u5c0f\u8282\u6807\u9898\uff08\u9017\u53f7\u5206\u9694\uff0c\u547d\u4e2d\u6761\u76ee\u65f6\u53ea\u53d6\u8fd9\u4e9b\u6bb5\uff09</label>\n            <input id=\"oair_worldbook_headings\" class=\"text_pole\" placeholder=\"\u5916\u8c8c,\u957f\u76f8,\u5916\u89c2,appearance,\u573a\u666f,\u73af\u5883,setting,scene\">\n            <label class=\"oair-field-label\">\u6ce8\u5165\u603b\u5b57\u6570\u4e0a\u9650</label>\n            <input id=\"oair_worldbook_maxchars\" class=\"text_pole\" type=\"number\" min=\"0\" placeholder=\"800\">\n        </div>\n    </div>\n\n    <!-- \u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550 -->\n    <!-- TAB 5: \u624b\u52a8\u751f\u56fe                                       -->\n    <!-- \u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550 -->\n    <div class=\"oair-tab-panel\" id=\"oair_panel_manual\">\n        <div class=\"oair-section\">\n            <div class=\"oair-section-title\">\u624b\u52a8\u751f\u56fe</div>\n            <label class=\"oair-field-label\">\u8f93\u5165\u63d0\u793a\u8bcd</label>\n            <textarea id=\"oair_manual_prompt\" class=\"text_pole\" rows=\"4\" style=\"width:100%; box-sizing:border-box;\" placeholder=\"\u63cf\u8ff0\u4f60\u60f3\u751f\u6210\u7684\u56fe\u7247...\"></textarea>\n\n            <!-- \u4f18\u5316\u540e\u63d0\u793a\u8bcd\u5c55\u793a\u533a -->\n            <div id=\"oair_manual_optimized_prompt\" style=\"display:none;\">\n                <label class=\"oair-field-label\" style=\"color:#60ff90;\">\u2728 \u4f18\u5316\u540e\u7684\u63d0\u793a\u8bcd</label>\n                <div id=\"oair_manual_optimized_text\" class=\"oair-optimized-box\"></div>\n                <div class=\"oair-hint\" style=\"color:#60ff90;\">\u751f\u6210\u56fe\u7247\u65f6\u5c06\u4f7f\u7528\u6b64\u4f18\u5316\u7248\u672c</div>\n            </div>\n\n            <div class=\"oair-btn-row\">\n                <button id=\"oair_btn_import_msg\" class=\"menu_button\" style=\"flex:1; justify-content:center;\">\n                    \ud83d\udce5 \u5bfc\u5165\u6d88\u606f\n                </button>\n                <button id=\"oair_btn_optimize\" class=\"menu_button\" style=\"flex:1; justify-content:center;\">\n                    \u2728 \u4f18\u5316\u63d0\u793a\u8bcd\n                </button>\n                <button id=\"oair_btn_manual_gen\" class=\"menu_button\" style=\"flex:1; justify-content:center;\">\n                    \ud83c\udfa8 \u751f\u6210\u56fe\u7247\n                </button>\n            </div>\n\n            <div class=\"oair-btn-row\">\n                <button id=\"oair_btn_clear_manual\" class=\"menu_button\" style=\"flex:1; justify-content:center;\">\n                    \u6e05\u7a7a\n                </button>\n                <button id=\"oair_btn_attach\" class=\"menu_button\" style=\"flex:1; justify-content:center;\">\n                    \ud83d\udcce \u9644\u52a0\u5230\u6d88\u606f\n                </button>\n            </div>\n\n            <div class=\"oair-hint\" style=\"margin-top:4px;\">\n                \ud83d\udce5 \u5bfc\u5165\u6d88\u606f\uff1a\u5c06\u5f53\u524d\u804a\u5929\u6700\u540e\u4e00\u6761 AI \u6d88\u606f\u5bfc\u5165\u4e3a\u63d0\u793a\u8bcd\n            </div>\n            <div class=\"oair-hint\">\n                \ud83d\udca1 \u63d0\u793a\uff1a\u5148\u8f93\u5165\u63d0\u793a\u8bcd \u2192 \u70b9\u51fb\u300c\u4f18\u5316\u63d0\u793a\u8bcd\u300d\u67e5\u770b\u4f18\u5316\u6548\u679c \u2192 \u70b9\u51fb\u300c\u751f\u6210\u56fe\u7247\u300d\n            </div>\n        </div>\n\n        <div class=\"oair-section\">\n            <div class=\"oair-section-title\">\u9884\u89c8</div>\n            <div id=\"oair_manual_preview\" style=\"display:grid; gap:8px;\"></div>\n        </div>\n    </div>\n\n    <!-- \u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550 -->\n    <!-- TAB: \u56fe\u5e93                                              -->\n    <!-- \u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550 -->\n    <div class=\"oair-tab-panel\" id=\"oair_panel_gallery\">\n        <div class=\"oair-section\">\n            <div class=\"oair-gallery-toolbar\">\n                <div class=\"oair-section-title\" style=\"margin:0;\">\u56fe\u5e93 <span id=\"oair_gallery_count\" class=\"oair-badge oair-badge-green\">0 \u5f20</span></div>\n                <div style=\"display:flex; gap:6px;\">\n                    <button id=\"oair_btn_gallery_refresh\" class=\"menu_button\">\u5237\u65b0</button>\n                    <button id=\"oair_btn_gallery_clear\" class=\"menu_button\">\u6e05\u7a7a\u56fe\u5e93</button>\n                </div>\n            </div>\n            <div class=\"oair-hint\">\u6240\u6709\u751f\u6210\u7684\u56fe\u7247\u81ea\u52a8\u4fdd\u5b58\u5230\u78c1\u76d8\uff08SillyTavern/data/&lt;\u7528\u6237&gt;/user/images/&lt;\u89d2\u8272&gt;/\uff09\u5e76\u8bb0\u5f55\u5728\u6b64\uff0c\u5237\u65b0\u6216\u91cd\u542f\u90fd\u4e0d\u4f1a\u4e22\u5931\u3002\u70b9\u51fb\u7f29\u7565\u56fe\u653e\u5927\uff1b\u300c\u6e05\u7a7a\u56fe\u5e93\u300d\u53ea\u6e05\u9664\u6b64\u5904\u8bb0\u5f55\uff0c\u4e0d\u5220\u9664\u78c1\u76d8\u6587\u4ef6\u3002</div>\n            <div id=\"oair_gallery_grid\" class=\"oair-gallery-grid\" style=\"margin-top:8px;\"></div>\n        </div>\n    </div>\n</div>\n";
 
 /**
  * 加载完整设置 HTML 到悬浮窗 body，并初始化绑定和默认标签
@@ -180,6 +213,7 @@ function loadFullSettings(body, html) {
     body.html(html);
     bindFloatingEvents();
     updateFloatingUi();
+    refreshGalleryUi();
 
     // Set default tab
     const s = extension_settings[extensionName];
@@ -188,7 +222,9 @@ function loadFullSettings(body, html) {
         backend: "#oair_tab_backend",
         extract: "#oair_tab_extract",
         optimize: "#oair_tab_optimize",
+        worldbook: "#oair_tab_worldbook",
         manual: "#oair_tab_manual",
+        gallery: "#oair_tab_gallery",
     };
     const targetTab = tabMap[s.floatingDefaultTab] || tabMap.manual;
     $(targetTab).prop("checked", true);
@@ -235,6 +271,7 @@ $(function () {
         // 聊天切换时清理 inFlightMessages，避免旧聊天的 key 残留
         eventSource.on(event_types.CHAT_CHANGED, () => {
             inFlightMessages.clear();
+            clearWorldBookCache();
         });
     })();
 });
@@ -730,7 +767,9 @@ function toggleFloatingPanel() {
             backend: "#oair_tab_backend",
             extract: "#oair_tab_extract",
             optimize: "#oair_tab_optimize",
+            worldbook: "#oair_tab_worldbook",
             manual: "#oair_tab_manual",
+            gallery: "#oair_tab_gallery",
         };
         const targetTab = tabMap[s.floatingDefaultTab] || tabMap.manual;
         $(targetTab).prop("checked", true);
@@ -805,7 +844,15 @@ function bindFloatingEvents() {
     bindSettingInput("#oair_optimize_enabled", "optimizeEnabled", () => fp.find("#oair_optimize_enabled").prop("checked"));
     bindSettingInput("#oair_optimize_auto", "optimizeAuto", () => fp.find("#oair_optimize_auto").prop("checked"));
     bindSettingInput("#oair_optimize_template", "optimizeTemplate", () => fp.find("#oair_optimize_template").val());
+    bindSettingInput("#oair_text_max_tokens", "textMaxTokens", () => Number(fp.find("#oair_text_max_tokens").val()) || 8192);
     bindSettingInput("#oair_character_appearance", "characterAppearance", () => fp.find("#oair_character_appearance").val());
+    bindSettingInput("#oair_style_library", "styleLibrary", () => fp.find("#oair_style_library").val());
+    bindSettingInput("#oair_style_active", "styleActive", () => fp.find("#oair_style_active").val());
+    bindSettingInput("#oair_style_auto_select", "styleAutoSelect", () => fp.find("#oair_style_auto_select").prop("checked"));
+    bindSettingInput("#oair_character_llm_extract", "characterLlmExtract", () => fp.find("#oair_character_llm_extract").prop("checked"));
+    bindSettingInput("#oair_worldbook_enabled", "worldBookEnabled", () => fp.find("#oair_worldbook_enabled").prop("checked"));
+    bindSettingInput("#oair_worldbook_headings", "worldBookSectionHeadings", () => fp.find("#oair_worldbook_headings").val());
+    bindSettingInput("#oair_worldbook_maxchars", "worldBookMaxChars", () => Number(fp.find("#oair_worldbook_maxchars").val()) || 0);
 
     // 自定义优化LLM后端复选框
     bindSettingInput("#oair_optimize_use_custom", "optimizeUseCustom", () => fp.find("#oair_optimize_use_custom").prop("checked"));
@@ -1023,6 +1070,20 @@ function bindFloatingEvents() {
         toastr.success("已应用 chatgpt2api 预设：Images 模式 / gpt-image-2 / b64_json / 超时 600s。请确认服务地址与 API 密钥。");
     });
 
+    // 重置优化模板为 5 模块新模板
+    fp.find("#oair_btn_reset_optimize_template").off("click").on("click", (e) => {
+        e.preventDefault();
+        const s = extension_settings[extensionName];
+        s.optimizeTemplate = DEFAULT_OPTIMIZE_TEMPLATE;
+        saveSettingsDebounced();
+        fp.find("#oair_optimize_template").val(DEFAULT_OPTIMIZE_TEMPLATE);
+        setStatus("已重置优化模板为 5 模块版", "success");
+        toastr.success("优化模板已重置为内置 5 模块版（含 {{style}}/{{characters}} 占位符）。");
+    });
+
+    // 风格库内容变更 → 重建「当前固定风格」下拉
+    fp.find("#oair_style_library").off("input.oair_style").on("input.oair_style", () => populateStyleSelect());
+
     // ─── 密码眼睛按钮 ──────────────────────────────────────
     fp.find(".oair-eye-btn").off("click").on("click", function () {
         const input = $(this).siblings("input");
@@ -1033,6 +1094,19 @@ function bindFloatingEvents() {
         } else {
             input.attr("type", "password");
             icon.removeClass("fa-eye-slash").addClass("fa-eye");
+        }
+    });
+
+    // ─── 图库 ──────────────────────────────────────────────
+    fp.find("#oair_btn_gallery_refresh").off("click").on("click", (e) => {
+        e.preventDefault();
+        refreshGalleryUi();
+    });
+    fp.find("#oair_btn_gallery_clear").off("click").on("click", (e) => {
+        e.preventDefault();
+        if (confirm("清空整个图库记录？（磁盘上的图片文件不会被删除）")) {
+            clearGallery();
+            toastr.success("图库已清空");
         }
     });
 }
@@ -1075,6 +1149,24 @@ function updatePanelUi() {
 /**
  * Update the floating window (L2) — all settings fields
  */
+/**
+ * 用风格库的名字重建「当前固定风格」<select>，并回填已选 styleActive。
+ * 用 jQuery .text/.val 写入，天然转义；空选项表示"不指定/自动"。
+ */
+function populateStyleSelect() {
+    const fp = $("#oair_floating_panel");
+    const sel = fp.find("#oair_style_active");
+    if (!sel.length) return;
+    const s = extension_settings[extensionName];
+    const lib = parseNamedLibrary(s.styleLibrary);
+    sel.empty();
+    sel.append($("<option>").val("").text("（不指定 / 自动）"));
+    for (const item of lib) {
+        sel.append($("<option>").val(item.name).text(item.name));
+    }
+    sel.val(String(s.styleActive || ""));
+}
+
 function updateFloatingUi() {
     const s = extension_settings[extensionName];
     const fp = $("#oair_floating_panel");
@@ -1114,7 +1206,15 @@ function updateFloatingUi() {
     fp.find("#oair_optimize_enabled").prop("checked", !!s.optimizeEnabled);
     fp.find("#oair_optimize_auto").prop("checked", !!s.optimizeAuto);
     fp.find("#oair_optimize_template").val(s.optimizeTemplate || "");
+    fp.find("#oair_text_max_tokens").val(s.textMaxTokens ?? 8192);
     fp.find("#oair_character_appearance").val(s.characterAppearance || "");
+    fp.find("#oair_style_library").val(s.styleLibrary || "");
+    fp.find("#oair_style_auto_select").prop("checked", !!s.styleAutoSelect);
+    fp.find("#oair_character_llm_extract").prop("checked", !!s.characterLlmExtract);
+    populateStyleSelect();   // 填充风格下拉并回填 styleActive
+    fp.find("#oair_worldbook_enabled").prop("checked", !!s.worldBookEnabled);
+    fp.find("#oair_worldbook_headings").val(s.worldBookSectionHeadings || "");
+    fp.find("#oair_worldbook_maxchars").val(s.worldBookMaxChars ?? 800);
     fp.find("#oair_optimize_use_custom").prop("checked", !!s.optimizeUseCustom);
     fp.find("#oair_custom_backend_fields").toggleClass("oair-visible", !!s.optimizeUseCustom);
     fp.find("#oair_optimize_api_url").val(s.optimizeApiUrl || "");
@@ -1244,13 +1344,37 @@ async function callMainLlm(systemPrompt, userPrompt) {
         return null;
     }
 
-    // 新版酒馆：generateRaw({ prompt, systemPrompt, ... })，唯一形参带默认值 → length 为 0
-    if (generateRaw.length === 0) {
-        return await generateRaw({ prompt: userPrompt, systemPrompt });
-    }
+    const settings = extension_settings[extensionName];
+    // 文本优化/审查/总结的回复长度上限（可配置）。推理模型(glm/o1 等)的 max_tokens 需同时覆盖
+    // 「思考 + 最终答案」，太小（如 1500）会让思考吃光预算、最终提示词被截断 → 质量很低；
+    // 太大（如继承主模型的 65535）某些 glm 代理会挂起/拒绝。默认 8192，用户可在「优化」tab 调整。
+    const responseLength = Number(settings.textMaxTokens) || 8192;
 
-    // 旧版酒馆：位置参数 generateRaw(prompt, api, instructOverride, quietToLoud, systemPrompt)
-    return await generateRaw(userPrompt, null, false, false, systemPrompt);
+    // generateRaw 自身无超时。在重世界书 + ST-Prompt-Template 钩子的环境里，这次请求会被注入
+    // 大量世界书条目，若后端挂起则 await 永不返回，UI 会永久卡在"正在优化…"。用超时兜底：超时即抛错，
+    // 让上层（optimize/sanitize/summarize）优雅降级，而不是冻结界面。
+    const timeoutMs = Math.min(120000, Number(settings.timeoutMs) || 120000);
+
+    const invoke = (generateRaw.length === 0)
+        // 新版酒馆：generateRaw({ prompt, systemPrompt, responseLength, ... })，唯一形参带默认值 → length 为 0
+        ? generateRaw({ prompt: userPrompt, systemPrompt, responseLength })
+        // 旧版酒馆：位置参数 generateRaw(prompt, api, instructOverride, quietToLoud, systemPrompt, responseLength)
+        : generateRaw(userPrompt, null, false, false, systemPrompt, responseLength);
+
+    let timer;
+    try {
+        return await Promise.race([
+            invoke,
+            new Promise((_, reject) => {
+                timer = setTimeout(
+                    () => reject(new Error(`文本模型 ${Math.round(timeoutMs / 1000)}s 内无响应（已超时）。若角色卡含大量世界书/JS 模板，建议在「优化」tab 勾选「使用自定义优化 LLM 后端」走独立后端。`)),
+                    timeoutMs,
+                );
+            }),
+        ]);
+    } finally {
+        clearTimeout(timer);
+    }
 }
 
 /**
@@ -1265,6 +1389,7 @@ async function callCustomLlmBackend(systemPrompt, userPrompt) {
     const body = {
         model,
         stream: false,
+        max_tokens: Number(settings.textMaxTokens) || 8192,
         messages: [
             { role: "system", content: systemPrompt },
             { role: "user", content: userPrompt },
@@ -1288,13 +1413,19 @@ async function callCustomLlmBackend(systemPrompt, userPrompt) {
 /**
  * 使用 LLM 优化提示词
  */
-async function optimizePrompt(prompt) {
+async function optimizePrompt(prompt, fixed = null) {
     const settings = extension_settings[extensionName];
     if (!settings.optimizeEnabled) return prompt;
 
     const template = settings.optimizeTemplate || defaultSettings.optimizeTemplate;
     const systemPrompt = "你是一个专业的图片提示词优化专家。";
-    const userMessage = renderPrompt(template, prompt);
+    const userMessage = optimizeHasSlots(template)
+        ? renderOptimizeTemplate(template, {
+            prompt,
+            style: fixed?.styleText,
+            characters: fixed?.charactersText,
+        })
+        : renderPrompt(template, prompt);
 
     try {
         const result = await callLlmForText(systemPrompt, userMessage);
@@ -1333,11 +1464,22 @@ async function sanitizePrompt(prompt) {
 async function processPromptPipeline(prompt, options = {}) {
     const settings = extension_settings[extensionName];
 
-    // Step 1: 优化（如果启用且满足条件）
+    // Step 0: 收集固定设定（风格 + 人物）
+    const fixed = await resolveFixedSettings(prompt, settings);
+
+    // Step 1: 优化（启用且满足条件时）
     const shouldOptimize = options.forceOptimize || settings.optimizeAuto;
-    if (settings.optimizeEnabled && shouldOptimize) {
+    const optimizeActive = settings.optimizeEnabled && shouldOptimize;
+    let injected = false;
+    if (optimizeActive) {
         setStatus("正在优化提示词...", "info");
-        prompt = await optimizePrompt(prompt);
+        const template = settings.optimizeTemplate || defaultSettings.optimizeTemplate;
+        if (optimizeHasSlots(template)) {
+            prompt = await optimizePrompt(prompt, fixed);   // 固定设定融进优化模板
+            injected = true;
+        } else {
+            prompt = await optimizePrompt(prompt, null);     // 老模板无占位符 → 优化后再拼接
+        }
     }
 
     // Step 2: NSFW 安全审查（如果启用）
@@ -1346,8 +1488,10 @@ async function processPromptPipeline(prompt, options = {}) {
         prompt = await sanitizePrompt(prompt);
     }
 
-    // Step 3: 注入固定角色外貌（仅注入提示词中出现的角色）
-    prompt = injectCharacterAppearance(prompt, settings.characterAppearance);
+    // Step 3: 未注入到模板的固定设定 → 末尾拼【设定参考】块
+    if (!injected) {
+        prompt = appendFixedBlock(prompt, fixed);
+    }
 
     return prompt;
 }
@@ -1359,12 +1503,22 @@ async function processPromptPipeline(prompt, options = {}) {
 /**
  * 图片请求分发器 — 根据 apiMode 选择不同后端
  */
-async function requestImagesFromBackend(prompt) {
+async function requestImagesFromBackend(prompt, meta = {}) {
     const settings = extension_settings[extensionName];
-    if (settings.apiMode === "images") {
-        return requestViaImagesGenerations(prompt);
+    const result = settings.apiMode === "images"
+        ? await requestViaImagesGenerations(prompt)
+        : await requestViaChatCompletions(prompt);
+
+    // 唯一 choke point：所有入口生成的图都在此落盘 + 记录图库。
+    // 换成磁盘路径后，附加进 extra.media 的就是短路径，聊天文件不再内联大 base64。
+    if (Array.isArray(result.images) && result.images.length) {
+        result.images = await persistAndRecordImages(
+            result.images,
+            meta.prompt || prompt,
+            meta.source || "generate",
+        );
     }
-    return requestViaChatCompletions(prompt);
+    return result;
 }
 
 // ═══════════════════════════════════════════════════════════════
@@ -1567,7 +1721,7 @@ async function onMessageReceived(messageId) {
             // 运行提示词处理流水线
             prompt = await processPromptPipeline(prompt, { forceOptimize: false });
 
-            const result = await requestImagesFromBackend(prompt);
+            const result = await requestImagesFromBackend(prompt, { source: "auto" });
             if (!result.images.length) {
                 replacements.push(match.fullMatch);
                 continue;
@@ -1632,7 +1786,7 @@ async function manualGenerate() {
         // 如果已有手动优化结果，forceOptimize=false 跳过再次自动优化
         prompt = await processPromptPipeline(prompt, { forceOptimize: !optimizedText });
 
-        const result = await requestImagesFromBackend(prompt);
+        const result = await requestImagesFromBackend(prompt, { source: "manual" });
         renderManualPreview(result.images, result.content);
 
         if (result.images.length > 0) {
@@ -1674,7 +1828,8 @@ async function manualOptimize() {
     setButtonLoading("#oair_btn_optimize", true);
 
     try {
-        const optimized = await optimizePrompt(prompt);
+        const fixed = await resolveFixedSettings(prompt, settings);
+        const optimized = await optimizePrompt(prompt, fixed);
         if (optimized && optimized !== prompt) {
             fp.find("#oair_manual_optimized_text").text(optimized);
             fp.find("#oair_manual_optimized_prompt").show();
@@ -1826,7 +1981,7 @@ async function generateFromMessage(messageId) {
     try {
         setStatus("正在从消息生图...", "info");
         prompt = await processPromptPipeline(prompt, { forceOptimize: false });
-        const result = await requestImagesFromBackend(prompt);
+        const result = await requestImagesFromBackend(prompt, { source: "message" });
 
         if (result.images.length > 0) {
             attachGeneratedImages(message, result.images, [prompt]);
@@ -1882,8 +2037,8 @@ async function summarizeAndGenerate(messageId) {
         // 总结模板已包含 SFW 指令，但额外运行安全审查
         let sanitizedPrompt = await sanitizePrompt(prompt);
         // 注入固定角色外貌（仅注入提示词中出现的角色）
-        sanitizedPrompt = injectCharacterAppearance(sanitizedPrompt, settings.characterAppearance);
-        const result = await requestImagesFromBackend(sanitizedPrompt);
+        sanitizedPrompt = await injectStableDescriptions(sanitizedPrompt, settings);
+        const result = await requestImagesFromBackend(sanitizedPrompt, { source: "summarize", prompt });
 
         if (result.images.length > 0) {
             attachGeneratedImages(message, result.images, [prompt]);
@@ -2216,6 +2371,26 @@ function renderPromptWithMessage(template, message) {
         .replaceAll("{{prompt}}", String(message || "").trim());
 }
 
+/**
+ * 优化模板渲染：替换 {{style}}/{{characters}}/{{prompt}}；风格/人物为空时给中性兜底文案。
+ */
+function renderOptimizeTemplate(template, { prompt, style, characters } = {}) {
+    const src = String(template || defaultSettings.optimizeTemplate);
+    const styleText = String(style || "").trim() || "保持画面整体协调即可";
+    const charText = String(characters || "").trim() || "（本图无需固定角色设定）";
+    return src
+        .replaceAll("{{style}}", styleText)
+        .replaceAll("{{characters}}", charText)
+        .replaceAll("{{prompt}}", String(prompt || "").trim());
+}
+
+/**
+ * 模板是否含固定设定占位符（{{style}} 或 {{characters}}）。无则走旧的仅 {{prompt}} 渲染。
+ */
+function optimizeHasSlots(template) {
+    return /\{\{\s*(style|characters)\s*\}\}/.test(String(template || ""));
+}
+
 function parseRegex(value, label) {
     const regex = safeParseRegex(value);
     if (!regex) {
@@ -2397,35 +2572,333 @@ function cleanRpText(raw) {
 }
 
 /**
- * 固定角色外貌注入：把 settings.characterAppearance 里【出现在当前提示词中的】角色外貌
- * 追加到提示词末尾，确保图片画对人。按行解析「名字：外貌」；若无该格式则整体注入。
+ * 从世界书条目正文里抽取"相关段"：按小节标题（外貌/场景/appearance...）定位，
+ * 取冒号后内容直到空行/下一个小节标题/结尾；抽不到则返回整条。单条截到 300 字。
  */
-function injectCharacterAppearance(prompt, appearanceText) {
+function extractEntrySection(content, headings) {
+    const text = String(content || "");
+    if (!text.trim()) return "";
+    const MAX = 300;
+    const heads = (Array.isArray(headings) ? headings : [])
+        .map((h) => String(h || "").trim().toLowerCase())
+        .filter(Boolean);
+    const lines = text.split(/\r?\n/);
+    const headingLabel = (line) => {
+        const m = line.match(/^\s*([^\n：:]{1,16})\s*[:：]/);
+        return m ? m[1].trim() : null;
+    };
+    for (let i = 0; i < lines.length; i++) {
+        const label = headingLabel(lines[i]);
+        if (label && heads.includes(label.toLowerCase())) {
+            const after = lines[i].replace(/^\s*[^\n：:]{1,16}\s*[:：]\s*/, "").trim();
+            const buf = [];
+            if (after) buf.push(after);
+            for (let j = i + 1; j < lines.length; j++) {
+                if (!lines[j].trim()) break;            // 空行
+                if (headingLabel(lines[j])) break;      // 下一个小节标题
+                buf.push(lines[j].trim());
+            }
+            const body = buf.join(" ").trim();
+            if (body) return `${label}：${body}`.slice(0, MAX);
+        }
+    }
+    return text.trim().slice(0, MAX);
+}
+
+/**
+ * 手动外貌兜底：解析 characterAppearance 的「名字：外貌」行，返回出现在 prompt 中、
+ * 且未被世界书覆盖（covered）的条目 [{name, text}]。无「名字：」格式时整体作一条。
+ */
+function collectManualAppearances(prompt, appearanceText, covered = new Set()) {
     const base = String(prompt || "");
     const raw = String(appearanceText || "").trim();
-    if (!raw) return base;
-
+    if (!raw) return [];
     const lines = raw.split(/\r?\n/).map((l) => l.trim()).filter(Boolean);
-    const matched = [];
+    const out = [];
     let parsedAny = false;
-
     for (const line of lines) {
         const m = line.match(/^([^：:]{1,24})[：:]\s*(.+)$/);
         if (m) {
             parsedAny = true;
-            if (base.includes(m[1].trim())) matched.push(line);
+            const name = m[1].trim();
+            if (covered.has(name)) continue;
+            if (base.includes(name)) out.push({ name, text: line });
+        }
+    }
+    if (!parsedAny) out.push({ name: "", text: raw });
+    return out;
+}
+
+/**
+ * 聚合当前激活的世界书名：聊天绑定（chatMetadata.world_info）+ 角色卡主书
+ * （characters[id].data.extensions.world）。任一字段缺失则忽略，最终去重去空。
+ */
+function getActiveWorldBookNames() {
+    const names = [];
+    try {
+        const ctx = getContext();
+        const chatBook = ctx?.chatMetadata?.world_info;
+        if (typeof chatBook === "string") names.push(chatBook);
+        else if (Array.isArray(chatBook)) names.push(...chatBook);
+        const charId = ctx?.characterId;
+        const charBook = ctx?.characters?.[charId]?.data?.extensions?.world;
+        if (typeof charBook === "string") names.push(charBook);
+    } catch (e) {
+        console.warn(`[${extensionName}] getActiveWorldBookNames failed`, e);
+    }
+    return dedupeStrings(names.filter((n) => typeof n === "string" && n.trim()));
+}
+
+// 世界书条目缓存：按激活书名签名缓存，CHAT_CHANGED 时清空
+let worldBookCache = { sig: null, entries: null };
+
+function clearWorldBookCache() {
+    worldBookCache = { sig: null, entries: null };
+}
+
+/**
+ * 加载当前激活世界书的全部可用条目，归一成 {keys, content, comment}。
+ * 滤掉 disable / 无内容 / 无长度≥2关键词的条目。带缓存。
+ */
+async function loadActiveWorldBookEntries() {
+    const ctx = getContext();
+    if (typeof ctx?.loadWorldInfo !== "function") return [];
+    const names = getActiveWorldBookNames();
+    if (!names.length) return [];
+    const sig = names.join("|");
+    if (worldBookCache.sig === sig && worldBookCache.entries) return worldBookCache.entries;
+
+    const all = [];
+    for (const name of names) {
+        try {
+            const data = await ctx.loadWorldInfo(name);
+            const entries = data?.entries;
+            if (!entries) continue;
+            for (const uid of Object.keys(entries)) {
+                const e = entries[uid];
+                if (!e || e.disable === true) continue;
+                const keys = [
+                    ...(Array.isArray(e.key) ? e.key : []),
+                    ...(Array.isArray(e.keysecondary) ? e.keysecondary : []),
+                ].map((k) => String(k || "").trim()).filter((k) => k.length >= 2);
+                if (!keys.length || !String(e.content || "").trim()) continue;
+                all.push({ keys, content: String(e.content), comment: String(e.comment || "") });
+            }
+        } catch (err) {
+            console.warn(`[${extensionName}] loadWorldInfo(${name}) failed`, err);
+        }
+    }
+    worldBookCache = { sig, entries: all };
+    return all;
+}
+
+/**
+ * 解析「名字：描述」多行库文本（风格库 / 人物库共用），返回 [{name, body, raw}]。
+ * 名字限 1-24 字、用中/英文冒号分隔；不合格的行跳过。
+ */
+function parseNamedLibrary(text) {
+    const raw = String(text || "").trim();
+    if (!raw) return [];
+    const out = [];
+    for (const line of raw.split(/\r?\n/)) {
+        const t = line.trim();
+        if (!t) continue;
+        const m = t.match(/^([^：:]{1,24})[：:]\s*(.+)$/);
+        if (m) out.push({ name: m[1].trim(), body: m[2].trim(), raw: t });
+    }
+    return out;
+}
+
+/**
+ * 按风格名从风格库取描述：精确匹配优先，再松匹配（互为子串）；找不到/名字空 → 返回 ""。
+ */
+function resolveStyleText(settings, styleName) {
+    const want = String(styleName || "").trim();
+    if (!want) return "";
+    const lib = parseNamedLibrary(settings.styleLibrary);
+    const exact = lib.find((s) => s.name === want);
+    if (exact) return exact.body;
+    const loose = lib.find((s) => s.name.includes(want) || want.includes(s.name));
+    return loose ? loose.body : "";
+}
+
+/**
+ * 去重 + 按总字数封顶：从 [{text}] 取不重复文本累加，超过 maxChars 即停，返回换行拼接串。
+ */
+function pickCappedText(items, maxChars) {
+    const cap = Number(maxChars) || 800;
+    const seen = new Set();
+    const picked = [];
+    let total = 0;
+    for (const item of (items || [])) {
+        const t = String(item?.text || "").trim();
+        if (!t || seen.has(t)) continue;
+        if (total + t.length > cap) break;
+        seen.add(t);
+        picked.push(t);
+        total += t.length;
+    }
+    return picked.join("\n");
+}
+
+/**
+ * 降级路径：把固定设定（风格 + 人物）拼成【设定参考】块追加到 prompt 末尾。
+ * 两者皆空则原样返回。供「优化关闭 / 老模板无占位符 / 总结生图」复用。
+ */
+function appendFixedBlock(prompt, fixed) {
+    const base = String(prompt || "");
+    const parts = [];
+    const style = String(fixed?.styleText || "").trim();
+    const chars = String(fixed?.charactersText || "").trim();
+    if (style) parts.push(`风格：${style}`);
+    if (chars) parts.push(chars);
+    if (!parts.length) return base;
+    return `${base}\n\n【设定参考】\n${parts.join("\n")}`;
+}
+
+/**
+ * 按名取人物（LLM 识别路）：解析 characterAppearance「名字：外貌」行，
+ * 名字与 names 互为子串即命中（容错别名/全名），跳过 covered。返回 [{name, text}]。
+ */
+function collectManualAppearancesByNames(appearanceText, names, covered = new Set()) {
+    const raw = String(appearanceText || "").trim();
+    if (!raw || !Array.isArray(names) || !names.length) return [];
+    const lines = raw.split(/\r?\n/).map((l) => l.trim()).filter(Boolean);
+    const out = [];
+    for (const line of lines) {
+        const m = line.match(/^([^：:]{1,24})[：:]\s*(.+)$/);
+        if (!m) continue;
+        const name = m[1].trim();
+        if (covered.has(name)) continue;
+        if (names.some((n) => String(n).includes(name) || name.includes(String(n)))) {
+            out.push({ name, text: line });
+        }
+    }
+    return out;
+}
+
+/**
+ * 宽松解析分析调用返回：抽首个 {...} JSON 片段，归一成 {characters:string[], style:string}。
+ * 解析失败 / 字段缺失 → 返回空结果（由上层降级）。
+ */
+function parseAnalysisJson(text) {
+    const s = String(text || "");
+    let obj = null;
+    const m = s.match(/\{[\s\S]*\}/);
+    if (m) { try { obj = JSON.parse(m[0]); } catch (e) { obj = null; } }
+    const characters = Array.isArray(obj?.characters)
+        ? obj.characters.map((x) => String(x || "").trim()).filter(Boolean)
+        : [];
+    const style = obj && obj.style != null ? String(obj.style).trim() : "";
+    return { characters, style };
+}
+
+/**
+ * 一次轻量分析调用：喂场景原文 + 候选人物名 + 候选风格名，要求输出紧凑 JSON。
+ * 走 callLlmForText（主聊天模型 / 自定义文本后端），不经图片后端。失败由调用方兜回。
+ */
+async function analyzeSceneForFixed(prompt, { charNames = [], styleNames = [] } = {}) {
+    const settings = extension_settings[extensionName];
+    const template = settings.analysisTemplate || defaultSettings.analysisTemplate;
+    const userMessage = String(template)
+        .replaceAll("{{characters}}", charNames.join("、") || "（无）")
+        .replaceAll("{{styles}}", styleNames.join("、") || "（无）")
+        .replaceAll("{{prompt}}", String(prompt || "").trim());
+    const systemPrompt = "你是一个图片场景分析助手，只输出 JSON。";
+    const result = await callLlmForText(systemPrompt, userMessage);
+    return parseAnalysisJson(result);
+}
+
+/**
+ * 收集出场人物的逐字描述条目 [{name, text}]：
+ * names 为数组 → LLM 识别路（按名匹配世界书/人物库）；names 为 null → 子串匹配路（现有行为）。
+ * 世界书优先并记 covered，人物库补未覆盖者。
+ */
+async function gatherCharacterItems(base, settings, names) {
+    const collected = [];
+    const covered = new Set();
+    const useNames = Array.isArray(names);
+    const rel = (a, b) => { a = String(a); b = String(b); return a.includes(b) || b.includes(a); };
+
+    if (settings.worldBookEnabled) {
+        try {
+            const entries = await loadActiveWorldBookEntries();
+            const headings = String(settings.worldBookSectionHeadings || "")
+                .split(/[,，]/).map((h) => h.trim()).filter(Boolean);
+            for (const e of entries) {
+                let hit = null;
+                if (useNames) {
+                    hit = names.find((n) => e.keys.some((k) => rel(n, k)) || (e.comment && rel(n, e.comment)));
+                } else {
+                    hit = e.keys.find((k) => base.includes(k));
+                }
+                if (!hit) continue;
+                const section = extractEntrySection(e.content, headings);
+                if (!section) continue;
+                collected.push({ name: e.comment || hit, text: section });
+                e.keys.forEach((k) => covered.add(k));
+                if (e.comment) covered.add(e.comment);
+            }
+        } catch (err) {
+            console.warn(`[${extensionName}] world book gather failed`, err);
         }
     }
 
-    let appendix;
-    if (parsedAny) {
-        if (matched.length === 0) return base;   // 有具名格式，但本图未出现这些角色 → 不注入
-        appendix = matched.join("\n");
+    if (useNames) {
+        collected.push(...collectManualAppearancesByNames(settings.characterAppearance, names, covered));
     } else {
-        appendix = raw;                           // 非「名字：」格式 → 整体注入
+        collected.push(...collectManualAppearances(base, settings.characterAppearance, covered));
+    }
+    return collected;
+}
+
+/**
+ * 流水线 Step 0：收集固定设定（风格 + 人物），返回 {styleText, charactersText}。
+ * 两 LLM 开关都关 → 0 调用（子串匹配 + styleActive）；任一开 → 合并一次 analyzeSceneForFixed。
+ * 分析失败静默降级：人物退子串、风格退 styleActive。
+ */
+async function resolveFixedSettings(prompt, settings) {
+    const base = String(prompt || "");
+    const needLlm = !!settings.characterLlmExtract || !!settings.styleAutoSelect;
+
+    let analysis = null;
+    if (needLlm) {
+        try {
+            const charNames = parseNamedLibrary(settings.characterAppearance).map((c) => c.name);
+            const styleNames = parseNamedLibrary(settings.styleLibrary).map((s) => s.name);
+            if (settings.worldBookEnabled) {
+                try {
+                    const entries = await loadActiveWorldBookEntries();
+                    for (const e of entries) {
+                        if (e.comment) charNames.push(e.comment);
+                        charNames.push(...e.keys);
+                    }
+                } catch (e) { /* 世界书读不到不阻断分析 */ }
+            }
+            analysis = await analyzeSceneForFixed(base, { charNames: dedupeStrings(charNames), styleNames });
+        } catch (err) {
+            console.warn(`[${extensionName}] scene analysis failed, falling back`, err);
+            analysis = null;
+        }
     }
 
-    return `${base}\n\n【角色外貌设定】\n${appendix}`;
+    const charNames = (settings.characterLlmExtract && analysis) ? analysis.characters : null;
+    const styleName = (settings.styleAutoSelect && analysis && analysis.style)
+        ? analysis.style
+        : settings.styleActive;
+
+    const items = await gatherCharacterItems(base, settings, charNames);
+    const charactersText = pickCappedText(items, Number(settings.worldBookMaxChars) || 800);
+    const styleText = resolveStyleText(settings, styleName);
+    return { styleText, charactersText };
+}
+
+/**
+ * 降级/总结路的固定设定注入：收集风格+人物 → 拼【设定参考】块到末尾。
+ * 主流水线优化路改走 resolveFixedSettings + 优化模板占位符（见 processPromptPipeline）。
+ */
+async function injectStableDescriptions(prompt, settings) {
+    return appendFixedBlock(prompt, await resolveFixedSettings(prompt, settings));
 }
 
 // ═══════════════════════════════════════════════════════════════
@@ -2473,4 +2946,191 @@ function attachGeneratedImages(message, images, titles) {
     extra.image = mergedImages[mergedImages.length - 1];
     extra.inline_image = true;
     if (firstTitle) extra.title = firstTitle;
+}
+
+// ═══════════════════════════════════════════════════════════════
+// SECTION 17: DISK PERSISTENCE & GALLERY
+// ═══════════════════════════════════════════════════════════════
+
+const GALLERY_KEY = `${extensionName}:gallery`;
+const GALLERY_MAX = 100;
+
+/** 是否为 data:image/...;base64,... 形式的内联图 */
+function isDataUri(value) {
+    return /^data:image\//i.test(String(value || ""));
+}
+
+/** 当前角色名作为落盘子目录（与 ST 自带 SD 出图同目录约定），非法字符替换，回退扩展名 */
+function currentGallerySubFolder() {
+    try {
+        const ctx = getContext();
+        const name = ctx?.characters?.[ctx.characterId]?.name || ctx?.name2 || "";
+        const clean = String(name).trim().replace(/[\\/:*?"<>|]+/g, "_");
+        return clean || extensionName;
+    } catch {
+        return extensionName;
+    }
+}
+
+/**
+ * 把单张图落盘并返回可持久访问的路径。
+ * - data-URI：剥前缀取原始 base64 → saveBase64AsFile → 返回 user/images/... 路径
+ * - 已是 URL（http/相对路径）：后端已托管，原样返回
+ */
+async function persistImageToDisk(image, subFolder) {
+    const m = /^data:image\/([a-z0-9.+-]+);base64,(.*)$/is.exec(String(image || ""));
+    if (!m) return image;                       // 非 data-URI（普通 URL）直接返回
+    const ext = String(m[1] || "png").toLowerCase();
+    const rawBase64 = m[2];                      // 后端 Buffer.from(image,'base64') 需要纯 base64（不含前缀）
+    const fileName = `oair_${Date.now()}_${Math.floor(Math.random() * 1e6)}`;
+    return await saveBase64AsFile(rawBase64, subFolder, fileName, ext);
+}
+
+/**
+ * 落盘整批图并记录图库；落盘失败静默回退原图（不入库，避免大 base64 进 localStorage）。
+ * 返回换成路径后的图片数组（供附加/预览使用）。
+ */
+async function persistAndRecordImages(images, prompt, source) {
+    const sub = currentGallerySubFolder();
+    const out = [];
+    for (const img of images) {
+        let url = img;
+        let recordable = !isDataUri(img);        // 普通 URL 默认可入库（后端持久）
+        if (isDataUri(img)) {
+            try {
+                url = await persistImageToDisk(img, sub);
+                recordable = true;
+            } catch (e) {
+                console.warn(`[${extensionName}] 图片落盘失败，回退内联 base64`, e);
+                url = img;
+                recordable = false;
+            }
+        }
+        out.push(url);
+        if (recordable && url) addGalleryRecord({ url, prompt, source });
+    }
+    return out;
+}
+
+// ─── 图库存储（localStorage 仅存索引：路径 + 提示词 + 来源 + 时间） ───
+
+function loadGallery() {
+    try {
+        const arr = JSON.parse(localStorage.getItem(GALLERY_KEY) || "[]");
+        return Array.isArray(arr) ? arr : [];
+    } catch {
+        return [];
+    }
+}
+
+function saveGallery(list) {
+    try {
+        localStorage.setItem(GALLERY_KEY, JSON.stringify(list));
+    } catch (e) {
+        console.warn(`[${extensionName}] 图库保存失败`, e);
+    }
+}
+
+function addGalleryRecord({ url, prompt, source }) {
+    if (!url) return;
+    const list = loadGallery();
+    if (list.some((r) => r && r.url === url)) return;   // 路径去重
+    list.unshift({
+        url,
+        prompt: String(prompt || "").slice(0, 500),
+        source: source || "",
+        ts: Date.now(),
+    });
+    if (list.length > GALLERY_MAX) list.length = GALLERY_MAX;
+    saveGallery(list);
+    refreshGalleryUi();
+}
+
+function deleteGalleryRecord(url) {
+    saveGallery(loadGallery().filter((r) => r && r.url !== url));
+    refreshGalleryUi();
+}
+
+function clearGallery() {
+    saveGallery([]);
+    refreshGalleryUi();
+}
+
+// ─── 图库 UI ──────────────────────────────────────────────────
+
+function refreshGalleryUi() {
+    const fp = $("#oair_floating_panel");
+    const grid = fp.find("#oair_gallery_grid");
+    if (!grid.length) return;                    // 图库面板未渲染时跳过
+
+    const list = loadGallery();
+    fp.find("#oair_gallery_count").text(`${list.length} 张`);
+    grid.empty();
+
+    if (!list.length) {
+        grid.append('<div class="oair-hint" style="grid-column:1/-1; text-align:center; padding:20px;">还没有生成过图片</div>');
+        return;
+    }
+
+    for (const rec of list) {
+        if (!rec || !rec.url) continue;
+        const cell = $('<div class="oair-gallery-cell"></div>');
+        $("<img>")
+            .attr("src", rec.url)
+            .attr("title", rec.prompt || "")
+            .attr("loading", "lazy")
+            .on("click", () => openImageLightbox(rec.url))
+            .appendTo(cell);
+
+        const bar = $('<div class="oair-gallery-cell-bar"></div>');
+        $('<button class="oair-gallery-mini" title="附加到当前消息">📎</button>')
+            .on("click", (e) => { e.stopPropagation(); attachGalleryImageToMessage(rec.url); })
+            .appendTo(bar);
+        $('<button class="oair-gallery-mini" title="下载">⬇️</button>')
+            .on("click", (e) => { e.stopPropagation(); downloadImage(rec.url); })
+            .appendTo(bar);
+        $('<button class="oair-gallery-mini" title="从图库删除（不删磁盘文件）">🗑️</button>')
+            .on("click", (e) => {
+                e.stopPropagation();
+                if (confirm("从图库删除这条记录？（磁盘文件不会被删除）")) deleteGalleryRecord(rec.url);
+            })
+            .appendTo(bar);
+        bar.appendTo(cell);
+        grid.append(cell);
+    }
+}
+
+/** 把图库里的某张图附加到最后一条助手消息（复用 attachGeneratedImages，不重渲染正文） */
+async function attachGalleryImageToMessage(url) {
+    const context = getContext();
+    const chat = context?.chat;
+    if (!chat || chat.length === 0) {
+        toastr.warning("当前没有聊天消息");
+        return;
+    }
+    let msg = null;
+    let idx = -1;
+    for (let i = chat.length - 1; i >= 0; i--) {
+        if (!chat[i].is_user && !chat[i].is_system) { msg = chat[i]; idx = i; break; }
+    }
+    if (!msg) { idx = chat.length - 1; msg = chat[idx]; }
+    attachGeneratedImages(msg, [url], ["图库"]);
+    updateMessageBlock(idx, msg, { rerenderMessage: false });
+    try { await context.saveChat(); } catch (_) {}
+    toastr.success("已附加图库图片到消息");
+}
+
+/** 触发浏览器下载（同源路径或 data-URI 均可） */
+function downloadImage(url) {
+    try {
+        const a = document.createElement("a");
+        a.href = url;
+        a.download = (String(url).split("/").pop() || "image").split("?")[0] || "image.png";
+        document.body.appendChild(a);
+        a.click();
+        a.remove();
+    } catch (e) {
+        console.warn(`[${extensionName}] 下载失败`, e);
+        window.open(url, "_blank");
+    }
 }

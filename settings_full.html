@@ -13,7 +13,9 @@
         gap: 2px;
         border-bottom: 1px solid rgba(255,255,255,0.15);
         margin-bottom: 8px;
-        flex-wrap: wrap;
+        flex-wrap: nowrap;
+        overflow-x: auto;
+        scrollbar-width: thin;
     }
     .oair-tab-label {
         padding: 5px 10px;
@@ -24,6 +26,7 @@
         transition: all 0.15s;
         user-select: none;
         white-space: nowrap;
+        flex: 0 0 auto;
     }
     .oair-tab-label:hover {
         opacity: 0.85;
@@ -38,10 +41,12 @@
     #oair_tab_backend:checked ~ .oair-tab-bar label[for="oair_tab_backend"],
     #oair_tab_extract:checked ~ .oair-tab-bar label[for="oair_tab_extract"],
     #oair_tab_optimize:checked ~ .oair-tab-bar label[for="oair_tab_optimize"],
-    #oair_tab_manual:checked ~ .oair-tab-bar label[for="oair_tab_manual"] {
+    #oair_tab_worldbook:checked ~ .oair-tab-bar label[for="oair_tab_worldbook"],
+    #oair_tab_manual:checked ~ .oair-tab-bar label[for="oair_tab_manual"],
+    #oair_tab_gallery:checked ~ .oair-tab-bar label[for="oair_tab_gallery"] {
         opacity: 1;
         background: rgba(255,255,255,0.1);
-        border-bottom: 2px solid cyan;
+        border-bottom: 2px solid var(--SmartThemeQuoteColor, #68a0ff);
     }
 
     /* 显示对应面板 */
@@ -49,7 +54,9 @@
     #oair_tab_backend:checked ~ #oair_panel_backend,
     #oair_tab_extract:checked ~ #oair_panel_extract,
     #oair_tab_optimize:checked ~ #oair_panel_optimize,
-    #oair_tab_manual:checked ~ #oair_panel_manual {
+    #oair_tab_worldbook:checked ~ #oair_panel_worldbook,
+    #oair_tab_manual:checked ~ #oair_panel_manual,
+    #oair_tab_gallery:checked ~ #oair_panel_gallery {
         display: block;
     }
 
@@ -264,12 +271,72 @@
     .oair-custom-backend-content.oair-visible {
         display: block;
     }
+
+    /* ─── 区块左强调边（主题色） ─────────────────────────── */
+    .oair-settings-ui .oair-section {
+        border-left: 2px solid var(--SmartThemeQuoteColor, #68a0ff);
+    }
+
+    /* ─── 图库 ─────────────────────────────────────────── */
+    .oair-gallery-toolbar {
+        display: flex;
+        align-items: center;
+        justify-content: space-between;
+        gap: 8px;
+    }
+    .oair-gallery-grid {
+        display: grid;
+        grid-template-columns: repeat(auto-fill, minmax(90px, 1fr));
+        gap: 8px;
+    }
+    .oair-gallery-cell {
+        position: relative;
+        border-radius: 6px;
+        overflow: hidden;
+        background: rgba(0,0,0,0.2);
+        aspect-ratio: 1 / 1;
+    }
+    .oair-gallery-cell img {
+        width: 100%;
+        height: 100%;
+        object-fit: cover;
+        cursor: pointer;
+        display: block;
+    }
+    .oair-gallery-cell-bar {
+        position: absolute;
+        bottom: 0;
+        left: 0;
+        right: 0;
+        display: flex;
+        justify-content: center;
+        gap: 2px;
+        padding: 2px;
+        background: rgba(0,0,0,0.55);
+        opacity: 0;
+        transition: opacity 0.15s;
+    }
+    .oair-gallery-cell:hover .oair-gallery-cell-bar {
+        opacity: 1;
+    }
+    .oair-gallery-mini {
+        border: none;
+        background: transparent;
+        cursor: pointer;
+        font-size: 13px;
+        padding: 2px 4px;
+        line-height: 1;
+    }
+    /* 移动端无 hover：操作条常显 */
+    @media (max-width: 1000px) {
+        .oair-gallery-cell-bar { opacity: 0.9; }
+    }
 </style>
 
 <div class="oair-settings-ui">
     <!-- 状态栏（悬浮窗内也有） -->
     <div style="display:flex; justify-content:space-between; align-items:center; margin-bottom:10px; border-bottom:1px solid rgba(255,255,255,0.1); padding-bottom:5px; gap:8px;">
-        <div id="oair_floating_status" style="font-size:0.8em; color:cyan;">就绪</div>
+        <div id="oair_floating_status" style="font-size:0.8em; color:var(--SmartThemeQuoteColor, #68a0ff);">就绪</div>
         <label style="display:flex; align-items:center; gap:6px; font-size:0.8em; white-space:nowrap;">
             <input id="oair_floating_enabled" type="checkbox">
             启用
@@ -281,7 +348,9 @@
     <input type="radio" name="oair_tab" id="oair_tab_backend" style="display:none">
     <input type="radio" name="oair_tab" id="oair_tab_extract" style="display:none">
     <input type="radio" name="oair_tab" id="oair_tab_optimize" style="display:none">
+    <input type="radio" name="oair_tab" id="oair_tab_worldbook" style="display:none">
     <input type="radio" name="oair_tab" id="oair_tab_manual" style="display:none">
+    <input type="radio" name="oair_tab" id="oair_tab_gallery" style="display:none">
 
     <!-- 标签栏 -->
     <div class="oair-tab-bar">
@@ -289,7 +358,9 @@
         <label for="oair_tab_backend" class="oair-tab-label">⚙️ 后端</label>
         <label for="oair_tab_extract" class="oair-tab-label">🔍 提取</label>
         <label for="oair_tab_optimize" class="oair-tab-label">✨ 优化</label>
+        <label for="oair_tab_worldbook" class="oair-tab-label">🎭 设定</label>
         <label for="oair_tab_manual" class="oair-tab-label">🎨 手动</label>
+        <label for="oair_tab_gallery" class="oair-tab-label">🖼️ 图库</label>
     </div>
 
     <!-- ═══════════════════════════════════════════════════════ -->
@@ -474,6 +545,10 @@
                 <div class="oair-hint">关闭时，仅在手动点击「优化提示词」按钮时生效。</div>
             </div>
 
+            <label class="oair-field-label">文本回复长度上限 max_tokens（优化 / 审查 / 总结调用）</label>
+            <input id="oair_text_max_tokens" class="text_pole" type="number" min="256" step="256" placeholder="8192">
+            <div class="oair-hint"><b>推理模型(glm / o1 等)建议 4096~16384</b>：太小（如 1500）会让「思考」吃光预算、最终提示词被截断导致质量很低；太大（如 65535）部分后端会挂起或拒绝。主 API 与自定义后端都会用这个值。</div>
+
             <details class="oair-details">
                 <summary>优化提示词模板</summary>
                 <div class="oair-details-content">
@@ -481,6 +556,11 @@
                     <div class="oair-hint">使用 {{prompt}} 插入原始提示词。优化后的提示词将替代原始提示词发送给图片生成后端。</div>
                 </div>
             </details>
+
+            <div class="oair-btn-row">
+                <button id="oair_btn_reset_optimize_template" class="menu_button" style="flex:1; justify-content:center;">↺ 重置为 5 模块新模板</button>
+            </div>
+            <div class="oair-hint">把优化模板重置为内置 5 模块版（含 {{style}} / {{characters}} / {{prompt}} 占位符）。老用户升级用；会覆盖当前模板内容。</div>
 
             <!-- 自定义优化 LLM 后端（复选框控制展开） -->
             <div style="margin-top:10px;">
@@ -513,14 +593,6 @@
             </div>
         </div>
 
-        <!-- 固定角色外貌注入 -->
-        <div class="oair-section">
-            <div class="oair-section-title">固定角色外貌注入 <span class="oair-badge oair-badge-green">画对人</span></div>
-            <label class="oair-field-label">角色外貌设定（每行一个角色，格式「名字：外貌描述」）</label>
-            <textarea id="oair_character_appearance" class="text_pole" rows="5" style="width:100%; box-sizing:border-box;" placeholder="卡提希娅：金色长发，蓝色眼眸，尖耳，少女体型，前圣女气质，硬毛猪皮软甲，细带凉鞋，蓝色脚趾甲油&#10;齐齐：黑发青年，不死人，懒散的恶趣味神情"></textarea>
-            <div class="oair-hint">生成图片时，凡是提示词里出现的角色，会自动把其外貌并入提示词末尾，确保画对人。留空则不注入；若填写一段不带「名字：」的文字，则整体注入。</div>
-        </div>
-
         <!-- NSFW 规避 -->
         <div class="oair-section">
             <div class="oair-section-title">NSFW 规避 <span class="oair-badge oair-badge-red">安全</span></div>
@@ -551,6 +623,54 @@
                     <div class="oair-hint">点击消息上的「总结生图」按钮时使用此模板。</div>
                 </div>
             </details>
+        </div>
+    </div>
+
+    <!-- ═══════════════════════════════════════════════════════ -->
+    <!-- TAB: 世界书                                            -->
+    <!-- ═══════════════════════════════════════════════════════ -->
+    <div class="oair-tab-panel" id="oair_panel_worldbook">
+        <!-- 风格库 -->
+        <div class="oair-section">
+            <div class="oair-section-title">风格库 <span class="oair-badge oair-badge-orange">固定·画风</span></div>
+            <label class="oair-field-label">风格预设（每行一个，格式「风格名：风格描述」）</label>
+            <textarea id="oair_style_library" class="text_pole" rows="4" style="width:100%; box-sizing:border-box;" placeholder="写实：写实摄影风格，电影级布光，高细节&#10;动漫：日式动漫赛璐璐风格，鲜艳色彩，干净线条"></textarea>
+            <label class="oair-field-label">当前固定风格</label>
+            <select id="oair_style_active" class="text_pole" style="width:100%; box-sizing:border-box;"></select>
+            <label class="oair-toggle-label" style="margin-top:8px;">
+                <input id="oair_style_auto_select" type="checkbox">
+                由 LLM 按场景自动选风格（覆盖上面的固定选择）
+            </label>
+            <div class="oair-hint">不勾选时始终用「当前固定风格」，会话内一致；勾选后每次生图多一次轻量 LLM 分析挑风格。风格会注入优化模板的【风格】模块。</div>
+        </div>
+
+        <!-- 人物库 -->
+        <div class="oair-section">
+            <div class="oair-section-title">人物库 <span class="oair-badge oair-badge-green">固定·画对人</span></div>
+            <label class="oair-field-label">角色外貌设定（每行一个角色，格式「名字：外貌描述」）</label>
+            <textarea id="oair_character_appearance" class="text_pole" rows="5" style="width:100%; box-sizing:border-box;" placeholder="卡提希娅：金色长发，蓝色眼眸，尖耳，少女体型，前圣女气质，硬毛猪皮软甲，细带凉鞋，蓝色脚趾甲油&#10;齐齐：黑发青年，不死人，懒散的恶趣味神情"></textarea>
+            <label class="oair-toggle-label" style="margin-top:8px;">
+                <input id="oair_character_llm_extract" type="checkbox">
+                由 LLM 智能识别出场人物（默认按名字匹配）
+            </label>
+            <div class="oair-hint">默认：名字在场景里出现就注入其外貌（0 额外调用）。勾选后用 LLM 识别出场人物（代词/别名也能认），与风格自动选合并为一次分析调用。出场角色外貌会逐字注入优化模板的【人物特征】模块。</div>
+        </div>
+
+        <!-- 自动来源：世界书 -->
+        <div class="oair-section">
+            <div class="oair-section-title">自动来源 · 世界书 <span class="oair-badge oair-badge-green">自动读设定</span></div>
+            <label class="oair-toggle-label">
+                <input id="oair_worldbook_enabled" type="checkbox">
+                从世界书自动补充人物外貌 / 场景设定
+            </label>
+            <div class="oair-hint">
+                开启后：人物库未写到的角色，会自动从「当前聊天 / 角色卡绑定的世界书」命中条目并取其相关段，作为人物库的补充来源。<br>
+                世界书优先、人物库补未覆盖者。当前场景状态与动作仍由对话上下文决定。
+            </div>
+            <label class="oair-field-label">抽取的小节标题（逗号分隔，命中条目时只取这些段）</label>
+            <input id="oair_worldbook_headings" class="text_pole" placeholder="外貌,长相,外观,appearance,场景,环境,setting,scene">
+            <label class="oair-field-label">注入总字数上限</label>
+            <input id="oair_worldbook_maxchars" class="text_pole" type="number" min="0" placeholder="800">
         </div>
     </div>
 
@@ -602,6 +722,23 @@
         <div class="oair-section">
             <div class="oair-section-title">预览</div>
             <div id="oair_manual_preview" style="display:grid; gap:8px;"></div>
+        </div>
+    </div>
+
+    <!-- ═══════════════════════════════════════════════════════ -->
+    <!-- TAB: 图库                                              -->
+    <!-- ═══════════════════════════════════════════════════════ -->
+    <div class="oair-tab-panel" id="oair_panel_gallery">
+        <div class="oair-section">
+            <div class="oair-gallery-toolbar">
+                <div class="oair-section-title" style="margin:0;">图库 <span id="oair_gallery_count" class="oair-badge oair-badge-green">0 张</span></div>
+                <div style="display:flex; gap:6px;">
+                    <button id="oair_btn_gallery_refresh" class="menu_button">刷新</button>
+                    <button id="oair_btn_gallery_clear" class="menu_button">清空图库</button>
+                </div>
+            </div>
+            <div class="oair-hint">所有生成的图片自动保存到磁盘（SillyTavern/data/&lt;用户&gt;/user/images/&lt;角色&gt;/）并记录在此，刷新或重启都不会丢失。点击缩略图放大；「清空图库」只清除此处记录，不删除磁盘文件。</div>
+            <div id="oair_gallery_grid" class="oair-gallery-grid" style="margin-top:8px;"></div>
         </div>
     </div>
 </div>

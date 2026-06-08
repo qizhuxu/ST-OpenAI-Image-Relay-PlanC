@@ -210,6 +210,8 @@
     cursor: grab;
     user-select: none;
     flex-shrink: 0;
+    touch-action: none;
+    -webkit-tap-highlight-color: transparent;
 }
 
 .oair-floating-header:active {
