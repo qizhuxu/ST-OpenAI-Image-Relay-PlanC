@@ -16,7 +16,7 @@
     color: var(--SmartThemeBodyColor, #ccc);
     font-size: 18px;
     cursor: grab;
-    z-index: 3010;
+    z-index: 3210;
     box-shadow: 0 4px 16px rgba(0, 0, 0, 0.5);
     backdrop-filter: blur(10px);
     transition: transform 0.2s ease, box-shadow 0.2s ease, border-color 0.3s ease;
@@ -174,7 +174,7 @@
 #oair_floating_panel {
     display: none !important;
     position: fixed !important;
-    z-index: 3000 !important;
+    z-index: 3200 !important;
     width: 640px !important;
     min-width: 520px !important;
     max-width: 880px !important;
@@ -200,7 +200,218 @@
     pointer-events: auto !important;
 }
 
+#oair_floating_panel .oair-character-list,
+#oair_floating_panel .oair-progress-list,
+#oair_floating_panel .oair-history-list {
+    display: grid;
+    gap: 7px;
+}
+
+#oair_floating_panel .oair-progress-list {
+    max-height: min(34vh, 320px);
+    overflow-y: auto;
+    padding-right: 2px;
+}
+
+#oair_floating_panel .oair-character-card,
+#oair_floating_panel .oair-progress-card,
+#oair_floating_panel .oair-history-record {
+    border: 1px solid rgba(255, 255, 255, 0.12);
+    border-radius: 8px;
+    padding: 8px;
+    background: rgba(255, 255, 255, 0.045);
+}
+
+#oair_floating_panel .oair-character-card-head,
+#oair_floating_panel .oair-history-record-head {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    gap: 7px;
+    font-size: 0.78em;
+    font-weight: bold;
+}
+
+#oair_floating_panel .oair-character-card-head {
+    justify-content: flex-start;
+}
+
+#oair_floating_panel .oair-character-toggle-btn {
+    margin-left: auto;
+    min-height: 24px;
+    padding: 2px 8px;
+    font-size: 0.72em;
+    white-space: nowrap;
+}
+
+#oair_floating_panel .oair-character-source,
+#oair_floating_panel .oair-history-time,
+#oair_floating_panel .oair-history-meta,
+#oair_floating_panel .oair-history-prompt,
+#oair_floating_panel .oair-history-job,
+#oair_floating_panel .oair-progress-status {
+    font-size: 0.73em;
+    opacity: 0.76;
+    line-height: 1.45;
+    overflow-wrap: anywhere;
+    word-break: break-word;
+}
+
+#oair_floating_panel .oair-error-summary {
+    margin-top: 6px;
+    max-height: 86px;
+    overflow-y: auto;
+    padding: 6px;
+    border-radius: 6px;
+    background: rgba(255, 80, 80, 0.08);
+    color: #ffb3b3;
+    font-size: 0.72em;
+    line-height: 1.45;
+    white-space: pre-wrap;
+    overflow-wrap: anywhere;
+}
+
+#oair_floating_panel .oair-character-candidate-text {
+    margin-top: 6px;
+    width: 100%;
+    box-sizing: border-box;
+    resize: vertical;
+}
+
+#oair_floating_panel .oair-progress-title {
+    font-size: 0.78em;
+    font-weight: bold;
+    margin-bottom: 4px;
+}
+
+#oair_floating_panel .oair-status-succeeded {
+    color: #78ffac;
+}
+
+#oair_floating_panel .oair-status-failed,
+#oair_floating_panel .oair-history-error {
+    color: #ff9a9a;
+}
+
+#oair_floating_panel .oair-history-job {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    gap: 6px;
+    padding-top: 5px;
+    margin-top: 5px;
+    border-top: 1px solid rgba(255, 255, 255, 0.08);
+}
+
+#oair_floating_panel .oair-history-prompt {
+    margin-top: 5px;
+    display: -webkit-box;
+    -webkit-line-clamp: 2;
+    -webkit-box-orient: vertical;
+    overflow: hidden;
+}
+
+#oair_floating_panel .oair-history-empty {
+    padding: 10px;
+    border: 1px dashed rgba(255, 255, 255, 0.16);
+    border-radius: 8px;
+    font-size: 0.76em;
+    opacity: 0.68;
+    text-align: center;
+}
+
+#oair_floating_panel .oair-auto-flow-events,
+#oair_floating_panel .oair-built-in-style-list {
+    display: grid;
+    gap: 6px;
+    margin-top: 8px;
+    max-height: 150px;
+    overflow-y: auto;
+    padding-right: 2px;
+}
+
+#oair_floating_panel .oair-auto-flow-event,
+#oair_floating_panel .oair-built-in-style {
+    border: 1px solid rgba(255, 255, 255, 0.12);
+    border-radius: 8px;
+    padding: 7px;
+    background: rgba(255, 255, 255, 0.045);
+    min-width: 0;
+}
+
+#oair_floating_panel .oair-auto-flow-event {
+    display: grid;
+    grid-template-columns: auto 1fr;
+    gap: 6px;
+    align-items: start;
+}
+
+#oair_floating_panel .oair-auto-flow-kind {
+    font-size: 0.68em;
+    font-weight: 700;
+    padding: 1px 6px;
+    border-radius: 999px;
+    background: rgba(104, 160, 255, 0.16);
+    white-space: nowrap;
+}
+
+#oair_floating_panel .oair-auto-flow-text,
+#oair_floating_panel .oair-built-in-style-text {
+    font-size: 0.73em;
+    line-height: 1.45;
+    opacity: 0.78;
+    overflow-wrap: anywhere;
+}
+
+#oair_floating_panel .oair-built-in-style-name {
+    font-size: 0.78em;
+    font-weight: 700;
+    margin-bottom: 3px;
+}
+
 /* 悬浮窗标题栏 */
+/* 移动端覆盖必须位于基础浮窗规则之后，确保同级 !important 顺序生效。 */
+@media (max-width: 1000px) {
+    #oair_floating_panel,
+    #oair_floating_panel.oair-floating--visible {
+        width: calc(100vw - 24px) !important;
+        max-width: 480px !important;
+        min-width: unset !important;
+        max-height: 75vh !important;
+        left: 50% !important;
+        transform: translateX(-50%) !important;
+    }
+}
+
+@media (max-width: 768px) {
+    #oair_floating_panel,
+    #oair_floating_panel.oair-floating--visible {
+        width: calc(100vw - 16px) !important;
+        max-width: none !important;
+        min-width: unset !important;
+        min-height: min(360px, calc(100vh - 16px)) !important;
+        max-height: 60vh !important;
+        left: 50% !important;
+        transform: translateX(-50%) !important;
+        border-radius: 10px !important;
+    }
+}
+
+@media (max-width: 400px) {
+    #oair_floating_panel,
+    #oair_floating_panel.oair-floating--visible {
+        width: calc(100vw - 8px) !important;
+        max-width: none !important;
+        min-width: unset !important;
+        min-height: min(320px, calc(100vh - 16px)) !important;
+        max-height: 55vh !important;
+        left: 50% !important;
+        top: 8px !important;
+        transform: translateX(-50%) !important;
+        border-radius: 10px !important;
+    }
+}
+
 .oair-floating-header {
     display: flex;
     align-items: center;
@@ -370,4 +581,427 @@
 }
 .oair-custom-backend-content.oair-visible {
     display: block;
+}
+
+/* ─── 设定库弹窗与摘要列表 ─────────────────────────────── */
+.oair-hidden-store {
+    display: none !important;
+}
+.oair-library-toolbar {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 6px;
+    margin-top: 8px;
+}
+.oair-library-toolbar .menu_button {
+    flex: 1 1 120px;
+    justify-content: center;
+    min-height: 30px;
+}
+.oair-library-summary {
+    display: grid;
+    gap: 6px;
+    margin-top: 8px;
+}
+.oair-library-card,
+.oair-library-row {
+    border: 1px solid rgba(255,255,255,0.12);
+    border-radius: 6px;
+    padding: 7px;
+    background: rgba(255,255,255,0.04);
+}
+.oair-library-card-title,
+.oair-library-row-title {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    gap: 8px;
+    font-size: 0.82em;
+    font-weight: bold;
+}
+.oair-library-card-body,
+.oair-library-row-body {
+    margin-top: 4px;
+    font-size: 0.75em;
+    line-height: 1.45;
+    opacity: 0.78;
+    word-break: break-word;
+}
+.oair-library-card-body {
+    display: -webkit-box;
+    -webkit-line-clamp: 2;
+    -webkit-box-orient: vertical;
+    overflow: hidden;
+}
+.oair-library-empty {
+    padding: 10px;
+    border: 1px dashed rgba(255,255,255,0.18);
+    border-radius: 6px;
+    font-size: 0.76em;
+    opacity: 0.65;
+    text-align: center;
+}
+.oair-active-chip {
+    display: inline-flex;
+    align-items: center;
+    max-width: 100%;
+    padding: 2px 7px;
+    border-radius: 999px;
+    background: rgba(104,160,255,0.16);
+    color: var(--SmartThemeBodyColor, #ddd);
+    font-size: 0.72em;
+    font-weight: normal;
+    white-space: nowrap;
+}
+.oair-radio-group {
+    display: grid;
+    grid-template-columns: repeat(3, minmax(0, 1fr));
+    gap: 6px;
+    margin-top: 8px;
+}
+.oair-radio-option {
+    display: flex;
+    align-items: flex-start;
+    gap: 6px;
+    padding: 7px;
+    border: 1px solid rgba(255,255,255,0.12);
+    border-radius: 6px;
+    background: rgba(255,255,255,0.04);
+    font-size: 0.76em;
+    line-height: 1.35;
+    cursor: pointer;
+}
+.oair-radio-option input {
+    margin-top: 2px;
+    flex: 0 0 auto;
+}
+.oair-library-modal {
+    position: fixed;
+    inset: 0;
+    z-index: 3300;
+    display: none;
+    align-items: center;
+    justify-content: center;
+    padding: 18px;
+    background:
+        radial-gradient(circle at 20% 12%, rgba(255,216,164,0.13), transparent 34%),
+        radial-gradient(circle at 82% 78%, rgba(104,160,255,0.16), transparent 38%),
+        rgba(0,0,0,0.62);
+    backdrop-filter: blur(3px);
+}
+.oair-library-modal.oair-visible {
+    display: flex;
+}
+.oair-library-dialog {
+    width: min(820px, calc(100vw - 36px));
+    max-height: min(820px, calc(100vh - 36px));
+    display: flex;
+    flex-direction: column;
+    border: 1px solid rgba(255,255,255,0.18);
+    border-radius: 16px;
+    background:
+        linear-gradient(180deg, rgba(255,255,255,0.075), rgba(0,0,0,0.18)),
+        var(--SmartThemeBlurTintColor, rgba(28,28,44,0.98));
+    box-shadow: 0 22px 70px rgba(0,0,0,0.72), 0 0 0 1px rgba(255,255,255,0.04) inset;
+    overflow: hidden;
+}
+.oair-library-dialog-header,
+.oair-library-dialog-footer {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    gap: 10px;
+    padding: 12px 14px;
+    border-bottom: 1px solid rgba(255,255,255,0.11);
+    background: rgba(255,255,255,0.035);
+}
+.oair-library-dialog-footer {
+    border-top: 1px solid rgba(255,255,255,0.11);
+    border-bottom: 0;
+    justify-content: flex-end;
+    flex-wrap: wrap;
+}
+.oair-library-dialog-footer .menu_button,
+.oair-library-editor .menu_button,
+.oair-library-row-actions .menu_button {
+    white-space: nowrap;
+    word-break: keep-all;
+}
+.oair-library-dialog-title {
+    margin: 0;
+    font-size: 1em;
+    font-weight: 800;
+    letter-spacing: 0.03em;
+}
+.oair-library-dialog-body {
+    display: grid;
+    grid-template-columns: minmax(240px, 0.9fr) minmax(300px, 1.15fr);
+    gap: 12px;
+    padding: 14px;
+    overflow: auto;
+}
+.oair-library-list,
+.oair-library-editor {
+    display: grid;
+    gap: 8px;
+    align-content: start;
+}
+.oair-library-list {
+    max-height: min(560px, calc(100vh - 220px));
+    overflow: auto;
+    padding-right: 2px;
+}
+.oair-library-row {
+    border-radius: 12px;
+    padding: 10px;
+    background: rgba(255,255,255,0.045);
+    cursor: pointer;
+    transition: border-color 0.16s ease, background 0.16s ease, transform 0.16s ease;
+}
+.oair-library-row:hover {
+    transform: translateY(-1px);
+    background: rgba(255,255,255,0.065);
+}
+.oair-library-row:focus-visible {
+    outline: 2px solid rgba(104,160,255,0.72);
+    outline-offset: 2px;
+}
+.oair-library-row.oair-active {
+    border-color: var(--SmartThemeQuoteColor, #68a0ff);
+    background: linear-gradient(135deg, rgba(104,160,255,0.16), rgba(255,216,164,0.07));
+}
+.oair-library-row-actions {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 5px;
+    margin-top: 4px;
+}
+.oair-library-row-actions .menu_button {
+    min-height: 26px;
+    padding: 3px 8px;
+    font-size: 0.72em;
+}
+.oair-library-editor {
+    padding: 10px;
+    border-radius: 12px;
+    border: 1px solid rgba(255,255,255,0.10);
+    background: rgba(0,0,0,0.12);
+}
+.oair-library-editor .text_pole,
+.oair-library-row .text_pole {
+    width: 100%;
+    box-sizing: border-box;
+}
+.oair-library-editor textarea {
+    min-height: 180px;
+    resize: vertical;
+    line-height: 1.5;
+}
+.oair-library-row textarea.text_pole {
+    min-height: 96px;
+    resize: vertical;
+    line-height: 1.45;
+}
+.oair-library-row input[type="checkbox"] {
+    width: 16px;
+    height: 16px;
+    accent-color: var(--SmartThemeQuoteColor, #68a0ff);
+}
+
+/* ─── 图库独立标签 ──────────────────────────────────────── */
+.oair-gallery-toolbar {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    gap: 8px;
+}
+.oair-gallery-actions {
+    display: flex;
+    gap: 6px;
+    flex-wrap: nowrap;
+    align-items: center;
+}
+.oair-gallery-actions .menu_button {
+    flex: 0 0 auto;
+    white-space: nowrap;
+    word-break: keep-all;
+    min-width: max-content;
+}
+.oair-gallery-grid {
+    display: grid;
+    grid-template-columns: repeat(auto-fill, minmax(90px, 1fr));
+    gap: 8px;
+}
+.oair-gallery-cell {
+    position: relative;
+    border-radius: 8px;
+    overflow: hidden;
+    background: rgba(0,0,0,0.2);
+    aspect-ratio: 1 / 1;
+}
+.oair-gallery-cell img {
+    width: 100%;
+    height: 100%;
+    object-fit: cover;
+    cursor: pointer;
+    display: block;
+}
+.oair-gallery-cell-bar {
+    position: absolute;
+    bottom: 0;
+    left: 0;
+    right: 0;
+    display: flex;
+    justify-content: center;
+    gap: 2px;
+    padding: 2px;
+    background: rgba(0,0,0,0.55);
+    opacity: 0;
+    transition: opacity 0.15s;
+}
+.oair-gallery-cell:hover .oair-gallery-cell-bar,
+.oair-gallery-cell:focus-within .oair-gallery-cell-bar {
+    opacity: 1;
+}
+.oair-gallery-mini {
+    border: none;
+    background: transparent;
+    cursor: pointer;
+    font-size: 13px;
+    padding: 2px 4px;
+    line-height: 1;
+}
+.oair-pagination {
+    grid-column: 1 / -1;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    gap: 8px;
+    margin-top: 8px;
+    flex-wrap: wrap;
+}
+.oair-pagination .menu_button {
+    min-height: 26px;
+    padding: 3px 10px;
+    white-space: nowrap;
+    word-break: keep-all;
+}
+.oair-pagination-info {
+    font-size: 0.74em;
+    opacity: 0.72;
+    white-space: nowrap;
+}
+/* ─── Phase 8: L2 混合型信息架构与工作台 ───────────────── */
+#oair_floating_panel .oair-tab-label:focus-visible,
+#oair_floating_panel .menu_button:focus-visible,
+#oair_floating_panel button:focus-visible,
+#oair_floating_panel input:focus-visible,
+#oair_floating_panel select:focus-visible,
+#oair_floating_panel textarea:focus-visible,
+#oair_floating_panel [role="button"]:focus-visible,
+#oair_floating_panel summary:focus-visible {
+    outline: 2px solid rgba(104,160,255,0.75);
+    outline-offset: 2px;
+}
+
+.oair-workbench-grid {
+    display: grid;
+    grid-template-columns: minmax(260px, 0.95fr) minmax(280px, 1.05fr);
+    gap: 10px;
+    align-items: start;
+}
+.oair-workbench-left,
+.oair-workbench-right {
+    min-width: 0;
+}
+.oair-workbench-preview-grid {
+    display: grid;
+    grid-template-columns: repeat(auto-fill, minmax(96px, 1fr));
+    gap: 8px;
+    margin-top: 8px;
+    align-items: start;
+}
+.oair-preview-card {
+    min-width: 0;
+    border: 1px solid rgba(255,255,255,0.12);
+    border-radius: 8px;
+    padding: 7px;
+    background: rgba(255,255,255,0.045);
+}
+.oair-preview-title {
+    margin-bottom: 6px;
+    font-size: 0.74em;
+    line-height: 1.35;
+    opacity: 0.82;
+    overflow-wrap: anywhere;
+}
+.oair-preview-thumb {
+    position: relative;
+    overflow: hidden;
+    border-radius: 6px;
+    background: rgba(0,0,0,0.22);
+    aspect-ratio: 1 / 1;
+}
+.oair-preview-thumb img {
+    display: block;
+    width: 100%;
+    height: 100%;
+    object-fit: cover;
+    cursor: pointer;
+}
+.oair-preview-card .oair-panel-dialogue {
+    max-height: 70px;
+    overflow-y: auto;
+    overflow-wrap: anywhere;
+}
+.oair-plan-placeholder,
+.oair-log-box,
+.oair-history-box {
+    border: 1px dashed rgba(255,255,255,0.16);
+    border-radius: 10px;
+    padding: 9px;
+    background: rgba(0,0,0,0.10);
+    font-size: 0.76em;
+    line-height: 1.5;
+    opacity: 0.78;
+}
+.oair-history-toolbar {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    gap: 8px;
+}
+.oair-history-actions {
+    display: flex;
+    gap: 6px;
+    flex-wrap: nowrap;
+    align-items: center;
+}
+.oair-history-actions .menu_button,
+#oair_floating_panel .oair-btn-row .menu_button,
+#oair_floating_panel .oair-tab-label {
+    white-space: nowrap;
+    word-break: keep-all;
+}
+
+@media (max-width: 720px) {
+    .oair-workbench-grid,
+    .oair-library-dialog-body,
+    .oair-radio-group,
+    #oair_floating_panel .oair-row {
+        grid-template-columns: 1fr;
+    }
+    .oair-library-dialog {
+        width: calc(100vw - 20px);
+        max-height: calc(100vh - 20px);
+    }
+    .oair-history-toolbar,
+    .oair-gallery-toolbar {
+        align-items: flex-start;
+        flex-direction: column;
+    }
+    #oair_floating_panel .oair-tab-label {
+        font-size: 0.76em;
+        padding: 7px 9px;
+    }
 }

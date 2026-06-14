@@ -24,6 +24,7 @@ desktop.ini
 *.temp
 *.bak
 *.backup
+.playwright-cli/
 
 
 # Python

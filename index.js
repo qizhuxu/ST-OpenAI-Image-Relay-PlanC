@@ -5,8 +5,28 @@
 
 import { extension_settings, getContext } from "../../../extensions.js";
 import {
+    BUILT_IN_STYLE_PRESETS,
+    applyAutomaticVisualExtraction,
+    canUsePolicySafeRetry,
+    classifyImageGenerationError,
+    compileImagePrompt,
+    confirmCharacterCandidatesIntoScope,
+    createChatVisualScopeKey,
+    createPolicySafeRetryPrompt,
+    formatBuiltInStyleLibrary,
+    loadChatVisualScope,
+    mergeBuiltInStylePresets,
+    normalizeVisualExtractionSettings,
+    normalizePromptSafetyLevel,
+    planSingleImageTarget,
+    resolvePersonaVisualCandidates,
+    resolveChatVisualBible,
+    saveChatVisualScopePatch,
+} from "./prompt_compiler.mjs";
+import {
     eventSource,
     event_types,
+    name1,
     saveSettingsDebounced,
     updateMessageBlock,
     setExtensionPrompt,
@@ -20,6 +40,10 @@ import { regexFromString, saveBase64AsFile } from "../../../utils.js";
 // ═══════════════════════════════════════════════════════════════
 
 const extensionName = "ST-OpenAI-Image-Relay";
+const CHAT_VISUAL_META_KEY = `${extensionName}:chatVisualScopes`;
+const CHAT_VISUAL_FIELDS = ["characterAppearance", "styleLibrary", "styleActive", "sceneLibrary", "sceneActive", "confirmedCharacters"];
+
+let chatVisualMetadataSaveTimer = null;
 
 // 动态检测实际扩展文件夹名（仓库名可能与 extensionName 不同）
 function detectExtensionPath() {
@@ -74,50 +98,210 @@ const DEFAULT_MAIN_PROMPT = [
 ].join('\n');
 
 const DEFAULT_OPTIMIZE_TEMPLATE = [
-    '你是一个专业的图片提示词优化专家。请把下列信息整合成一段可直接用于生成【单张】图片的中文提示词。',
+    '你是一个图片提示词精修编辑。输入内容已经由本地提示词编译器整理为可生图 prompt；你的任务是做轻量精修，而不是重新规划画面。',
     '',
-    '【风格】（固定，必须严格遵循）：',
+    '【取景策略】：',
+    '{{singleStrategy}}',
+    '',
+    '【固定风格参考】：',
     '{{style}}',
     '',
-    '【人物特征】（固定，出现的角色必须逐字保留以下外貌设定，不得改写或省略）：',
+    '【固定人物外貌参考】：',
     '{{characters}}',
     '',
-    '【本次场景原文】：',
+    '【固定场景参考】：',
+    '{{scenes}}',
+    '',
+    '【编译后提示词】：',
     '{{prompt}}',
     '',
-    '整合要求：',
-    '1. 从场景原文中提炼〔场景环境〕〔人物空间位置〕〔行为动作〕三部分，与上面的风格、人物特征融合成统一画面。',
-    '2. 若原文含多个场景或时间段，只取最后出现的、或最具视觉冲击力的高潮场景作为画面主体。',
-    '3. 出现的具名角色必须套用上面【人物特征】里的固定外貌，严禁替换成「女孩」「男子」等泛称，也不要省略其外观细节。',
-    '4. 不要凭空虚构未提供的人物身份或外貌；可补充利于出图的构图、视角、色彩、光线，但不得削弱原文已有关键信息。',
-    '5. 使用中文连贯句子描述，而不是关键词堆砌。',
-    '6. 只输出最终提示词，不要包含任何解释、前言或后记。',
+    '精修要求：',
+    '1. 保留编译器选定的主体、视觉瞬间、人物关系、镜头构图、场景光影、视觉锚点、连续性和文字/对白策略。',
+    '2. 出现具名角色时，必须保留【固定人物外貌参考】里的角色名和关键外貌，不要改写成“少女”“男子”等泛称。',
+    '3. 只压缩重复、补足图像模型需要的构图/光线/动作清晰度；不要凭空新增角色、改地点、改剧情顺序或改成多张图。',
+    '4. 插件气泡模式下，不要要求模型在图中生成文字；模型画字模式下才保留文字绘制要求。',
+    '5. 不要主动把安全的动作戏、武器持握、奇幻道具、追逐、对峙改成日常立绘；最终安全处理由安全重写模板负责。',
+    '6. 输出最终生图提示词即可，可保留原来的分段结构；不要前言、解释、项目符号、代码块或额外段落。',
 ].join('\n');
 
+const DEFAULT_SINGLE_IMAGE_STRATEGY = "climax";
+const SINGLE_IMAGE_STRATEGY_LABELS = {
+    climax: "剧情高潮：选择本段最有视觉冲击、最能代表剧情转折的瞬间。",
+    poster: "总结海报：把整段剧情的主要人物、场景、道具和氛围汇总成代表性画面。",
+    final: "最后镜头：优先描绘文本末尾正在发生的当前画面。",
+};
+
+const DEFAULT_STYLE_LIBRARY = [
+    '日系动画：清爽二次元线条，干净上色，角色表情明确，适合轻小说、动画截图感画面。',
+    '写实电影：真实摄影质感，电影级构图，自然光影，细节丰富，适合严肃剧情与沉浸式场景。',
+    '厚涂奇幻：厚涂笔触，高饱和光影，幻想史诗氛围，适合魔法、战斗、异世界场景。',
+    '赛博朋克：霓虹灯光，高对比暗部，未来都市质感，适合电子、机械、夜景与压迫感画面。',
+    '水彩插画：柔和水彩晕染，低对比温柔色彩，纸张纹理，适合日常、回忆、抒情画面。',
+].join('\n');
+
+const LEGACY_OPTIMIZE_TEMPLATES = [
+    [
+        '你是一个专业的图片提示词优化专家。请把下列信息整理为【剧情主轴导向】中文单图生图提示词。',
+        '',
+        '【取景策略】：',
+        '{{singleStrategy}}',
+        '',
+        '【固定风格参考】：',
+        '{{style}}',
+        '',
+        '【固定人物外貌参考】：',
+        '{{characters}}',
+        '',
+        '【固定场景参考】：',
+        '{{scenes}}',
+        '',
+        '【本次场景原文】：',
+        '{{prompt}}',
+        '',
+        '输出格式必须固定为以下七段，标题、冒号和顺序都不能改变：',
+        '画面主轴：XXXX',
+        '剧情瞬间：XXXX',
+        '主要人物：XXXX',
+        '空间构图：XXXX',
+        '场景氛围：XXXX',
+        '关键视觉锚点：XXXX',
+        '绘图指令：请根据上述要求绘图',
+        '',
+        '填写要求：',
+        '1. 画面主轴：先判断这张图真正要画什么，必须保护剧情主线，不要只抓最后一句标签或局部人物。',
+        '2. 剧情瞬间：按【取景策略】选择剧情高潮、总结海报或最后镜头；长文只能落到一张单图时，必须说明被选中的具体瞬间。',
+        '3. 主要人物：列出本画面必须出现的主要人物、身份、外貌、装备、情绪；出现的具名角色必须套用【固定人物外貌参考】中的“角色名：外貌描述”，不得改写成“少女”“男子”等泛称。',
+        '4. 空间构图：明确前景、中景、远景、视角、人物之间的位置关系和画面层次。',
+        '5. 场景氛围：融合【固定场景参考】和本次原文，只描述地点、环境、时间、光影、天气、人群、建筑、氛围等可视化信息。',
+        '6. 关键视觉锚点：保留原文中最能防止失真的道具、文字、标志、特殊光效、背景事件、巨大实体或环境符号。',
+        '7. 绘图指令固定写为“请根据上述要求绘图”，不要在此行复述或扩写前六段内容。',
+        '8. 若某项信息不足，也要保留该段并写出最合理的安全、可视化描述；不要输出“无”。',
+        '9. 只输出七段固定格式，不要前言、解释、项目符号、代码块或额外段落。',
+    ].join('\n'),
+    [
+        '你是一个专业的图片提示词优化专家。请把下列信息整理为【固定五项 + 画图指令】中文生图提示词。',
+        '',
+        '【固定风格参考】：',
+        '{{style}}',
+        '',
+        '【固定人物外貌参考】：',
+        '{{characters}}',
+        '',
+        '【固定场景参考】：',
+        '{{scenes}}',
+        '',
+        '【本次场景原文】：',
+        '{{prompt}}',
+        '',
+        '输出格式必须固定为以下六行，字段名、冒号和顺序都不能改变：',
+        '风格：XXXX',
+        '场景：XXXXXX',
+        '人物外貌：XXXXXXX',
+        '人物空间位置：XXXXXX',
+        '人物行为：XXXXXXX',
+        '画图指令：XXXXXXX',
+        '',
+        '填写要求：',
+        '1. 风格：优先使用【固定风格参考】，没有固定风格时从原文提炼画风、镜头、光影、色彩。',
+        '2. 场景：融合【固定场景参考】和本次原文，只描述本张图发生的地点、环境、时间、氛围。',
+        '3. 人物外貌：出现的具名角色必须套用【固定人物外貌参考】中的外貌，不得改写、弱化或省略关键特征。',
+        '4. 人物空间位置：明确人物之间、人物与场景物体之间的站位、距离、朝向、前后层次。',
+        '5. 人物行为：只描述当前画面中可见的动作、表情、互动和姿态。',
+        '6. 画图指令必须是可直接发送给图片模型的完整生图提示词，要把前五行信息整合成一段连贯、具体、可视化的画面描述。',
+        '7. 若某项信息不足，也要保留该行并写出最合理的安全、可视化描述；不要输出“无”。',
+        '8. 只输出六行固定格式，不要前言、解释、项目符号、代码块或额外段落。',
+    ].join('\n'),
+    [
+        '你是一个专业的图片提示词优化专家。请把下列信息整合成一段可直接用于生成【单张】图片的中文提示词。',
+        '',
+        '【风格】（固定，必须严格遵循）：',
+        '{{style}}',
+        '',
+        '【人物特征】（固定，出现的角色必须逐字保留以下外貌设定，不得改写或省略）：',
+        '{{characters}}',
+        '',
+        '【场景设定】（固定参考，若本次画面发生在这些地点或环境中，必须保留其关键特征）：',
+        '{{scenes}}',
+        '',
+        '【本次场景原文】：',
+        '{{prompt}}',
+        '',
+        '整合要求：',
+        '1. 从场景原文中提炼〔场景环境〕〔人物空间位置〕〔行为动作〕三部分，与上面的风格、人物特征、场景设定融合成统一画面。',
+        '2. 若原文含多个场景或时间段，只取最后出现的、或最具视觉冲击力的高潮场景作为画面主体。',
+        '3. 出现的具名角色必须套用上面【人物特征】里的固定外貌，严禁替换成「女孩」「男子」等泛称，也不要省略其外观细节。',
+        '4. 不要凭空虚构未提供的人物身份或外貌；可补充利于出图的构图、视角、色彩、光线，但不得削弱原文已有关键信息。',
+        '5. 使用中文连贯句子描述，而不是关键词堆砌。',
+        '6. 只输出最终提示词，不要包含任何解释、前言或后记。',
+    ].join('\n'),
+    [
+        '你是一个专业的图片提示词优化专家。请把下列信息整合成一段可直接用于生成【单张】图片的中文提示词。',
+        '',
+        '【风格】（固定，必须严格遵循）：',
+        '{{style}}',
+        '',
+        '【人物特征】（固定，出现的角色必须逐字保留以下外貌设定，不得改写或省略）：',
+        '{{characters}}',
+        '',
+        '【本次场景原文】：',
+        '{{prompt}}',
+        '',
+        '整合要求：',
+        '1. 从场景原文中提炼〔场景环境〕〔人物空间位置〕〔行为动作〕三部分，与上面的风格、人物特征融合成统一画面。',
+        '2. 若原文含多个场景或时间段，只取最后出现的、或最具视觉冲击力的高潮场景作为画面主体。',
+        '3. 出现的具名角色必须套用上面【人物特征】里的固定外貌，严禁替换成「女孩」「男子」等泛称，也不要省略其外观细节。',
+        '4. 不要凭空虚构未提供的人物身份或外貌；可补充利于出图的构图、视角、色彩、光线，但不得削弱原文已有关键信息。',
+        '5. 使用中文连贯句子描述，而不是关键词堆砌。',
+        '6. 只输出最终提示词，不要包含任何解释、前言或后记。',
+    ].join('\n'),
+];
+
+const LEGACY_OPTIMIZE_TEMPLATE_MARKERS = [
+    "固定六项 + 简短画图指令",
+    "固定五项 + 画图指令",
+    "剧情主轴导向",
+    "图片提示词优化专家",
+];
+
+const LEGACY_NSFW_TEMPLATE_MARKERS = [
+    "内容安全审查专家",
+    "重度伤害",
+    "改为人物立绘、日常场景、风景",
+];
+
 const DEFAULT_ANALYSIS_TEMPLATE = [
-    '你是图片场景分析助手。阅读【场景原文】后判断两件事：',
+    '你是图片场景分析助手。阅读【场景原文】后判断三件事：',
     '1. characters：从【候选人物】里挑出本场景实际出场的人物名（数组；没有就空数组）。',
     '2. style：从【候选风格】里挑出最贴合本场景氛围的一个风格名（字符串；无合适就空字符串）。',
+    '3. scene：从【候选场景】里挑出最贴合本次画面的一个场景名（字符串；无合适就空字符串）。',
     '',
     '只输出一行紧凑 JSON，不要任何解释或代码块标记，例如：',
-    '{"characters":["卡提希娅","齐齐"],"style":"写实"}',
+    '{"characters":["卡提希娅","齐齐"],"style":"写实","scene":"雨夜街道"}',
     '',
     '【候选人物】：{{characters}}',
     '【候选风格】：{{styles}}',
+    '【候选场景】：{{scenes}}',
     '【场景原文】：',
     '{{prompt}}',
 ].join('\n');
 
 const DEFAULT_NSFW_TEMPLATE = [
-    '你是一个内容安全审查专家。请审查并修改以下图片生成提示词，确保其内容安全（SFW）。',
+    '你是一个图片提示词安全重写专家。请按【安全级别】审查并最小化修改以下图片生成提示词，确保其内容安全（SFW）。',
+    '',
+    '【安全级别】：{{safetyLevel}}',
+    '',
+    '级别说明：',
+    '- strict：更积极地弱化危险、暴力和性暗示，但仍保留基本画面意图。',
+    '- standard：默认级别，只移除明确不安全内容；保留非血腥动作戏、武器持握、奇幻道具、追逐、对峙、紧张气氛和电影感冲突。',
+    '- loose：只移除露骨色情、裸露、血腥、肢解、重度伤害等明确违规细节，尽量保留原文张力。',
     '',
     '规则：',
-    '1. 移除任何色情、裸露、性暗示、露骨身体描写、性行为的内容',
-    '2. 移除任何血腥、暴力、重度伤害的描述',
-    '3. 将不安全的内容替换为安全、自然、健康的替代描述（如改为人物立绘、日常场景、风景等）',
-    '4. 保持提示词的整体画面意图和构图方向',
-    '5. 如果原始提示词完全是安全的，直接原样返回不做修改',
-    '6. 只输出修改后的提示词，不要包含任何解释',
+    '1. 必须移除色情、裸露、性行为、露骨身体描写、未成年暧昧、血腥、肢解、内脏、重度伤害等明确不安全内容。',
+    '2. 不要把安全的动作戏、奇幻战斗、武器道具、魔法药剂、对峙、闪避、格挡、追逐、紧张氛围改成日常人物立绘或风景。',
+    '3. 如需弱化战斗，只把血口、滴血、致命伤、残酷伤害改成非血腥的“擦伤、格挡、击退、踉跄、破绽、火花、尘土、冲击感”。',
+    '4. 保持主体、构图、人物关系、道具、场景、镜头和剧情张力。',
+    '5. 如果原始提示词已经安全，直接原样返回。',
+    '6. 只输出修改后的提示词，不要包含任何解释、标题或代码块。',
     '',
     '原始提示词：',
     '{{prompt}}',
@@ -136,6 +320,52 @@ const DEFAULT_SUMMARIZE_TEMPLATE = [
     '',
     '消息内容：',
     '{{message}}',
+].join('\n');
+
+const DEFAULT_MULTI_ANALYSIS_TEMPLATE = [
+    '你是剧情分镜专家。阅读【剧情原文】后，将其拆分为 {{beatCount}} 个递进的剧情节点（StoryBeat），每个节点代表一个适合生成图片的视觉瞬间。',
+    '',
+    '输出格式必须是紧凑 JSON（不要代码块标记），结构如下：',
+    '{"beats":[',
+    '  {"title":"节点1标题","visualMoment":"这一瞬间的视觉画面描述","characters":["角色A","角色B"],"scene":"地点环境","actions":["动作1","动作2"],"anchors":["视觉锚点1","视觉锚点2"]},',
+    '  {"title":"节点2标题","visualMoment":"...","characters":[...],"scene":"...","actions":[...],"anchors":[...]},',
+    '  ...',
+    ']}',
+    '',
+    '拆分要求：',
+    '1. 每个 beat 的 title 简短（5-10字）、visualMoment 具体（完整句子描述该瞬间画面）。',
+    '2. characters 数组包含该节点出现的具名角色（名字，不是泛称）。',
+    '3. scene 描述该节点发生的地点、环境、时间、氛围（一句话）。',
+    '4. actions 数组列出该节点人物的关键可视化动作。',
+    '5. anchors 数组列出该节点的关键视觉锚点（道具、背景标志、光影特征等）。',
+    '6. 节点按剧情时间递进排序，覆盖【剧情原文】的完整流程。',
+    '7. 若原文不足 {{beatCount}} 个明显节点，优先保留关键转折和高潮，可适当合并次要情节；若原文远超 {{beatCount}} 个场景，只取最重要的 {{beatCount}} 个节点。',
+    '',
+    '【剧情原文】：',
+    '{{prompt}}',
+].join('\n');
+
+const DEFAULT_COMIC_ANALYSIS_TEMPLATE = [
+    '你是漫画分镜师。阅读【剧情原文】后，将其拆分为 {{panelCount}} 格漫画分镜（ComicPanel），每格代表一个可以独立生成图片的画面。',
+    '',
+    '输出格式必须是紧凑 JSON（不要代码块标记），结构如下：',
+    '{"panels":[',
+    '  {"index":1,"shotType":"远景/中景/近景/特写","imageDescription":"这一格的完整画面描述","characters":["角色A"],"actions":["动作1"],"dialogue":["角色A：台词内容"],"caption":"旁白文字（无则空字符串）","anchors":["视觉锚点1"]},',
+    '  ...',
+    ']}',
+    '',
+    '拆分要求：',
+    '1. index 为格号，从 1 开始按阅读顺序递增。',
+    '2. shotType 写镜头类型（远景/中景/近景/特写等），相邻格尽量变化镜头制造节奏。',
+    '3. imageDescription 用完整中文句子描述该格画面（构图、人物姿态、表情、环境），不包含对白文字本身。',
+    '4. characters 数组列出该格出场的具名角色；actions 列出关键可视化动作。',
+    '5. dialogue 数组按「角色名：台词」格式记录该格对白；没有对白就用空数组。',
+    '6. caption 为该格旁白/场景说明文字，没有就空字符串。',
+    '7. anchors 列出该格关键视觉锚点（道具、标志物、光影特征等）。',
+    '8. 分镜按剧情时间顺序覆盖【剧情原文】的主线；若原文场景超过 {{panelCount}} 格，只取最重要的 {{panelCount}} 格。',
+    '',
+    '【剧情原文】：',
+    '{{prompt}}',
 ].join('\n');
 
 const defaultSettings = {
@@ -161,18 +391,24 @@ const defaultSettings = {
     responseImageRegex: "/!\\[[^\\]]*\\]\\(([^)\\s]+)\\)/g",
 
     // ─── 优化 ──────────────────────────────────────────────
+    promptCompilerEnabled: true,                   // 本地提示词编译器：将计划转换成图像后端友好的 prompt
     optimizeEnabled: false,
     optimizeAuto: false,
     optimizeTemplate: DEFAULT_OPTIMIZE_TEMPLATE,
-    optimizeUseCustom: false,                      // 是否使用自定义优化LLM后端
+    singleImageStrategy: DEFAULT_SINGLE_IMAGE_STRATEGY, // 单图取景策略：climax | poster | final
+    visualSanitizationLevel: "standard",          // 固定设定清洗强度：strict | standard | loose
+    optimizeUseCustom: false,                      // 是否使用自定义精修 LLM 后端
     optimizeApiUrl: "",
     optimizeModel: "",
     optimizeApiKey: "",
     textMaxTokens: 8192,                           // 优化/审查/总结等文本调用的回复上限(max_tokens)；推理模型需较大值，太小会截断思考导致质量低，太大可能被后端拒绝/挂起
-    characterAppearance: "",                       // 人物库：每行「名字：外貌」，出场角色的外貌逐字注入优化模板（世界书作补充来源）
+    characterAppearance: "",                       // 人物库：每行「名字：外貌」，出场角色的外貌逐字注入编译/精修链路（世界书作补充来源）
 
     // ─── 世界书注入 ──────────────────────────────────────────
-    // 从当前激活世界书按关键词命中注入人物外貌/固定场景设定（characterAppearance 作兜底）
+    // worldBookMode: "off" | "inject" | "extract"；legacy worldBookEnabled 继续兼容旧设置。
+    worldBookMode: "off",
+    characterWorldBookMode: "off",                  // 人物世界书来源：off | inject | extract
+    sceneWorldBookMode: "off",                      // 场景世界书来源：off | inject | extract
     worldBookEnabled: false,
     worldBookSectionHeadings: "外貌,长相,外观,appearance,场景,环境,setting,scene",
     worldBookMaxChars: 800,
@@ -182,15 +418,52 @@ const defaultSettings = {
     styleActive: "",                               // 当前激活（默认固定）的风格名
     styleAutoSelect: false,                        // LLM 按场景自动选风格（覆盖 styleActive）
     characterLlmExtract: false,                    // LLM 智能识别出场人物（默认子串匹配）
+    autoExtractCharactersEnabled: false,            // 自动从新 AI 消息提取人物库，只写当前角色卡
+    autoExtractScenesEnabled: false,                // 自动从新 AI 消息提取场景库，只写当前角色卡
+    sceneLibrary: "",                              // 场景库：每行「场景名：环境/地点描述」
+    sceneActive: "",                               // 当前固定场景名
+    sceneAutoSelect: false,                        // LLM 按原文自动选场景（覆盖 sceneActive）
     analysisTemplate: DEFAULT_ANALYSIS_TEMPLATE,   // 场景分析调用模板（出人物 + 选风格）
 
-    // ─── NSFW 规避 ──────────────────────────────────────────
+    // ─── 安全重写 ──────────────────────────────────────────
     nsfwAvoidance: false,
+    promptSafetyLevel: "standard",                 // strict | standard | loose
     nsfwAvoidanceTemplate: DEFAULT_NSFW_TEMPLATE,
 
     // ─── 消息生图 ──────────────────────────────────────────
     messageGenEnabled: true,
     summarizeTemplate: DEFAULT_SUMMARIZE_TEMPLATE,
+    multiAnalysisTemplate: DEFAULT_MULTI_ANALYSIS_TEMPLATE,
+
+    // ─── 自动整条 AI 消息生图 ───────────────────────────────
+    automaticFlowEnabled: false,                 // 自动流程默认关闭，开启后每条新 AI 消息按整条正文生图
+    automaticFlowFollowWorkbench: true,          // 本阶段 single 模式沿用当前单图/优化/设定配置
+    automaticFlowMinChars: 80,                   // 清洗后正文少于该字数则跳过，避免短回复刷图
+    automaticFlowFailurePolicy: "stop",          // single 自动任务默认 fail-fast，保留旧错误提示语义
+    automaticFlowShowQueue: true,
+    automaticFlowCancelEnabled: true,
+
+    // ─── 多图模式 ──────────────────────────────────────────
+    multiImageEnabled: false,                    // 多图模式默认关闭
+    defaultBeatCount: 3,                         // 默认生成 3 张多图
+    splitStrategy: "auto",                       // auto 或 fixed（本阶段只实现 auto LLM 拆分）
+    multiImageFailurePolicy: "continue",         // 多图默认 continue，聚合成功图片
+
+    // ─── 生成模式与漫画模式 ─────────────────────────────────
+    generationMode: "single",                    // 手动工作台生成模式：single | multi | comic
+    comicPanelCount: 4,                          // 漫画默认分格数（2-8）
+    comicDialogueEnabled: true,                  // 是否要求漫画 planner 生成对白/旁白元数据
+    comicDialogueMode: "bubble",                 // 对白模式：bubble（插件气泡，默认）| modelText（模型画字）
+    comicFailurePolicy: "continue",              // 漫画分格失败策略，默认聚合成功格
+    comicAnalysisTemplate: DEFAULT_COMIC_ANALYSIS_TEMPLATE,
+    cleanupTemplate: "",                         // 预留：清洗模板集中到提示词模板页
+
+    // ─── 图生图连续性（预留）────────────────────────────────
+    // 本阶段仅把参考图记录进 ImageJob.referenceImages 元数据，不改变文生图请求；
+    // 编辑接口（如 chatgpt2api 图片编辑端点）接入后才真正按参考图生成。
+    continuityMode: "off",                       // off | previous | firstAndPrevious | characterAndPrevious
+    imageEditEnabled: false,                     // 预留：图片编辑/图生图能力开关（调研接入后启用）
+    imageEditEndpoint: "",                       // 预留：编辑接口地址；为空或不可用时回退文生图
 
     // ─── UI 控制 ──────────────────────────────────────────
     fabEnabled: false,
@@ -204,8 +477,7 @@ const defaultSettings = {
 
 const SETTINGS_PANEL_HTML = "<!-- \u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550 -->\n<!-- \u9762\u677f\u7cbe\u7b80\u7248 \u2014 \u53ea\u4fdd\u7559\u57fa\u7840\u5f00\u5173\u548c\u72b6\u6001 -->\n<!-- \u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550 -->\n<div class=\"oair-panel-ui\">\n    <!-- \u72b6\u6001\u680f -->\n    <div style=\"display:flex; justify-content:space-between; align-items:center; margin-bottom:8px; border-bottom:1px solid rgba(255,255,255,0.1); padding-bottom:5px; gap:8px;\">\n        <div id=\"oair_status\" style=\"font-size:0.8em; color:cyan;\">\u5c31\u7eea</div>\n        <label style=\"display:flex; align-items:center; gap:6px; font-size:0.8em; white-space:nowrap;\">\n            <input id=\"oair_enabled\" type=\"checkbox\">\n            \u542f\u7528\n        </label>\n    </div>\n\n    <!-- \u60ac\u6d6e\u5feb\u6377\u6309\u94ae\u5f00\u5173 -->\n    <div class=\"oair-section\">\n        <label class=\"oair-toggle-label\">\n            <input id=\"oair_fab_enabled\" type=\"checkbox\">\n            \u663e\u793a\u60ac\u6d6e\u5feb\u6377\u6309\u94ae\n        </label>\n        <div class=\"oair-hint\">\n            \u52fe\u9009\u540e\u5c4f\u5e55\u53f3\u4e0b\u89d2\u51fa\u73b0\u53ef\u62d6\u62fd\u7684\u5feb\u6377\u6309\u94ae\uff0c\u70b9\u51fb\u6253\u5f00\u8be6\u7ec6\u914d\u7f6e\u7a97\u53e3\u3002<br>\n            \u9002\u5408\u9700\u8981\u9891\u7e41\u4f7f\u7528\u624b\u52a8\u751f\u56fe\u6216\u8c03\u6574\u914d\u7f6e\u7684\u573a\u666f\u3002\n        </div>\n    </div>\n\n    <!-- \u5feb\u6377\u5165\u53e3 -->\n    <div class=\"oair-section\" style=\"margin-top:4px;\">\n        <button id=\"oair_btn_open_floating\" class=\"menu_button\" style=\"width:100%; justify-content:center;\">\n            \ud83d\uddbc\ufe0f \u6253\u5f00\u8be6\u7ec6\u914d\u7f6e\u7a97\u53e3\n        </button>\n        <div class=\"oair-hint\" style=\"margin-top:4px; text-align:center;\">\n            \u6216\u4f7f\u7528\u60ac\u6d6e\u5feb\u6377\u6309\u94ae\u5feb\u901f\u8bbf\u95ee\n        </div>\n    </div>\n</div>\n";
 
-const SETTINGS_FULL_HTML = "<!-- \u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550 -->\n<!-- \u5b8c\u6574\u914d\u7f6e\u7248 \u2014 \u7528\u4e8e\u60ac\u6d6e\u7a97\uff085\u6807\u7b7e\u9875\u5b8c\u6574\u914d\u7f6e\uff09 -->\n<!-- \u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550 -->\n<style>\n    /* \u2500\u2500\u2500 \u6807\u7b7e\u9875\u5bb9\u5668 \u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500 */\n    .oair-tabs-container {\n        display: flex;\n        flex-direction: column;\n        gap: 0;\n    }\n    .oair-tab-bar {\n        display: flex;\n        gap: 2px;\n        border-bottom: 1px solid rgba(255,255,255,0.15);\n        margin-bottom: 8px;\n        flex-wrap: nowrap;\n        overflow-x: auto;\n        scrollbar-width: thin;\n    }\n    .oair-tab-label {\n        padding: 5px 10px;\n        font-size: 0.78em;\n        cursor: pointer;\n        border-radius: 4px 4px 0 0;\n        opacity: 0.55;\n        transition: all 0.15s;\n        user-select: none;\n        white-space: nowrap;\n        flex: 0 0 auto;\n    }\n    .oair-tab-label:hover {\n        opacity: 0.85;\n        background: rgba(255,255,255,0.05);\n    }\n    .oair-tab-panel {\n        display: none;\n    }\n\n    /* \u6fc0\u6d3b\u6807\u7b7e\u6837\u5f0f */\n    #oair_tab_basic:checked ~ .oair-tab-bar label[for=\"oair_tab_basic\"],\n    #oair_tab_backend:checked ~ .oair-tab-bar label[for=\"oair_tab_backend\"],\n    #oair_tab_extract:checked ~ .oair-tab-bar label[for=\"oair_tab_extract\"],\n    #oair_tab_optimize:checked ~ .oair-tab-bar label[for=\"oair_tab_optimize\"],\n    #oair_tab_worldbook:checked ~ .oair-tab-bar label[for=\"oair_tab_worldbook\"],\n    #oair_tab_manual:checked ~ .oair-tab-bar label[for=\"oair_tab_manual\"],\n    #oair_tab_gallery:checked ~ .oair-tab-bar label[for=\"oair_tab_gallery\"] {\n        opacity: 1;\n        background: rgba(255,255,255,0.1);\n        border-bottom: 2px solid var(--SmartThemeQuoteColor, #68a0ff);\n    }\n\n    /* \u663e\u793a\u5bf9\u5e94\u9762\u677f */\n    #oair_tab_basic:checked ~ #oair_panel_basic,\n    #oair_tab_backend:checked ~ #oair_panel_backend,\n    #oair_tab_extract:checked ~ #oair_panel_extract,\n    #oair_tab_optimize:checked ~ #oair_panel_optimize,\n    #oair_tab_worldbook:checked ~ #oair_panel_worldbook,\n    #oair_tab_manual:checked ~ #oair_panel_manual,\n    #oair_tab_gallery:checked ~ #oair_panel_gallery {\n        display: block;\n    }\n\n    /* \u2500\u2500\u2500 \u901a\u7528\u7ec4\u4ef6\u6837\u5f0f \u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500 */\n    .oair-section {\n        background: rgba(0,0,0,0.15);\n        padding: 10px;\n        border-radius: 6px;\n        margin-bottom: 8px;\n    }\n    .oair-section-title {\n        font-weight: bold;\n        font-size: 0.88em;\n        margin-bottom: 8px;\n        display: flex;\n        align-items: center;\n        gap: 6px;\n    }\n    .oair-field-label {\n        display: block;\n        font-size: 0.75em;\n        opacity: 0.8;\n        margin-top: 6px;\n        margin-bottom: 2px;\n    }\n    .oair-hint {\n        margin-top: 4px;\n        font-size: 0.72em;\n        opacity: 0.6;\n        line-height: 1.4;\n    }\n    .oair-row {\n        display: grid;\n        grid-template-columns: 1fr 1fr;\n        gap: 6px;\n        margin-top: 6px;\n    }\n    .oair-btn-row {\n        display: flex;\n        gap: 6px;\n        margin-top: 6px;\n    }\n    .oair-optimized-box {\n        background: rgba(0,200,100,0.08);\n        border: 1px solid rgba(0,200,100,0.25);\n        border-radius: 6px;\n        padding: 8px;\n        margin-top: 6px;\n        font-size: 0.85em;\n        line-height: 1.5;\n        white-space: pre-wrap;\n        word-break: break-all;\n    }\n    .oair-toggle-row {\n        display: flex;\n        justify-content: space-between;\n        align-items: center;\n        gap: 8px;\n    }\n    .oair-toggle-label {\n        display: flex;\n        align-items: center;\n        gap: 6px;\n        font-size: 0.8em;\n    }\n    .oair-badge {\n        display: inline-block;\n        padding: 1px 6px;\n        border-radius: 3px;\n        font-size: 0.7em;\n        font-weight: bold;\n        vertical-align: middle;\n    }\n    .oair-badge-green {\n        background: rgba(0,200,100,0.2);\n        color: #60ff90;\n    }\n    .oair-badge-orange {\n        background: rgba(255,180,60,0.2);\n        color: #ffd280;\n    }\n    .oair-badge-red {\n        background: rgba(255,80,80,0.2);\n        color: #ff9090;\n    }\n\n    /* \u2500\u2500\u2500 \u65b0\u589e\uff1a\u8f93\u5165+\u6309\u94ae\u7ec4\u5408\u884c \u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500 */\n    .oair-input-with-btn {\n        display: flex;\n        gap: 6px;\n        align-items: center;\n    }\n    .oair-input-with-btn .text_pole {\n        flex: 1;\n        min-width: 0;\n    }\n    .oair-input-with-btn .menu_button {\n        flex-shrink: 0;\n        white-space: nowrap;\n    }\n\n    /* \u2500\u2500\u2500 \u65b0\u589e\uff1a\u5bc6\u7801\u884c\uff08\u8f93\u5165+\u773c\u775b\u6309\u94ae\uff09 \u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500 */\n    .oair-password-row {\n        display: flex;\n        gap: 6px;\n        align-items: center;\n    }\n    .oair-password-row .text_pole {\n        flex: 1;\n        min-width: 0;\n    }\n    .oair-password-row .oair-eye-btn {\n        flex-shrink: 0;\n        width: 32px;\n        height: 32px;\n        display: flex;\n        align-items: center;\n        justify-content: center;\n        background: rgba(255,255,255,0.08);\n        border: 1px solid rgba(255,255,255,0.15);\n        border-radius: 4px;\n        color: var(--SmartThemeBodyColor, #ccc);\n        cursor: pointer;\n        font-size: 13px;\n        transition: background 0.15s;\n    }\n    .oair-password-row .oair-eye-btn:hover {\n        background: rgba(255,255,255,0.15);\n    }\n\n    /* \u2500\u2500\u2500 \u65b0\u589e\uff1a\u6a21\u578b\u884c\uff08\u8f93\u5165+\u83b7\u53d6\u6309\u94ae\uff09 \u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500 */\n    .oair-model-row {\n        display: flex;\n        gap: 6px;\n        align-items: center;\n    }\n    .oair-model-row .text_pole {\n        flex: 1;\n        min-width: 0;\n    }\n    .oair-model-row .menu_button {\n        flex-shrink: 0;\n        white-space: nowrap;\n    }\n\n    /* \u2500\u2500\u2500 \u65b0\u589e\uff1a\u6a21\u578b\u9009\u62e9\u4e0b\u62c9 \u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500 */\n    #oair_model_select,\n    #oair_optimize_model_select {\n        width: 100%;\n        margin-top: 4px;\n        display: none;\n    }\n    #oair_model_select.oair-visible,\n    #oair_optimize_model_select.oair-visible {\n        display: block;\n    }\n\n    /* \u2500\u2500\u2500 \u65b0\u589e\uff1a\u4fdd\u5b58\u884c\uff08\u8d85\u65f6+\u4fdd\u5b58\u6309\u94ae\uff09 \u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500 */\n    .oair-save-row {\n        display: flex;\n        gap: 6px;\n        align-items: center;\n    }\n    .oair-save-row .text_pole {\n        flex: 1;\n        min-width: 0;\n    }\n    .oair-save-row .menu_button {\n        flex-shrink: 0;\n        white-space: nowrap;\n    }\n\n    /* \u2500\u2500\u2500 \u65b0\u589e\uff1aDetails/Summary \u6298\u53e0\u6837\u5f0f \u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500 */\n    .oair-details {\n        margin-top: 8px;\n    }\n    .oair-details summary {\n        font-size: 0.78em;\n        cursor: pointer;\n        opacity: 0.7;\n        padding: 4px 0;\n        user-select: none;\n        list-style: none;\n        display: flex;\n        align-items: center;\n        gap: 4px;\n    }\n    .oair-details summary::-webkit-details-marker {\n        display: none;\n    }\n    .oair-details summary::before {\n        content: \"\u25b8\";\n        display: inline-block;\n        width: 12px;\n        text-align: center;\n        transition: transform 0.15s;\n    }\n    .oair-details[open] summary::before {\n        transform: rotate(90deg);\n    }\n    .oair-details summary:hover {\n        opacity: 1;\n    }\n    .oair-details .oair-details-content {\n        margin-top: 6px;\n    }\n\n    /* \u2500\u2500\u2500 \u65b0\u589e\uff1a\u81ea\u5b9a\u4e49\u4f18\u5316LLM\u540e\u7aef\u590d\u9009\u6846\u5c55\u5f00 \u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500 */\n    .oair-custom-backend-content {\n        display: none;\n    }\n    .oair-custom-backend-content.oair-visible {\n        display: block;\n    }\n\n    /* \u2500\u2500\u2500 \u533a\u5757\u5de6\u5f3a\u8c03\u8fb9\uff08\u4e3b\u9898\u8272\uff09 \u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500 */\n    .oair-settings-ui .oair-section {\n        border-left: 2px solid var(--SmartThemeQuoteColor, #68a0ff);\n    }\n\n    /* \u2500\u2500\u2500 \u56fe\u5e93 \u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500 */\n    .oair-gallery-toolbar {\n        display: flex;\n        align-items: center;\n        justify-content: space-between;\n        gap: 8px;\n    }\n    .oair-gallery-grid {\n        display: grid;\n        grid-template-columns: repeat(auto-fill, minmax(90px, 1fr));\n        gap: 8px;\n    }\n    .oair-gallery-cell {\n        position: relative;\n        border-radius: 6px;\n        overflow: hidden;\n        background: rgba(0,0,0,0.2);\n        aspect-ratio: 1 / 1;\n    }\n    .oair-gallery-cell img {\n        width: 100%;\n        height: 100%;\n        object-fit: cover;\n        cursor: pointer;\n        display: block;\n    }\n    .oair-gallery-cell-bar {\n        position: absolute;\n        bottom: 0;\n        left: 0;\n        right: 0;\n        display: flex;\n        justify-content: center;\n        gap: 2px;\n        padding: 2px;\n        background: rgba(0,0,0,0.55);\n        opacity: 0;\n        transition: opacity 0.15s;\n    }\n    .oair-gallery-cell:hover .oair-gallery-cell-bar {\n        opacity: 1;\n    }\n    .oair-gallery-mini {\n        border: none;\n        background: transparent;\n        cursor: pointer;\n        font-size: 13px;\n        padding: 2px 4px;\n        line-height: 1;\n    }\n    /* \u79fb\u52a8\u7aef\u65e0 hover\uff1a\u64cd\u4f5c\u6761\u5e38\u663e */\n    @media (max-width: 1000px) {\n        .oair-gallery-cell-bar { opacity: 0.9; }\n    }\n</style>\n\n<div class=\"oair-settings-ui\">\n    <!-- \u72b6\u6001\u680f\uff08\u60ac\u6d6e\u7a97\u5185\u4e5f\u6709\uff09 -->\n    <div style=\"display:flex; justify-content:space-between; align-items:center; margin-bottom:10px; border-bottom:1px solid rgba(255,255,255,0.1); padding-bottom:5px; gap:8px;\">\n        <div id=\"oair_floating_status\" style=\"font-size:0.8em; color:var(--SmartThemeQuoteColor, #68a0ff);\">\u5c31\u7eea</div>\n        <label style=\"display:flex; align-items:center; gap:6px; font-size:0.8em; white-space:nowrap;\">\n            <input id=\"oair_floating_enabled\" type=\"checkbox\">\n            \u542f\u7528\n        </label>\n    </div>\n\n    <!-- \u9690\u85cf\u7684 radio \u8f93\u5165 -->\n    <input type=\"radio\" name=\"oair_tab\" id=\"oair_tab_basic\" checked style=\"display:none\">\n    <input type=\"radio\" name=\"oair_tab\" id=\"oair_tab_backend\" style=\"display:none\">\n    <input type=\"radio\" name=\"oair_tab\" id=\"oair_tab_extract\" style=\"display:none\">\n    <input type=\"radio\" name=\"oair_tab\" id=\"oair_tab_optimize\" style=\"display:none\">\n    <input type=\"radio\" name=\"oair_tab\" id=\"oair_tab_worldbook\" style=\"display:none\">\n    <input type=\"radio\" name=\"oair_tab\" id=\"oair_tab_manual\" style=\"display:none\">\n    <input type=\"radio\" name=\"oair_tab\" id=\"oair_tab_gallery\" style=\"display:none\">\n\n    <!-- \u6807\u7b7e\u680f -->\n    <div class=\"oair-tab-bar\">\n        <label for=\"oair_tab_basic\" class=\"oair-tab-label\">\ud83d\udccb \u57fa\u7840</label>\n        <label for=\"oair_tab_backend\" class=\"oair-tab-label\">\u2699\ufe0f \u540e\u7aef</label>\n        <label for=\"oair_tab_extract\" class=\"oair-tab-label\">\ud83d\udd0d \u63d0\u53d6</label>\n        <label for=\"oair_tab_optimize\" class=\"oair-tab-label\">\u2728 \u4f18\u5316</label>\n        <label for=\"oair_tab_worldbook\" class=\"oair-tab-label\">\ud83c\udfad \u8bbe\u5b9a</label>\n        <label for=\"oair_tab_manual\" class=\"oair-tab-label\">\ud83c\udfa8 \u624b\u52a8</label>\n        <label for=\"oair_tab_gallery\" class=\"oair-tab-label\">\ud83d\uddbc\ufe0f \u56fe\u5e93</label>\n    </div>\n\n    <!-- \u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550 -->\n    <!-- TAB 1: \u57fa\u7840                                           -->\n    <!-- \u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550 -->\n    <div class=\"oair-tab-panel\" id=\"oair_panel_basic\">\n        <div class=\"oair-section\">\n            <div class=\"oair-section-title\">\u4e3b\u6a21\u578b\u63d0\u793a\u6ce8\u5165</div>\n            <details class=\"oair-details\">\n                <summary>\u4e16\u754c\u4e66\u5f0f\u9ed8\u8ba4\u63d0\u793a\u8bcd</summary>\n                <div class=\"oair-details-content\">\n                    <textarea id=\"oair_main_prompt\" class=\"text_pole\" rows=\"12\" style=\"width:100%; box-sizing:border-box;\" placeholder=\"\u8fd9\u91cc\u7684\u5185\u5bb9\u4f1a\u50cf\u5e38\u9a7b\u4e16\u754c\u4e66\u4e00\u6837\u6ce8\u5165\u5230\u4e3b\u6a21\u578b\u63d0\u793a\u94fe\u91cc\u3002\"></textarea>\n                    <div class=\"oair-hint\">\u8fd9\u6bb5\u6587\u5b57\u4f1a\u4ee5\u7cfb\u7edf\u89c4\u5219\u7684\u65b9\u5f0f\u81ea\u52a8\u6ce8\u5165\u5230\u4e3b\u6a21\u578b\u63d0\u793a\u94fe\u5f00\u5934\uff0c\u4e0d\u4f1a\u53d1\u9001\u7ed9\u56fe\u7247\u540e\u7aef\u3002</div>\n                </div>\n            </details>\n        </div>\n\n        <div class=\"oair-section\">\n            <div class=\"oair-section-title\">\u6d88\u606f\u751f\u56fe\u6309\u94ae</div>\n            <label class=\"oair-toggle-label\">\n                <input id=\"oair_message_gen_enabled\" type=\"checkbox\">\n                \u5728\u804a\u5929\u6d88\u606f\u4e0a\u663e\u793a\u751f\u56fe\u6309\u94ae\n            </label>\n            <div class=\"oair-hint\">\u542f\u7528\u540e\uff0c\u6bcf\u6761\u6d88\u606f\u7684\u64cd\u4f5c\u680f\u4f1a\u51fa\u73b0\u4e24\u4e2a\u6309\u94ae\uff1a<br>\n                \ud83d\uddbc\ufe0f \u76f4\u63a5\u751f\u56fe \u2014 \u4f7f\u7528\u6d88\u606f\u539f\u6587\u4f5c\u4e3a\u63d0\u793a\u8bcd<br>\n                \u2728 \u603b\u7ed3\u751f\u56fe \u2014 \u5148\u5c06\u6d88\u606f\u603b\u7ed3\u4e3a\u63d0\u793a\u8bcd\u518d\u751f\u56fe\n            </div>\n        </div>\n    </div>\n\n    <!-- \u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550 -->\n    <!-- TAB 2: \u540e\u7aef                                           -->\n    <!-- \u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550 -->\n    <div class=\"oair-tab-panel\" id=\"oair_panel_backend\">\n        <div class=\"oair-section\">\n            <div class=\"oair-section-title\">\u5feb\u6377\u9884\u8bbe</div>\n            <button id=\"oair_btn_chatgpt2api_preset\" class=\"menu_button\" style=\"width:100%; justify-content:center;\">\u26a1 \u4e00\u952e chatgpt2api \u9884\u8bbe</button>\n            <div class=\"oair-hint\">\u4e00\u952e\u5207\u6362\u4e3a chatgpt2api \u63a8\u8350\u914d\u7f6e\uff1aImages \u6a21\u5f0f\u3001\u6a21\u578b gpt-image-2\u3001\u54cd\u5e94 b64_json\u3001\u63d0\u793a\u8bcd\u76f4\u901a\u3001\u6587\u672c\u6b65\u9aa4\u8d70\u9152\u9986\u4e3b\u6a21\u578b\u3002\u5e94\u7528\u540e\u8bf7\u786e\u8ba4\u670d\u52a1\u5730\u5740\u4e0e API \u5bc6\u94a5\u662f\u5426\u6b63\u786e\u3002</div>\n        </div>\n\n        <div class=\"oair-section\">\n            <div class=\"oair-section-title\">API \u6a21\u5f0f</div>\n            <label class=\"oair-field-label\">\u9009\u62e9\u63a5\u53e3\u7c7b\u578b</label>\n            <select id=\"oair_api_mode\" class=\"text_pole\" style=\"width:100%; box-sizing:border-box;\">\n                <option value=\"chat\">Chat Completions (/v1/chat/completions)</option>\n                <option value=\"images\">Images API (/v1/images/generations)</option>\n            </select>\n            <div class=\"oair-hint\">\n                <b>Chat Completions</b>\uff1a\u901a\u8fc7\u804a\u5929\u63a5\u53e3\u751f\u56fe\uff0c\u540e\u7aef\u5728\u6587\u672c\u56de\u590d\u4e2d\u8fd4\u56de\u56fe\u7247\u94fe\u63a5<br>\n                <b>Images API</b>\uff1a\u4f7f\u7528 OpenAI \u6807\u51c6\u56fe\u7247\u751f\u6210\u63a5\u53e3\uff0c\u76f4\u63a5\u8fd4\u56de\u56fe\u7247\u6570\u636e\n            </div>\n        </div>\n\n        <div class=\"oair-section\">\n            <div class=\"oair-section-title\">\u8fde\u63a5\u914d\u7f6e</div>\n\n            <!-- \u670d\u52a1\u5730\u5740 -->\n            <label class=\"oair-field-label\">\u670d\u52a1\u5730\u5740</label>\n            <input id=\"oair_service_url\" class=\"text_pole\" style=\"width:100%; box-sizing:border-box;\" placeholder=\"http://127.0.0.1:8199/v1\">\n            <div class=\"oair-hint\">\u53ea\u586b\u5230 /v1\uff0c\u8def\u5f84\u540e\u7f00\u6839\u636eAPI\u6a21\u5f0f\u81ea\u52a8\u8865\u5168</div>\n\n            <!-- API \u5bc6\u94a5\uff08\u5e26\u773c\u775b\u6309\u94ae\uff09 -->\n            <label class=\"oair-field-label\">API \u5bc6\u94a5</label>\n            <div class=\"oair-password-row\">\n                <input id=\"oair_api_key\" type=\"password\" class=\"text_pole\" placeholder=\"sk-any\">\n                <button type=\"button\" class=\"oair-eye-btn\" title=\"\u663e\u793a/\u9690\u85cf\u5bc6\u94a5\"><i class=\"fa-solid fa-eye\"></i></button>\n            </div>\n\n            <!-- \u6a21\u578b\uff08\u8f93\u5165+\u83b7\u53d6\u6309\u94ae+\u9690\u85cf\u4e0b\u62c9\uff09 -->\n            <label class=\"oair-field-label\">\u6a21\u578b</label>\n            <div class=\"oair-model-row\">\n                <input id=\"oair_model\" class=\"text_pole\" placeholder=\"any\">\n                <button id=\"oair_btn_fetch_model\" class=\"menu_button\">\u83b7\u53d6\u6a21\u578b</button>\n            </div>\n            <select id=\"oair_model_select\" class=\"text_pole\"></select>\n\n            <!-- \u8d85\u65f6+\u4fdd\u5b58\u6309\u94ae -->\n            <label class=\"oair-field-label\">\u8d85\u65f6\uff08\u6beb\u79d2\uff09</label>\n            <div class=\"oair-save-row\">\n                <input id=\"oair_timeout_ms\" type=\"number\" min=\"1000\" step=\"1000\" class=\"text_pole\" placeholder=\"120000\">\n                <button id=\"oair_btn_save_api\" class=\"menu_button\">\ud83d\udcbe \u4fdd\u5b58\u8bbe\u7f6e</button>\n            </div>\n        </div>\n\n        <!-- Chat Completions \u4e13\u5c5e\u5b57\u6bb5 -->\n        <div class=\"oair-section oair-chat-api-fields\">\n            <details class=\"oair-details\">\n                <summary>Chat Completions \u6a21\u677f</summary>\n                <div class=\"oair-details-content\">\n                    <label class=\"oair-field-label\">\u53d1\u9001\u7ed9\u56fe\u7247\u540e\u7aef\u7684\u6a21\u677f</label>\n                    <textarea id=\"oair_prompt_template\" class=\"text_pole\" rows=\"3\" style=\"width:100%; box-sizing:border-box;\" placeholder=\"\u5728\u9700\u8981\u63d2\u5165\u63d0\u53d6\u5185\u5bb9\u7684\u4f4d\u7f6e\u4f7f\u7528 {{prompt}}\u3002\"></textarea>\n                    <div class=\"oair-hint\">\u5c06\u63d0\u53d6\u51fa\u7684\u63d0\u793a\u8bcd\u5305\u88c5\u540e\u53d1\u7ed9 chat completions \u540e\u7aef\u3002</div>\n                </div>\n            </details>\n        </div>\n\n        <!-- Images API \u4e13\u5c5e\u5b57\u6bb5 -->\n        <div class=\"oair-section oair-images-api-fields\" style=\"display:none;\">\n            <details class=\"oair-details\">\n                <summary>Images API \u53c2\u6570</summary>\n                <div class=\"oair-details-content\">\n                    <label class=\"oair-field-label\">\u53d1\u9001\u7ed9\u56fe\u7247\u540e\u7aef\u7684\u6a21\u677f</label>\n                    <textarea id=\"oair_images_prompt_template\" class=\"text_pole\" rows=\"2\" style=\"width:100%; box-sizing:border-box;\" placeholder=\"{{prompt}}\uff08\u9ed8\u8ba4\u76f4\u901a\uff0c\u4e0d\u5305\u88c5\uff09\"></textarea>\n\n                    <div class=\"oair-row\">\n                        <div>\n                            <label class=\"oair-field-label\">\u56fe\u7247\u5c3a\u5bf8</label>\n                            <select id=\"oair_image_size\" class=\"text_pole\" style=\"width:100%; box-sizing:border-box;\">\n                                <option value=\"256x256\">256x256</option>\n                                <option value=\"512x512\">512x512</option>\n                                <option value=\"1024x1024\">1024x1024</option>\n                                <option value=\"1024x1792\">1024x1792</option>\n                                <option value=\"1792x1024\">1792x1024</option>\n                            </select>\n                        </div>\n                        <div>\n                            <label class=\"oair-field-label\">\u751f\u6210\u6570\u91cf</label>\n                            <input id=\"oair_image_count\" type=\"number\" min=\"1\" max=\"10\" class=\"text_pole\" style=\"width:100%; box-sizing:border-box;\">\n                        </div>\n                    </div>\n\n                    <label class=\"oair-field-label\">\u54cd\u5e94\u683c\u5f0f</label>\n                    <select id=\"oair_image_response_format\" class=\"text_pole\" style=\"width:100%; box-sizing:border-box;\">\n                        <option value=\"url\">URL\uff08\u8fd4\u56de\u56fe\u7247\u94fe\u63a5\uff09</option>\n                        <option value=\"b64_json\">Base64\uff08\u8fd4\u56de\u56fe\u7247\u6570\u636e\uff09</option>\n                    </select>\n                </div>\n            </details>\n        </div>\n\n        <div class=\"oair-section\">\n            <div class=\"oair-section-title\">\u989d\u5916\u8bf7\u6c42\u4f53</div>\n            <label class=\"oair-field-label\">\u989d\u5916\u8bf7\u6c42\u4f53 JSON\uff08\u53ef\u9009\uff09</label>\n            <textarea id=\"oair_extra_body\" class=\"text_pole\" rows=\"3\" style=\"width:100%; box-sizing:border-box;\" placeholder='{\"preset_name\":\"image\"}'></textarea>\n        </div>\n    </div>\n\n    <!-- \u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550 -->\n    <!-- TAB 3: \u63d0\u53d6                                           -->\n    <!-- \u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550 -->\n    <div class=\"oair-tab-panel\" id=\"oair_panel_extract\">\n        <div class=\"oair-section\">\n            <div class=\"oair-section-title\">\u63d0\u53d6\u63d0\u793a\u8bcd\u6b63\u5219</div>\n            <details class=\"oair-details\">\n                <summary>\u4ece\u52a9\u624b\u56de\u590d\u4e2d\u63d0\u53d6\u751f\u56fe\u63d0\u793a\u8bcd</summary>\n                <div class=\"oair-details-content\">\n                    <textarea id=\"oair_extraction_regex\" class=\"text_pole\" rows=\"3\" style=\"width:100%; box-sizing:border-box;\" placeholder='/&lt;pic[^&gt;]*prompt=\"([^\"]+)\"[^&gt;]*&gt;/g'></textarea>\n                </div>\n            </details>\n        </div>\n\n        <div class=\"oair-section\">\n            <div class=\"oair-section-title\">\u8fd4\u56de\u56fe\u7247\u6b63\u5219\u56de\u9000</div>\n            <details class=\"oair-details\">\n                <summary>\u5f53\u540e\u7aef\u628a\u56fe\u7247\u94fe\u63a5\u653e\u5728\u6587\u672c\u91cc\u8fd4\u56de\u65f6\u4f7f\u7528</summary>\n                <div class=\"oair-details-content\">\n                    <textarea id=\"oair_response_image_regex\" class=\"text_pole\" rows=\"2\" style=\"width:100%; box-sizing:border-box;\" placeholder='/!\\\\[[^\\\\]]*\\\\]\\\\(([^)\\\\s]+)\\\\)/g'></textarea>\n                    <div class=\"oair-hint\">\u6269\u5c55\u4f1a\u4f18\u5148\u8bfb\u53d6 <code>media</code> \u8fd9\u7c7b\u7ed3\u6784\u5316\u56fe\u7247\u5b57\u6bb5\u3002\u53ea\u6709\u5f53\u540e\u7aef\u628a\u56fe\u7247\u94fe\u63a5\u653e\u5728\u6587\u672c\u91cc\u8fd4\u56de\u65f6\uff0c\u624d\u4f1a\u4f7f\u7528\u8fd9\u91cc\u7684\u56de\u9000\u6b63\u5219\u3002</div>\n                </div>\n            </details>\n        </div>\n    </div>\n\n    <!-- \u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550 -->\n    <!-- TAB 4: \u4f18\u5316                                           -->\n    <!-- \u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550 -->\n    <div class=\"oair-tab-panel\" id=\"oair_panel_optimize\">\n        <!-- \u63d0\u793a\u8bcd\u4f18\u5316 -->\n        <div class=\"oair-section\">\n            <div class=\"oair-section-title\">\u63d0\u793a\u8bcd\u4f18\u5316 <span class=\"oair-badge oair-badge-orange\">\u65b0</span></div>\n            <label class=\"oair-toggle-label\">\n                <input id=\"oair_optimize_enabled\" type=\"checkbox\">\n                \u542f\u7528\u63d0\u793a\u8bcd\u4f18\u5316\n            </label>\n            <div class=\"oair-hint\">\u4f7f\u7528 LLM \u81ea\u52a8\u4f18\u5316\u63d0\u793a\u8bcd\uff0c\u6dfb\u52a0\u753b\u9762\u7ec6\u8282\u3001\u6784\u56fe\u3001\u5149\u7ebf\u7b49\u63cf\u8ff0\u3002</div>\n\n            <div style=\"margin-top:8px;\">\n                <label class=\"oair-toggle-label\">\n                    <input id=\"oair_optimize_auto\" type=\"checkbox\">\n                    \u81ea\u52a8\u4f18\u5316\uff08\u5e94\u7528\u4e8e\u81ea\u52a8\u63d0\u53d6\u7684\u63d0\u793a\u8bcd\uff09\n                </label>\n                <div class=\"oair-hint\">\u5173\u95ed\u65f6\uff0c\u4ec5\u5728\u624b\u52a8\u70b9\u51fb\u300c\u4f18\u5316\u63d0\u793a\u8bcd\u300d\u6309\u94ae\u65f6\u751f\u6548\u3002</div>\n            </div>\n\n            <label class=\"oair-field-label\">\u6587\u672c\u56de\u590d\u957f\u5ea6\u4e0a\u9650 max_tokens\uff08\u4f18\u5316 / \u5ba1\u67e5 / \u603b\u7ed3\u8c03\u7528\uff09</label>\n            <input id=\"oair_text_max_tokens\" class=\"text_pole\" type=\"number\" min=\"256\" step=\"256\" placeholder=\"8192\">\n            <div class=\"oair-hint\"><b>\u63a8\u7406\u6a21\u578b(glm / o1 \u7b49)\u5efa\u8bae 4096~16384</b>\uff1a\u592a\u5c0f\uff08\u5982 1500\uff09\u4f1a\u8ba9\u300c\u601d\u8003\u300d\u5403\u5149\u9884\u7b97\u3001\u6700\u7ec8\u63d0\u793a\u8bcd\u88ab\u622a\u65ad\u5bfc\u81f4\u8d28\u91cf\u5f88\u4f4e\uff1b\u592a\u5927\uff08\u5982 65535\uff09\u90e8\u5206\u540e\u7aef\u4f1a\u6302\u8d77\u6216\u62d2\u7edd\u3002\u4e3b API \u4e0e\u81ea\u5b9a\u4e49\u540e\u7aef\u90fd\u4f1a\u7528\u8fd9\u4e2a\u503c\u3002</div>\n\n            <details class=\"oair-details\">\n                <summary>\u4f18\u5316\u63d0\u793a\u8bcd\u6a21\u677f</summary>\n                <div class=\"oair-details-content\">\n                    <textarea id=\"oair_optimize_template\" class=\"text_pole\" rows=\"10\" style=\"width:100%; box-sizing:border-box;\" placeholder=\"\u4f18\u5316\u63d0\u793a\u8bcd\u7684\u6a21\u677f\uff0c\u4f7f\u7528 {{prompt}} \u63d2\u5165\u539f\u59cb\u63d0\u793a\u8bcd\u3002\"></textarea>\n                    <div class=\"oair-hint\">\u4f7f\u7528 {{prompt}} \u63d2\u5165\u539f\u59cb\u63d0\u793a\u8bcd\u3002\u4f18\u5316\u540e\u7684\u63d0\u793a\u8bcd\u5c06\u66ff\u4ee3\u539f\u59cb\u63d0\u793a\u8bcd\u53d1\u9001\u7ed9\u56fe\u7247\u751f\u6210\u540e\u7aef\u3002</div>\n                </div>\n            </details>\n\n            <div class=\"oair-btn-row\">\n                <button id=\"oair_btn_reset_optimize_template\" class=\"menu_button\" style=\"flex:1; justify-content:center;\">\u21ba \u91cd\u7f6e\u4e3a 5 \u6a21\u5757\u65b0\u6a21\u677f</button>\n            </div>\n            <div class=\"oair-hint\">\u628a\u4f18\u5316\u6a21\u677f\u91cd\u7f6e\u4e3a\u5185\u7f6e 5 \u6a21\u5757\u7248\uff08\u542b {{style}} / {{characters}} / {{prompt}} \u5360\u4f4d\u7b26\uff09\u3002\u8001\u7528\u6237\u5347\u7ea7\u7528\uff1b\u4f1a\u8986\u76d6\u5f53\u524d\u6a21\u677f\u5185\u5bb9\u3002</div>\n\n            <!-- \u81ea\u5b9a\u4e49\u4f18\u5316 LLM \u540e\u7aef\uff08\u590d\u9009\u6846\u63a7\u5236\u5c55\u5f00\uff09 -->\n            <div style=\"margin-top:10px;\">\n                <label class=\"oair-toggle-label\">\n                    <input id=\"oair_optimize_use_custom\" type=\"checkbox\">\n                    \u4f7f\u7528\u81ea\u5b9a\u4e49\u4f18\u5316 LLM \u540e\u7aef\n                </label>\n                <div class=\"oair-hint\">\u52fe\u9009\u540e\u5c55\u5f00\u81ea\u5b9a\u4e49\u540e\u7aef\u914d\u7f6e\uff0c\u7559\u7a7a\u65f6\u9ed8\u8ba4\u4f7f\u7528\u9152\u9986\u4e3bAPI</div>\n\n                <div class=\"oair-custom-backend-content\" id=\"oair_custom_backend_fields\">\n                    <label class=\"oair-field-label\">\u4f18\u5316 LLM \u670d\u52a1\u5730\u5740</label>\n                    <input id=\"oair_optimize_api_url\" class=\"text_pole\" style=\"width:100%; box-sizing:border-box;\" placeholder=\"http://127.0.0.1:11434/v1\">\n                    <div class=\"oair-hint\" data-hint-id=\"optimize_url\">\u81ea\u5b9a\u4e49\u4f18\u5316LLM\u7684\u670d\u52a1\u5730\u5740\uff0c\u586b\u5230 /v1</div>\n\n                    <label class=\"oair-field-label\">\u4f18\u5316 LLM API \u5bc6\u94a5</label>\n                    <div class=\"oair-password-row\">\n                        <input id=\"oair_optimize_api_key\" type=\"password\" class=\"text_pole\" placeholder=\"sk-...\">\n                        <button type=\"button\" class=\"oair-eye-btn\" title=\"\u663e\u793a/\u9690\u85cf\u5bc6\u94a5\"><i class=\"fa-solid fa-eye\"></i></button>\n                    </div>\n                    <div class=\"oair-hint\" data-hint-id=\"optimize_key\">\u81ea\u5b9a\u4e49\u4f18\u5316LLM\u7684API\u5bc6\u94a5</div>\n\n                    <label class=\"oair-field-label\">\u4f18\u5316 LLM \u6a21\u578b</label>\n                    <div class=\"oair-model-row\">\n                        <input id=\"oair_optimize_model\" class=\"text_pole\" placeholder=\"gpt-4o-mini\">\n                        <button id=\"oair_btn_fetch_optimize_model\" class=\"menu_button\">\u83b7\u53d6\u6a21\u578b</button>\n                    </div>\n                    <select id=\"oair_optimize_model_select\" class=\"text_pole\"></select>\n                    <div class=\"oair-hint\" data-hint-id=\"optimize_model\">\u81ea\u5b9a\u4e49\u4f18\u5316LLM\u4f7f\u7528\u7684\u6a21\u578b</div>\n                </div>\n            </div>\n        </div>\n\n        <!-- NSFW \u89c4\u907f -->\n        <div class=\"oair-section\">\n            <div class=\"oair-section-title\">NSFW \u89c4\u907f <span class=\"oair-badge oair-badge-red\">\u5b89\u5168</span></div>\n            <label class=\"oair-toggle-label\">\n                <input id=\"oair_nsfw_avoidance\" type=\"checkbox\">\n                \u542f\u7528 NSFW \u5185\u5bb9\u89c4\u907f\n            </label>\n            <div class=\"oair-hint\">\n                \u4f7f\u7528 LLM \u81ea\u52a8\u5ba1\u67e5\u63d0\u793a\u8bcd\uff0c\u79fb\u9664\u4e0d\u5b89\u5168\u5185\u5bb9\uff0c\u907f\u514d\u5c01\u53f7\u3002<br>\n                <b>\u5efa\u8bae\u5f00\u542f</b>\uff1a\u5373\u4f7f\u4e3b\u63d0\u793a\u8bcd\u5df2\u8981\u6c42 SFW\uff0c\u6b64\u529f\u80fd\u53ef\u4f5c\u4e3a\u989d\u5916\u5b89\u5168\u7f51\u3002\n            </div>\n\n            <details class=\"oair-details\">\n                <summary>NSFW \u5ba1\u67e5\u6a21\u677f</summary>\n                <div class=\"oair-details-content\">\n                    <textarea id=\"oair_nsfw_avoidance_template\" class=\"text_pole\" rows=\"8\" style=\"width:100%; box-sizing:border-box;\" placeholder=\"NSFW \u5ba1\u67e5\u6a21\u677f\uff0c\u4f7f\u7528 {{prompt}} \u63d2\u5165\u539f\u59cb\u63d0\u793a\u8bcd\u3002\"></textarea>\n                </div>\n            </details>\n        </div>\n\n        <!-- \u6d88\u606f\u603b\u7ed3\u6a21\u677f -->\n        <div class=\"oair-section\">\n            <div class=\"oair-section-title\">\u6d88\u606f\u603b\u7ed3\u6a21\u677f</div>\n            <details class=\"oair-details\">\n                <summary>\u5c06\u804a\u5929\u6d88\u606f\u8f6c\u5316\u4e3a\u751f\u56fe\u63d0\u793a\u8bcd\u7684\u6a21\u677f</summary>\n                <div class=\"oair-details-content\">\n                    <textarea id=\"oair_summarize_template\" class=\"text_pole\" rows=\"8\" style=\"width:100%; box-sizing:border-box;\" placeholder=\"\u4f7f\u7528 {{message}} \u63d2\u5165\u6d88\u606f\u5185\u5bb9\u3002\"></textarea>\n                    <div class=\"oair-hint\">\u70b9\u51fb\u6d88\u606f\u4e0a\u7684\u300c\u603b\u7ed3\u751f\u56fe\u300d\u6309\u94ae\u65f6\u4f7f\u7528\u6b64\u6a21\u677f\u3002</div>\n                </div>\n            </details>\n        </div>\n    </div>\n\n    <!-- \u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550 -->\n    <!-- TAB: \u4e16\u754c\u4e66                                            -->\n    <!-- \u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550 -->\n    <div class=\"oair-tab-panel\" id=\"oair_panel_worldbook\">\n        <!-- \u98ce\u683c\u5e93 -->\n        <div class=\"oair-section\">\n            <div class=\"oair-section-title\">\u98ce\u683c\u5e93 <span class=\"oair-badge oair-badge-orange\">\u56fa\u5b9a\u00b7\u753b\u98ce</span></div>\n            <label class=\"oair-field-label\">\u98ce\u683c\u9884\u8bbe\uff08\u6bcf\u884c\u4e00\u4e2a\uff0c\u683c\u5f0f\u300c\u98ce\u683c\u540d\uff1a\u98ce\u683c\u63cf\u8ff0\u300d\uff09</label>\n            <textarea id=\"oair_style_library\" class=\"text_pole\" rows=\"4\" style=\"width:100%; box-sizing:border-box;\" placeholder=\"\u5199\u5b9e\uff1a\u5199\u5b9e\u6444\u5f71\u98ce\u683c\uff0c\u7535\u5f71\u7ea7\u5e03\u5149\uff0c\u9ad8\u7ec6\u8282&#10;\u52a8\u6f2b\uff1a\u65e5\u5f0f\u52a8\u6f2b\u8d5b\u7490\u7490\u98ce\u683c\uff0c\u9c9c\u8273\u8272\u5f69\uff0c\u5e72\u51c0\u7ebf\u6761\"></textarea>\n            <label class=\"oair-field-label\">\u5f53\u524d\u56fa\u5b9a\u98ce\u683c</label>\n            <select id=\"oair_style_active\" class=\"text_pole\" style=\"width:100%; box-sizing:border-box;\"></select>\n            <label class=\"oair-toggle-label\" style=\"margin-top:8px;\">\n                <input id=\"oair_style_auto_select\" type=\"checkbox\">\n                \u7531 LLM \u6309\u573a\u666f\u81ea\u52a8\u9009\u98ce\u683c\uff08\u8986\u76d6\u4e0a\u9762\u7684\u56fa\u5b9a\u9009\u62e9\uff09\n            </label>\n            <div class=\"oair-hint\">\u4e0d\u52fe\u9009\u65f6\u59cb\u7ec8\u7528\u300c\u5f53\u524d\u56fa\u5b9a\u98ce\u683c\u300d\uff0c\u4f1a\u8bdd\u5185\u4e00\u81f4\uff1b\u52fe\u9009\u540e\u6bcf\u6b21\u751f\u56fe\u591a\u4e00\u6b21\u8f7b\u91cf LLM \u5206\u6790\u6311\u98ce\u683c\u3002\u98ce\u683c\u4f1a\u6ce8\u5165\u4f18\u5316\u6a21\u677f\u7684\u3010\u98ce\u683c\u3011\u6a21\u5757\u3002</div>\n        </div>\n\n        <!-- \u4eba\u7269\u5e93 -->\n        <div class=\"oair-section\">\n            <div class=\"oair-section-title\">\u4eba\u7269\u5e93 <span class=\"oair-badge oair-badge-green\">\u56fa\u5b9a\u00b7\u753b\u5bf9\u4eba</span></div>\n            <label class=\"oair-field-label\">\u89d2\u8272\u5916\u8c8c\u8bbe\u5b9a\uff08\u6bcf\u884c\u4e00\u4e2a\u89d2\u8272\uff0c\u683c\u5f0f\u300c\u540d\u5b57\uff1a\u5916\u8c8c\u63cf\u8ff0\u300d\uff09</label>\n            <textarea id=\"oair_character_appearance\" class=\"text_pole\" rows=\"5\" style=\"width:100%; box-sizing:border-box;\" placeholder=\"\u5361\u63d0\u5e0c\u5a05\uff1a\u91d1\u8272\u957f\u53d1\uff0c\u84dd\u8272\u773c\u7738\uff0c\u5c16\u8033\uff0c\u5c11\u5973\u4f53\u578b\uff0c\u524d\u5723\u5973\u6c14\u8d28\uff0c\u786c\u6bdb\u732a\u76ae\u8f6f\u7532\uff0c\u7ec6\u5e26\u51c9\u978b\uff0c\u84dd\u8272\u811a\u8dbe\u7532\u6cb9&#10;\u9f50\u9f50\uff1a\u9ed1\u53d1\u9752\u5e74\uff0c\u4e0d\u6b7b\u4eba\uff0c\u61d2\u6563\u7684\u6076\u8da3\u5473\u795e\u60c5\"></textarea>\n            <label class=\"oair-toggle-label\" style=\"margin-top:8px;\">\n                <input id=\"oair_character_llm_extract\" type=\"checkbox\">\n                \u7531 LLM \u667a\u80fd\u8bc6\u522b\u51fa\u573a\u4eba\u7269\uff08\u9ed8\u8ba4\u6309\u540d\u5b57\u5339\u914d\uff09\n            </label>\n            <div class=\"oair-hint\">\u9ed8\u8ba4\uff1a\u540d\u5b57\u5728\u573a\u666f\u91cc\u51fa\u73b0\u5c31\u6ce8\u5165\u5176\u5916\u8c8c\uff080 \u989d\u5916\u8c03\u7528\uff09\u3002\u52fe\u9009\u540e\u7528 LLM \u8bc6\u522b\u51fa\u573a\u4eba\u7269\uff08\u4ee3\u8bcd/\u522b\u540d\u4e5f\u80fd\u8ba4\uff09\uff0c\u4e0e\u98ce\u683c\u81ea\u52a8\u9009\u5408\u5e76\u4e3a\u4e00\u6b21\u5206\u6790\u8c03\u7528\u3002\u51fa\u573a\u89d2\u8272\u5916\u8c8c\u4f1a\u9010\u5b57\u6ce8\u5165\u4f18\u5316\u6a21\u677f\u7684\u3010\u4eba\u7269\u7279\u5f81\u3011\u6a21\u5757\u3002</div>\n        </div>\n\n        <!-- \u81ea\u52a8\u6765\u6e90\uff1a\u4e16\u754c\u4e66 -->\n        <div class=\"oair-section\">\n            <div class=\"oair-section-title\">\u81ea\u52a8\u6765\u6e90 \u00b7 \u4e16\u754c\u4e66 <span class=\"oair-badge oair-badge-green\">\u81ea\u52a8\u8bfb\u8bbe\u5b9a</span></div>\n            <label class=\"oair-toggle-label\">\n                <input id=\"oair_worldbook_enabled\" type=\"checkbox\">\n                \u4ece\u4e16\u754c\u4e66\u81ea\u52a8\u8865\u5145\u4eba\u7269\u5916\u8c8c / \u573a\u666f\u8bbe\u5b9a\n            </label>\n            <div class=\"oair-hint\">\n                \u5f00\u542f\u540e\uff1a\u4eba\u7269\u5e93\u672a\u5199\u5230\u7684\u89d2\u8272\uff0c\u4f1a\u81ea\u52a8\u4ece\u300c\u5f53\u524d\u804a\u5929 / \u89d2\u8272\u5361\u7ed1\u5b9a\u7684\u4e16\u754c\u4e66\u300d\u547d\u4e2d\u6761\u76ee\u5e76\u53d6\u5176\u76f8\u5173\u6bb5\uff0c\u4f5c\u4e3a\u4eba\u7269\u5e93\u7684\u8865\u5145\u6765\u6e90\u3002<br>\n                \u4e16\u754c\u4e66\u4f18\u5148\u3001\u4eba\u7269\u5e93\u8865\u672a\u8986\u76d6\u8005\u3002\u5f53\u524d\u573a\u666f\u72b6\u6001\u4e0e\u52a8\u4f5c\u4ecd\u7531\u5bf9\u8bdd\u4e0a\u4e0b\u6587\u51b3\u5b9a\u3002\n            </div>\n            <label class=\"oair-field-label\">\u62bd\u53d6\u7684\u5c0f\u8282\u6807\u9898\uff08\u9017\u53f7\u5206\u9694\uff0c\u547d\u4e2d\u6761\u76ee\u65f6\u53ea\u53d6\u8fd9\u4e9b\u6bb5\uff09</label>\n            <input id=\"oair_worldbook_headings\" class=\"text_pole\" placeholder=\"\u5916\u8c8c,\u957f\u76f8,\u5916\u89c2,appearance,\u573a\u666f,\u73af\u5883,setting,scene\">\n            <label class=\"oair-field-label\">\u6ce8\u5165\u603b\u5b57\u6570\u4e0a\u9650</label>\n            <input id=\"oair_worldbook_maxchars\" class=\"text_pole\" type=\"number\" min=\"0\" placeholder=\"800\">\n        </div>\n    </div>\n\n    <!-- \u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550 -->\n    <!-- TAB 5: \u624b\u52a8\u751f\u56fe                                       -->\n    <!-- \u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550 -->\n    <div class=\"oair-tab-panel\" id=\"oair_panel_manual\">\n        <div class=\"oair-section\">\n            <div class=\"oair-section-title\">\u624b\u52a8\u751f\u56fe</div>\n            <label class=\"oair-field-label\">\u8f93\u5165\u63d0\u793a\u8bcd</label>\n            <textarea id=\"oair_manual_prompt\" class=\"text_pole\" rows=\"4\" style=\"width:100%; box-sizing:border-box;\" placeholder=\"\u63cf\u8ff0\u4f60\u60f3\u751f\u6210\u7684\u56fe\u7247...\"></textarea>\n\n            <!-- \u4f18\u5316\u540e\u63d0\u793a\u8bcd\u5c55\u793a\u533a -->\n            <div id=\"oair_manual_optimized_prompt\" style=\"display:none;\">\n                <label class=\"oair-field-label\" style=\"color:#60ff90;\">\u2728 \u4f18\u5316\u540e\u7684\u63d0\u793a\u8bcd</label>\n                <div id=\"oair_manual_optimized_text\" class=\"oair-optimized-box\"></div>\n                <div class=\"oair-hint\" style=\"color:#60ff90;\">\u751f\u6210\u56fe\u7247\u65f6\u5c06\u4f7f\u7528\u6b64\u4f18\u5316\u7248\u672c</div>\n            </div>\n\n            <div class=\"oair-btn-row\">\n                <button id=\"oair_btn_import_msg\" class=\"menu_button\" style=\"flex:1; justify-content:center;\">\n                    \ud83d\udce5 \u5bfc\u5165\u6d88\u606f\n                </button>\n                <button id=\"oair_btn_optimize\" class=\"menu_button\" style=\"flex:1; justify-content:center;\">\n                    \u2728 \u4f18\u5316\u63d0\u793a\u8bcd\n                </button>\n                <button id=\"oair_btn_manual_gen\" class=\"menu_button\" style=\"flex:1; justify-content:center;\">\n                    \ud83c\udfa8 \u751f\u6210\u56fe\u7247\n                </button>\n            </div>\n\n            <div class=\"oair-btn-row\">\n                <button id=\"oair_btn_clear_manual\" class=\"menu_button\" style=\"flex:1; justify-content:center;\">\n                    \u6e05\u7a7a\n                </button>\n                <button id=\"oair_btn_attach\" class=\"menu_button\" style=\"flex:1; justify-content:center;\">\n                    \ud83d\udcce \u9644\u52a0\u5230\u6d88\u606f\n                </button>\n            </div>\n\n            <div class=\"oair-hint\" style=\"margin-top:4px;\">\n                \ud83d\udce5 \u5bfc\u5165\u6d88\u606f\uff1a\u5c06\u5f53\u524d\u804a\u5929\u6700\u540e\u4e00\u6761 AI \u6d88\u606f\u5bfc\u5165\u4e3a\u63d0\u793a\u8bcd\n            </div>\n            <div class=\"oair-hint\">\n                \ud83d\udca1 \u63d0\u793a\uff1a\u5148\u8f93\u5165\u63d0\u793a\u8bcd \u2192 \u70b9\u51fb\u300c\u4f18\u5316\u63d0\u793a\u8bcd\u300d\u67e5\u770b\u4f18\u5316\u6548\u679c \u2192 \u70b9\u51fb\u300c\u751f\u6210\u56fe\u7247\u300d\n            </div>\n        </div>\n\n        <div class=\"oair-section\">\n            <div class=\"oair-section-title\">\u9884\u89c8</div>\n            <div id=\"oair_manual_preview\" style=\"display:grid; gap:8px;\"></div>\n        </div>\n    </div>\n\n    <!-- \u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550 -->\n    <!-- TAB: \u56fe\u5e93                                              -->\n    <!-- \u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550 -->\n    <div class=\"oair-tab-panel\" id=\"oair_panel_gallery\">\n        <div class=\"oair-section\">\n            <div class=\"oair-gallery-toolbar\">\n                <div class=\"oair-section-title\" style=\"margin:0;\">\u56fe\u5e93 <span id=\"oair_gallery_count\" class=\"oair-badge oair-badge-green\">0 \u5f20</span></div>\n                <div style=\"display:flex; gap:6px;\">\n                    <button id=\"oair_btn_gallery_refresh\" class=\"menu_button\">\u5237\u65b0</button>\n                    <button id=\"oair_btn_gallery_clear\" class=\"menu_button\">\u6e05\u7a7a\u56fe\u5e93</button>\n                </div>\n            </div>\n            <div class=\"oair-hint\">\u6240\u6709\u751f\u6210\u7684\u56fe\u7247\u81ea\u52a8\u4fdd\u5b58\u5230\u78c1\u76d8\uff08SillyTavern/data/&lt;\u7528\u6237&gt;/user/images/&lt;\u89d2\u8272&gt;/\uff09\u5e76\u8bb0\u5f55\u5728\u6b64\uff0c\u5237\u65b0\u6216\u91cd\u542f\u90fd\u4e0d\u4f1a\u4e22\u5931\u3002\u70b9\u51fb\u7f29\u7565\u56fe\u653e\u5927\uff1b\u300c\u6e05\u7a7a\u56fe\u5e93\u300d\u53ea\u6e05\u9664\u6b64\u5904\u8bb0\u5f55\uff0c\u4e0d\u5220\u9664\u78c1\u76d8\u6587\u4ef6\u3002</div>\n            <div id=\"oair_gallery_grid\" class=\"oair-gallery-grid\" style=\"margin-top:8px;\"></div>\n        </div>\n    </div>\n</div>\n";
-
+const SETTINGS_FULL_HTML = "<!-- ═══════════════════════════════════════════════════════ -->\n<!-- 完整配置版 — Huashu 混合型信息架构，用于悬浮窗 -->\n<!-- ═══════════════════════════════════════════════════════ -->\n<style>\n    .oair-tabs-container { display:flex; flex-direction:column; gap:0; }\n    .oair-tab-bar { display:flex; gap:4px; border-bottom:1px solid rgba(255,255,255,0.14); margin-bottom:12px; flex-wrap:nowrap; overflow-x:auto; scrollbar-width:thin; padding-bottom:2px; }\n    .oair-tab-radio { position:absolute; width:1px; height:1px; margin:-1px; padding:0; overflow:hidden; clip:rect(0 0 0 0); clip-path:inset(50%); border:0; white-space:nowrap; }\n    .oair-tab-label { padding:7px 11px; font-size:0.8em; cursor:pointer; border-radius:999px; opacity:0.62; transition:all .16s ease; user-select:none; white-space:nowrap; flex:0 0 auto; letter-spacing:.02em; }\n    .oair-tab-label:hover { opacity:.92; background:rgba(255,255,255,.06); }\n    #oair_tab_workbench:focus-visible ~ .oair-tab-bar label[for=\"oair_tab_workbench\"],\n    #oair_tab_library:focus-visible ~ .oair-tab-bar label[for=\"oair_tab_library\"],\n    #oair_tab_prompts:focus-visible ~ .oair-tab-bar label[for=\"oair_tab_prompts\"],\n    #oair_tab_models:focus-visible ~ .oair-tab-bar label[for=\"oair_tab_models\"],\n    #oair_tab_history:focus-visible ~ .oair-tab-bar label[for=\"oair_tab_history\"] { outline:2px solid rgba(104,160,255,.75); outline-offset:2px; }\n    .oair-tab-panel { display:none; }\n    #oair_tab_workbench:checked ~ .oair-tab-bar label[for=\"oair_tab_workbench\"],\n    #oair_tab_library:checked ~ .oair-tab-bar label[for=\"oair_tab_library\"],\n    #oair_tab_prompts:checked ~ .oair-tab-bar label[for=\"oair_tab_prompts\"],\n    #oair_tab_models:checked ~ .oair-tab-bar label[for=\"oair_tab_models\"],\n    #oair_tab_history:checked ~ .oair-tab-bar label[for=\"oair_tab_history\"] { opacity:1; background:linear-gradient(135deg, rgba(255,216,164,.17), rgba(166,215,255,.13)); border:1px solid rgba(255,255,255,.13); box-shadow:0 0 0 1px rgba(255,255,255,.045) inset; }\n    #oair_tab_workbench:checked ~ #oair_panel_workbench,\n    #oair_tab_library:checked ~ #oair_panel_library,\n    #oair_tab_prompts:checked ~ #oair_panel_prompts,\n    #oair_tab_models:checked ~ #oair_panel_models,\n    #oair_tab_history:checked ~ #oair_panel_history { display:block; }\n    .oair-section { background:linear-gradient(180deg, rgba(255,255,255,.055), rgba(0,0,0,.12)); padding:11px; border-radius:12px; margin-bottom:9px; border:1px solid rgba(255,255,255,.10); box-shadow:0 8px 24px rgba(0,0,0,.12); }\n    .oair-section-title { font-weight:bold; font-size:.9em; margin-bottom:8px; display:flex; align-items:center; gap:7px; letter-spacing:.02em; }\n    .oair-field-label { display:block; font-size:.76em; opacity:.82; margin-top:7px; margin-bottom:3px; }\n    .oair-hint { margin-top:4px; font-size:.72em; opacity:.62; line-height:1.45; }\n    .oair-row { display:grid; grid-template-columns:1fr 1fr; gap:7px; margin-top:7px; }\n    .oair-btn-row { display:flex; gap:7px; margin-top:7px; flex-wrap:wrap; }\n    .oair-btn-row .menu_button { min-height:30px; white-space:nowrap; word-break:keep-all; }\n    .oair-toggle-label { display:flex; align-items:center; gap:6px; font-size:.8em; }\n    .oair-badge { display:inline-block; padding:1px 7px; border-radius:999px; font-size:.7em; font-weight:bold; vertical-align:middle; white-space:nowrap; }\n    .oair-badge-green { background:rgba(0,200,100,.18); color:#78ffac; }\n    .oair-badge-orange { background:rgba(255,180,60,.18); color:#ffd08a; }\n    .oair-badge-red { background:rgba(255,80,80,.18); color:#ff9a9a; }\n    .oair-workbench-grid { display:grid; grid-template-columns:minmax(260px, .95fr) minmax(280px, 1.05fr); gap:10px; align-items:start; }\n    .oair-workbench-left,.oair-workbench-right { min-width:0; }\n    .oair-plan-placeholder,.oair-log-box,.oair-history-box { border:1px dashed rgba(255,255,255,.16); border-radius:10px; padding:9px; background:rgba(0,0,0,.10); font-size:.76em; line-height:1.5; opacity:.78; }\n    .oair-character-list,.oair-progress-list,.oair-history-list { display:grid; gap:7px; }\n    .oair-progress-list { max-height:min(34vh, 320px); overflow-y:auto; padding-right:2px; }\n    .oair-character-card,.oair-progress-card,.oair-history-record { border:1px solid rgba(255,255,255,.12); border-radius:8px; padding:8px; background:rgba(255,255,255,.045); }\n    .oair-character-card-head,.oair-history-record-head { display:flex; align-items:center; justify-content:space-between; gap:7px; font-size:.78em; font-weight:bold; }\n    .oair-character-card-head { justify-content:flex-start; }\n    .oair-character-toggle-btn { margin-left:auto; min-height:24px; padding:2px 8px; font-size:.72em; white-space:nowrap; }\n    .oair-character-source,.oair-history-time,.oair-history-meta,.oair-history-prompt,.oair-history-job,.oair-progress-status { font-size:.73em; opacity:.76; line-height:1.45; overflow-wrap:anywhere; word-break:break-word; }\n    .oair-error-summary { margin-top:6px; max-height:86px; overflow-y:auto; padding:6px; border-radius:6px; background:rgba(255,80,80,.08); color:#ffb3b3; font-size:.72em; line-height:1.45; white-space:pre-wrap; overflow-wrap:anywhere; }\n    .oair-character-candidate-text { margin-top:6px; width:100%; box-sizing:border-box; resize:vertical; }\n    .oair-progress-title { font-size:.78em; font-weight:bold; margin-bottom:4px; }\n    .oair-status-succeeded { color:#78ffac; }\n    .oair-status-failed,.oair-history-error { color:#ff9a9a; }\n    .oair-workbench-preview-grid { display:grid; grid-template-columns:repeat(auto-fill, minmax(96px, 1fr)); gap:8px; margin-top:8px; align-items:start; }\n    .oair-preview-card { min-width:0; border:1px solid rgba(255,255,255,.12); border-radius:8px; padding:7px; background:rgba(255,255,255,.045); }\n    .oair-preview-title { margin-bottom:6px; font-size:.74em; line-height:1.35; opacity:.82; overflow-wrap:anywhere; }\n    .oair-preview-thumb { position:relative; overflow:hidden; border-radius:6px; background:rgba(0,0,0,.22); aspect-ratio:1 / 1; }\n    .oair-preview-thumb img { display:block; width:100%; height:100%; object-fit:cover; cursor:pointer; }\n    .oair-preview-card .oair-panel-dialogue { max-height:70px; overflow-y:auto; overflow-wrap:anywhere; }\n    .oair-history-job { display:flex; align-items:center; justify-content:space-between; gap:6px; padding-top:5px; margin-top:5px; border-top:1px solid rgba(255,255,255,.08); }\n    .oair-history-prompt { margin-top:5px; display:-webkit-box; -webkit-line-clamp:2; -webkit-box-orient:vertical; overflow:hidden; }\n    .oair-history-empty { padding:10px; border:1px dashed rgba(255,255,255,.16); border-radius:8px; font-size:.76em; opacity:.68; text-align:center; }\n    .oair-auto-flow-events,.oair-built-in-style-list { display:grid; gap:6px; margin-top:8px; max-height:150px; overflow-y:auto; padding-right:2px; }\n    .oair-auto-flow-event,.oair-built-in-style { border:1px solid rgba(255,255,255,.12); border-radius:8px; padding:7px; background:rgba(255,255,255,.045); min-width:0; }\n    .oair-auto-flow-event { display:grid; grid-template-columns:auto 1fr; gap:6px; align-items:start; }\n    .oair-auto-flow-kind { font-size:.68em; font-weight:700; padding:1px 6px; border-radius:999px; background:rgba(104,160,255,.16); white-space:nowrap; }\n    .oair-auto-flow-text,.oair-built-in-style-text { font-size:.73em; line-height:1.45; opacity:.78; overflow-wrap:anywhere; }\n    .oair-built-in-style-name { font-size:.78em; font-weight:700; margin-bottom:3px; }\n    .oair-optimized-box { background:rgba(0,200,100,.08); border:1px solid rgba(0,200,100,.25); border-radius:8px; padding:8px; margin-top:6px; font-size:.85em; line-height:1.5; white-space:pre-wrap; word-break:break-word; }\n    .oair-input-with-btn,.oair-password-row,.oair-model-row,.oair-save-row { display:flex; gap:6px; align-items:center; }\n    .oair-input-with-btn .text_pole,.oair-password-row .text_pole,.oair-model-row .text_pole,.oair-save-row .text_pole { flex:1; min-width:0; }\n    .oair-model-row .menu_button,.oair-save-row .menu_button,#oair_btn_chatgpt2api_preset { flex:0 0 auto; white-space:nowrap; word-break:keep-all; min-width:max-content; }\n    .oair-password-row .oair-eye-btn { flex-shrink:0; width:32px; height:32px; display:flex; align-items:center; justify-content:center; background:rgba(255,255,255,.08); border:1px solid rgba(255,255,255,.15); border-radius:4px; color:var(--SmartThemeBodyColor,#ccc); cursor:pointer; font-size:13px; }\n    #oair_model_select,#oair_optimize_model_select { width:100%; margin-top:4px; display:none; }\n    #oair_model_select.oair-visible,#oair_optimize_model_select.oair-visible { display:block; }\n    .oair-details { margin-top:8px; }\n    .oair-details summary { font-size:.78em; cursor:pointer; opacity:.78; padding:4px 0; user-select:none; list-style:none; display:flex; align-items:center; gap:4px; }\n    .oair-details summary::-webkit-details-marker { display:none; }\n    .oair-details summary::before { content:\"▸\"; display:inline-block; width:12px; text-align:center; transition:transform .15s; }\n    .oair-details[open] summary::before { transform:rotate(90deg); }\n    .oair-custom-backend-content { display:none; }\n    .oair-custom-backend-content.oair-visible { display:block; }\n    .oair-library-toolbar { display:flex; flex-wrap:wrap; gap:6px; margin-top:8px; }\n    .oair-library-toolbar .menu_button { flex:1 1 120px; justify-content:center; min-height:30px; white-space:nowrap; word-break:keep-all; }\n    .oair-library-summary { display:grid; gap:6px; margin-top:8px; }\n    .oair-library-card { border:1px solid rgba(255,255,255,.12); border-radius:8px; padding:8px; background:rgba(255,255,255,.045); }\n    .oair-library-card-title { display:flex; align-items:center; justify-content:space-between; gap:8px; font-size:.82em; font-weight:bold; }\n    .oair-library-card-body { margin-top:4px; font-size:.75em; line-height:1.45; opacity:.78; word-break:break-word; display:-webkit-box; -webkit-line-clamp:2; -webkit-box-orient:vertical; overflow:hidden; }\n    .oair-library-empty { padding:10px; border:1px dashed rgba(255,255,255,.18); border-radius:8px; font-size:.76em; opacity:.65; text-align:center; }\n    .oair-active-chip { display:inline-flex; align-items:center; padding:2px 7px; border-radius:999px; background:rgba(104,160,255,.16); font-size:.72em; font-weight:normal; white-space:nowrap; }\n    .oair-radio-group { display:grid; grid-template-columns:repeat(3, minmax(0, 1fr)); gap:6px; margin-top:8px; }\n    .oair-radio-option { display:flex; align-items:flex-start; gap:6px; padding:7px; border:1px solid rgba(255,255,255,.12); border-radius:8px; background:rgba(255,255,255,.04); font-size:.76em; line-height:1.35; cursor:pointer; }\n    .oair-radio-option input { margin-top:2px; flex:0 0 auto; }\n    .oair-library-modal { position:fixed; inset:0; z-index:3300; display:none; align-items:center; justify-content:center; padding:18px; background:radial-gradient(circle at 20% 12%, rgba(255,216,164,.13), transparent 34%), radial-gradient(circle at 82% 78%, rgba(104,160,255,.16), transparent 38%), rgba(0,0,0,.62); backdrop-filter:blur(3px); }\n    .oair-library-modal.oair-visible { display:flex; }\n    .oair-library-dialog { width:min(820px, calc(100vw - 36px)); max-height:min(820px, calc(100vh - 36px)); display:flex; flex-direction:column; border:1px solid rgba(255,255,255,.18); border-radius:16px; background:linear-gradient(180deg, rgba(255,255,255,.075), rgba(0,0,0,.18)), var(--SmartThemeBlurTintColor, rgba(28,28,44,.98)); box-shadow:0 22px 70px rgba(0,0,0,.72), 0 0 0 1px rgba(255,255,255,.04) inset; overflow:hidden; }\n    .oair-library-dialog-header,.oair-library-dialog-footer { display:flex; align-items:center; justify-content:space-between; gap:10px; padding:12px 14px; border-bottom:1px solid rgba(255,255,255,.11); background:rgba(255,255,255,.035); }\n    .oair-library-dialog-footer { border-top:1px solid rgba(255,255,255,.11); border-bottom:0; justify-content:flex-end; flex-wrap:wrap; }\n    .oair-library-dialog-footer .menu_button,.oair-library-editor .menu_button,.oair-library-row-actions .menu_button { white-space:nowrap; word-break:keep-all; }\n    .oair-library-dialog-title { margin:0; font-size:1em; font-weight:800; letter-spacing:.03em; }\n    .oair-library-dialog-body { display:grid; grid-template-columns:minmax(240px,.9fr) minmax(300px,1.15fr); gap:12px; padding:14px; overflow:auto; }\n    .oair-library-list,.oair-library-editor { display:grid; gap:8px; align-content:start; }\n    .oair-library-list { max-height:min(560px, calc(100vh - 220px)); overflow:auto; padding-right:2px; }\n    .oair-library-row { border-radius:12px; padding:10px; background:rgba(255,255,255,.045); cursor:pointer; transition:border-color .16s ease, background .16s ease, transform .16s ease; }\n    .oair-library-row:hover { transform:translateY(-1px); background:rgba(255,255,255,.065); }\n    .oair-library-row:focus-visible { outline:2px solid rgba(104,160,255,.72); outline-offset:2px; }\n    .oair-library-row.oair-active { border-color:var(--SmartThemeQuoteColor,#68a0ff); background:linear-gradient(135deg, rgba(104,160,255,.16), rgba(255,216,164,.07)); }\n    .oair-library-row-actions { display:flex; flex-wrap:wrap; gap:5px; margin-top:4px; }\n    .oair-library-row-actions .menu_button { min-height:26px; padding:3px 8px; font-size:.72em; }\n    .oair-library-editor { padding:10px; border-radius:12px; border:1px solid rgba(255,255,255,.10); background:rgba(0,0,0,.12); }\n    .oair-library-editor .text_pole,.oair-library-row .text_pole { width:100%; box-sizing:border-box; }\n    .oair-library-editor textarea { min-height:180px; resize:vertical; line-height:1.5; }\n    .oair-library-row textarea.text_pole { min-height:96px; resize:vertical; line-height:1.45; }\n    .oair-library-row input[type=\"checkbox\"] { width:16px; height:16px; accent-color:var(--SmartThemeQuoteColor,#68a0ff); }\n    .oair-gallery-toolbar,.oair-history-toolbar { display:flex; align-items:center; justify-content:space-between; gap:8px; }\n    .oair-gallery-actions,.oair-history-actions { display:flex; gap:6px; flex-wrap:nowrap; align-items:center; }\n    .oair-gallery-actions .menu_button,.oair-history-actions .menu_button { flex:0 0 auto; white-space:nowrap; word-break:keep-all; min-width:max-content; }\n    .oair-gallery-grid { display:grid; grid-template-columns:repeat(auto-fill, minmax(90px,1fr)); gap:8px; }\n    .oair-gallery-cell { position:relative; border-radius:8px; overflow:hidden; background:rgba(0,0,0,.2); aspect-ratio:1/1; }\n    .oair-gallery-cell img { width:100%; height:100%; object-fit:cover; cursor:pointer; display:block; }\n    .oair-gallery-cell-bar { position:absolute; bottom:0; left:0; right:0; display:flex; justify-content:center; gap:2px; padding:2px; background:rgba(0,0,0,.55); opacity:0; transition:opacity .15s; }\n    .oair-gallery-cell:hover .oair-gallery-cell-bar,.oair-gallery-cell:focus-within .oair-gallery-cell-bar { opacity:1; }\n    .oair-gallery-mini { border:none; background:transparent; cursor:pointer; font-size:13px; padding:2px 4px; line-height:1; }\n    .oair-pagination { grid-column:1/-1; display:flex; align-items:center; justify-content:center; gap:8px; margin-top:8px; flex-wrap:wrap; }\n    .oair-pagination .menu_button { min-height:26px; padding:3px 10px; white-space:nowrap; word-break:keep-all; }\n    .oair-pagination-info { font-size:.74em; opacity:.72; white-space:nowrap; }\n    .oair-gallery-cell img[role=\"button\"]:focus-visible,.oair-gallery-mini:focus-visible { outline:2px solid rgba(104,160,255,.78); outline-offset:2px; }\n    @media (max-width:720px){ .oair-workbench-grid,.oair-row,.oair-radio-group,.oair-library-dialog-body{grid-template-columns:1fr;} .oair-library-dialog{width:calc(100vw - 20px); max-height:calc(100vh - 20px);} .oair-tab-label{font-size:.76em; padding:7px 9px;} .oair-gallery-toolbar,.oair-history-toolbar{align-items:flex-start; flex-direction:column;} }\n</style>\n\n<div class=\"oair-settings-ui\">\n    <div style=\"display:flex; justify-content:space-between; align-items:center; margin-bottom:10px; border-bottom:1px solid rgba(255,255,255,0.1); padding-bottom:5px; gap:8px;\">\n        <div id=\"oair_floating_status\" style=\"font-size:0.8em; color:var(--SmartThemeQuoteColor, #68a0ff);\">就绪</div>\n        <label style=\"display:flex; align-items:center; gap:6px; font-size:0.8em; white-space:nowrap;\"><input id=\"oair_floating_enabled\" type=\"checkbox\">启用</label>\n    </div>\n\n    <input type=\"radio\" name=\"oair_tab\" id=\"oair_tab_workbench\" class=\"oair-tab-radio\" checked>\n    <input type=\"radio\" name=\"oair_tab\" id=\"oair_tab_library\" class=\"oair-tab-radio\">\n    <input type=\"radio\" name=\"oair_tab\" id=\"oair_tab_prompts\" class=\"oair-tab-radio\">\n    <input type=\"radio\" name=\"oair_tab\" id=\"oair_tab_models\" class=\"oair-tab-radio\">\n    <input type=\"radio\" name=\"oair_tab\" id=\"oair_tab_history\" class=\"oair-tab-radio\">\n\n    <div class=\"oair-tab-bar\">\n        <label for=\"oair_tab_workbench\" class=\"oair-tab-label\">生成工作台</label>\n        <label for=\"oair_tab_library\" class=\"oair-tab-label\">设定库</label>\n        <label for=\"oair_tab_prompts\" class=\"oair-tab-label\">提示词模板</label>\n        <label for=\"oair_tab_models\" class=\"oair-tab-label\">模型后端</label>\n        <label for=\"oair_tab_history\" class=\"oair-tab-label\">图库历史</label>\n    </div>\n\n    <div class=\"oair-tab-panel\" id=\"oair_panel_workbench\">\n        <div class=\"oair-workbench-grid\">\n            <div class=\"oair-workbench-left\">\n                <div class=\"oair-section\"><div class=\"oair-section-title\">生成模式</div><label class=\"oair-field-label\">工作台模式</label><select id=\"oair_generation_mode\" class=\"text_pole\" style=\"width:100%; box-sizing:border-box;\"><option value=\"single\">单图（默认）</option><option value=\"multi\">多图（剧情递进图组）</option><option value=\"comic\">漫画（分格 + 对白元数据）</option></select><div class=\"oair-hint\">源文本会在单图、多图、漫画之间保留；自动流程勾选跟随时会使用这里的模式、张数、对白和失败策略。</div></div>\n                <div class=\"oair-section\"><div class=\"oair-section-title\">源文本 / 手动生图</div><label class=\"oair-field-label\">输入提示词 / 剧情原文</label><textarea id=\"oair_manual_prompt\" class=\"text_pole\" rows=\"6\" style=\"width:100%; box-sizing:border-box;\" placeholder=\"描述你想生成的图片，或粘贴一整段剧情...\"></textarea><div id=\"oair_manual_optimized_prompt\" style=\"display:none;\"><label class=\"oair-field-label\" style=\"color:#60ff90;\">✨ 精修后的编译提示词</label><div id=\"oair_manual_optimized_text\" class=\"oair-optimized-box\"></div><div class=\"oair-hint\" style=\"color:#60ff90;\">生成图片时将使用此精修版本</div></div><div class=\"oair-btn-row\"><button id=\"oair_btn_import_msg\" class=\"menu_button\" style=\"flex:1; justify-content:center;\">📥 导入消息</button><button id=\"oair_btn_optimize\" class=\"menu_button\" style=\"flex:1; justify-content:center;\">✨ 精修提示词</button><button id=\"oair_btn_manual_gen\" class=\"menu_button\" style=\"flex:1; justify-content:center;\">🎨 生成图片</button><button id=\"oair_btn_clear_manual\" class=\"menu_button\" style=\"flex:1; justify-content:center;\">清空</button><button id=\"oair_btn_attach\" class=\"menu_button\" style=\"flex:1; justify-content:center;\">📎 附加到消息</button></div></div>\n                <div class=\"oair-section\"><div class=\"oair-section-title\">单图取景策略</div><select id=\"oair_single_image_strategy\" class=\"text_pole\" style=\"width:100%; box-sizing:border-box;\"><option value=\"climax\">剧情高潮</option><option value=\"poster\">总结海报</option><option value=\"final\">最后镜头</option></select><div class=\"oair-hint\">单图会先按这里规划一个画面目标，再由本地提示词编译器生成生图 prompt。</div></div>\n                <div class=\"oair-section\"><div class=\"oair-section-title\">多图模式</div><label class=\"oair-toggle-label\"><input id=\"oair_multi_image_enabled\" type=\"checkbox\">启用多图模式（长剧情拆分为多个节点生成）</label><div class=\"oair-row\"><div><label class=\"oair-field-label\">默认生成张数</label><input id=\"oair_default_beat_count\" type=\"number\" min=\"2\" max=\"6\" step=\"1\" class=\"text_pole\" style=\"width:100%; box-sizing:border-box;\" placeholder=\"3\"></div><div><label class=\"oair-field-label\">失败策略</label><select id=\"oair_multi_image_failure_policy\" class=\"text_pole\" style=\"width:100%; box-sizing:border-box;\"><option value=\"stop\">停止并提示</option><option value=\"continue\">继续保留成功项</option><option value=\"retry\">预留重试</option></select></div></div></div>\n                <div class=\"oair-section\"><div class=\"oair-section-title\">漫画模式</div><div class=\"oair-row\"><div><label class=\"oair-field-label\">分格数（2-8）</label><input id=\"oair_comic_panel_count\" type=\"number\" min=\"2\" max=\"8\" step=\"1\" class=\"text_pole\" style=\"width:100%; box-sizing:border-box;\" placeholder=\"4\"></div><div><label class=\"oair-field-label\">失败策略</label><select id=\"oair_comic_failure_policy\" class=\"text_pole\" style=\"width:100%; box-sizing:border-box;\"><option value=\"stop\">停止并提示</option><option value=\"continue\">继续保留成功格</option><option value=\"retry\">预留重试</option></select></div></div><label class=\"oair-toggle-label\" style=\"margin-top:8px;\"><input id=\"oair_comic_dialogue_enabled\" type=\"checkbox\">生成对白/旁白元数据</label><label class=\"oair-field-label\">对白模式</label><select id=\"oair_comic_dialogue_mode\" class=\"text_pole\" style=\"width:100%; box-sizing:border-box;\"><option value=\"bubble\">插件气泡（默认，画面不出现文字）</option><option value=\"modelText\">模型画字（提示后端绘制中文气泡，可能不稳定）</option></select><div class=\"oair-hint\">关闭时 planner 不强制创造对白；插件气泡会保存可读对白元数据，模型画中文字可能不稳定。</div></div>\n                <div class=\"oair-section\"><div class=\"oair-section-title\">连续性策略 <span class=\"oair-badge oair-badge-orange\">预留</span></div><label class=\"oair-field-label\">参考图策略</label><select id=\"oair_continuity_mode\" class=\"text_pole\" style=\"width:100%; box-sizing:border-box;\"><option value=\"off\">关闭（纯文生图）</option><option value=\"previous\">上一张</option><option value=\"firstAndPrevious\">首图 + 上一张</option><option value=\"characterAndPrevious\">角色参考 + 上一张</option></select><div class=\"oair-hint\">本阶段只把参考图写入 ImageJob 元数据，不改变文生图请求；真实图生图/编辑接口后续接入。</div></div>\n            </div>\n            <div class=\"oair-workbench-right\">\n                <div class=\"oair-section\"><div class=\"oair-section-title\">自动整条 AI 消息生图</div><label class=\"oair-toggle-label\"><input id=\"oair_automatic_flow_enabled\" type=\"checkbox\">开启后，每条符合条件的新 AI 消息自动按整条正文生图</label><div class=\"oair-hint\">开启时会忽略消息里的 &lt;pic&gt; 作为单独触发，避免重复生成；关闭时旧 &lt;pic prompt=&quot;...&quot;&gt; 路径保持兼容。</div><label class=\"oair-toggle-label\" style=\"margin-top:8px;\"><input id=\"oair_automatic_flow_follow_workbench\" type=\"checkbox\">跟随当前工作台模式、张数、对白和失败策略</label><div class=\"oair-row\"><div><label class=\"oair-field-label\">最小正文字数</label><input id=\"oair_automatic_flow_min_chars\" type=\"number\" min=\"0\" step=\"10\" class=\"text_pole\" style=\"width:100%; box-sizing:border-box;\"></div><div><label class=\"oair-field-label\">单图失败策略</label><select id=\"oair_automatic_flow_failure_policy\" class=\"text_pole\" style=\"width:100%; box-sizing:border-box;\"><option value=\"stop\">停止并提示</option><option value=\"continue\">继续保留成功项</option><option value=\"retry\">预留重试</option></select></div></div><div class=\"oair-row\"><label class=\"oair-toggle-label\"><input id=\"oair_automatic_flow_show_queue\" type=\"checkbox\">显示队列状态</label><label class=\"oair-toggle-label\"><input id=\"oair_automatic_flow_cancel_enabled\" type=\"checkbox\">允许取消安全任务</label></div><div class=\"oair-btn-row\"><button id=\"oair_btn_cancel_auto_queue\" class=\"menu_button\" style=\"flex:1; justify-content:center;\">取消排队/运行中的自动任务</button></div><div id=\"oair_automatic_flow_queue_status\" class=\"oair-hint\">自动队列：空闲</div><div id=\"oair_automatic_flow_events\" class=\"oair-auto-flow-events\" aria-live=\"polite\"></div></div>\n                <div class=\"oair-section\"><div class=\"oair-section-title\">进度</div><div id=\"oair_plan_progress\" class=\"oair-progress-list\"></div></div>\n                <div class=\"oair-section\"><div class=\"oair-section-title\">预览</div><div id=\"oair_manual_preview\" class=\"oair-workbench-preview-grid\"></div></div>\n                <div class=\"oair-section\"><div class=\"oair-section-title\">折叠日志</div><details class=\"oair-details\"><summary>查看规划 / 编译 / 安全重写 / 生成摘要</summary><div class=\"oair-log-box\">详细开发日志仍输出到浏览器 Console；这里仅显示适合 UI 的短摘要。</div></details></div>\n                <div class=\"oair-section\"><div class=\"oair-section-title\">图库快捷入口</div><div class=\"oair-btn-row\"><label for=\"oair_tab_history\" class=\"menu_button\" style=\"flex:1; justify-content:center; cursor:pointer;\">打开图库历史</label></div></div>\n            </div>\n        </div>\n    </div>\n\n    <div class=\"oair-tab-panel\" id=\"oair_panel_library\">\n        <div class=\"oair-section\"><div class=\"oair-section-title\">当前角色卡视觉设定 <span class=\"oair-badge oair-badge-green\">当前角色卡库</span></div><div id=\"oair_visual_scope_status\" class=\"oair-hint\">人物库、场景库、当前风格/场景和确认人物只写入当前角色卡；旧全局设定不会自动回填。</div></div>\n        <div class=\"oair-section\"><div class=\"oair-section-title\">风格库 <span class=\"oair-badge oair-badge-orange\">固定·画风</span></div><input id=\"oair_style_library\" type=\"hidden\"><input id=\"oair_style_active\" type=\"hidden\"><div class=\"oair-hint\">风格、人物、场景统一在当前角色卡设定库维护，生成时按配置注入或自动选择。</div><div class=\"oair-built-in-style-panel\"><div class=\"oair-section-title\" style=\"font-size:.82em; margin-top:8px;\">插件内置风格</div><div class=\"oair-hint\">Built-in style presets are visible here and import only into the current character card.</div><div id=\"oair_builtin_style_presets\" class=\"oair-built-in-style-list\"></div><div class=\"oair-btn-row\"><button id=\"oair_btn_import_builtin_styles\" class=\"menu_button\" type=\"button\" style=\"flex:1; justify-content:center;\">导入内置风格到当前角色卡</button></div></div><div id=\"oair_style_library_summary\" class=\"oair-library-summary\"></div><div class=\"oair-library-toolbar\"><button id=\"oair_btn_style_library\" class=\"menu_button\" type=\"button\">管理风格预设</button></div><label class=\"oair-toggle-label\" style=\"margin-top:8px;\"><input id=\"oair_style_auto_select\" type=\"checkbox\">由 LLM 按场景自动选风格</label></div>\n        <div class=\"oair-section\"><div class=\"oair-section-title\">人物库 <span class=\"oair-badge oair-badge-green\">固定·画对人</span></div><input id=\"oair_character_appearance\" type=\"hidden\"><div id=\"oair_character_library_summary\" class=\"oair-library-summary\"></div><div class=\"oair-library-toolbar\"><button id=\"oair_btn_character_library\" class=\"menu_button\" type=\"button\">管理人物预设</button><button id=\"oair_btn_character_from_chat\" class=\"menu_button\" type=\"button\">从对话提取</button><button id=\"oair_btn_character_from_worldbook\" class=\"menu_button\" type=\"button\">从世界书提取</button><button id=\"oair_btn_character_clear\" class=\"menu_button\" type=\"button\">清空人物库</button></div><label class=\"oair-toggle-label\" style=\"margin-top:8px;\"><input id=\"oair_auto_extract_characters\" type=\"checkbox\">每次新 AI 消息自动提取人物到当前角色卡</label><label class=\"oair-toggle-label\" style=\"margin-top:8px;\"><input id=\"oair_character_llm_extract\" type=\"checkbox\">由 LLM 智能识别出场人物</label></div>\n        <div class=\"oair-section\"><div class=\"oair-section-title\">场景库 <span class=\"oair-badge oair-badge-orange\">固定·地点环境</span></div><input id=\"oair_scene_library\" type=\"hidden\"><input id=\"oair_scene_active\" type=\"hidden\"><div id=\"oair_scene_library_summary\" class=\"oair-library-summary\"></div><div class=\"oair-library-toolbar\"><button id=\"oair_btn_scene_library\" class=\"menu_button\" type=\"button\">管理场景预设</button><button id=\"oair_btn_scene_from_chat\" class=\"menu_button\" type=\"button\">从对话提取</button><button id=\"oair_btn_scene_from_worldbook\" class=\"menu_button\" type=\"button\">从世界书提取</button><button id=\"oair_btn_scene_clear\" class=\"menu_button\" type=\"button\">清空场景库</button></div><label class=\"oair-toggle-label\" style=\"margin-top:8px;\"><input id=\"oair_auto_extract_scenes\" type=\"checkbox\">每次新 AI 消息自动提取场景到当前角色卡</label><label class=\"oair-toggle-label\" style=\"margin-top:8px;\"><input id=\"oair_scene_auto_select\" type=\"checkbox\">由 LLM 按原文自动选场景</label></div>\n        <div class=\"oair-section\"><div class=\"oair-section-title\">世界书 / 固定设定清洗级别</div><label class=\"oair-field-label\">固定设定清洗级别</label><select id=\"oair_visual_sanitization_level\" class=\"text_pole\" style=\"width:100%; box-sizing:border-box;\"><option value=\"strict\">严格</option><option value=\"standard\">标准</option><option value=\"loose\">宽松</option></select><div class=\"oair-hint\">过滤世界书/人物/场景里的模板宏、TavernDB/Wrapper、插图插入任务规则和低视觉价值内容。</div><div class=\"oair-row\"><div><div class=\"oair-section-title\" style=\"font-size:.82em; margin-top:8px;\">人物世界书策略</div><div class=\"oair-radio-group\"><label class=\"oair-radio-option\"><input type=\"radio\" name=\"oair_character_worldbook_mode\" value=\"off\"><span>关闭<br><span class=\"oair-hint\">人物不读世界书。</span></span></label><label class=\"oair-radio-option\"><input type=\"radio\" name=\"oair_character_worldbook_mode\" value=\"inject\"><span>生图时注入<br><span class=\"oair-hint\">命中人物时即时补充。</span></span></label><label class=\"oair-radio-option\"><input type=\"radio\" name=\"oair_character_worldbook_mode\" value=\"extract\"><span>仅提取到库<br><span class=\"oair-hint\">只通过提取按钮入库。</span></span></label></div></div><div><div class=\"oair-section-title\" style=\"font-size:.82em; margin-top:8px;\">场景世界书策略</div><div class=\"oair-radio-group\"><label class=\"oair-radio-option\"><input type=\"radio\" name=\"oair_scene_worldbook_mode\" value=\"off\"><span>关闭<br><span class=\"oair-hint\">场景不读世界书。</span></span></label><label class=\"oair-radio-option\"><input type=\"radio\" name=\"oair_scene_worldbook_mode\" value=\"inject\"><span>生图时注入<br><span class=\"oair-hint\">命中地点/环境时即时补充。</span></span></label><label class=\"oair-radio-option\"><input type=\"radio\" name=\"oair_scene_worldbook_mode\" value=\"extract\"><span>仅提取到库<br><span class=\"oair-hint\">只通过提取按钮入库。</span></span></label></div></div></div><label class=\"oair-field-label\">世界书小节标题</label><input id=\"oair_worldbook_headings\" class=\"text_pole\" placeholder=\"外貌,长相,外观,appearance,场景,环境,setting,scene\"><label class=\"oair-field-label\">注入总字数上限</label><input id=\"oair_worldbook_maxchars\" class=\"text_pole\" type=\"number\" min=\"0\" placeholder=\"800\"></div>\n    </div>\n\n    <div class=\"oair-tab-panel\" id=\"oair_panel_prompts\">\n        <div class=\"oair-section\"><div class=\"oair-section-title\">主模型提示注入</div><textarea id=\"oair_main_prompt\" class=\"text_pole\" rows=\"8\" style=\"width:100%; box-sizing:border-box;\" placeholder=\"主模型提示注入\"></textarea><label class=\"oair-toggle-label\" style=\"margin-top:8px;\"><input id=\"oair_message_gen_enabled\" type=\"checkbox\">启用消息按钮生图</label></div>\n        <div class=\"oair-section\"><div class=\"oair-section-title\">提示词模板</div><details class=\"oair-details\"><summary>Chat Completions 图片模板</summary><div class=\"oair-details-content\"><textarea id=\"oair_prompt_template\" class=\"text_pole\" rows=\"3\" style=\"width:100%; box-sizing:border-box;\"></textarea></div></details><details class=\"oair-details\"><summary>Images API 图片模板</summary><div class=\"oair-details-content\"><textarea id=\"oair_images_prompt_template\" class=\"text_pole\" rows=\"2\" style=\"width:100%; box-sizing:border-box;\"></textarea></div></details><details class=\"oair-details\" open><summary>精修模板（编译后可选）</summary><div class=\"oair-details-content\"><textarea id=\"oair_optimize_template\" class=\"text_pole\" rows=\"10\" style=\"width:100%; box-sizing:border-box;\"></textarea><div class=\"oair-btn-row\"><button id=\"oair_btn_reset_optimize_template\" class=\"menu_button\" style=\"flex:1; justify-content:center;\">↺ 重置为编译后精修模板</button></div></div></details><details class=\"oair-details\"><summary>多图分析模板</summary><div class=\"oair-details-content\"><textarea id=\"oair_multi_analysis_template\" class=\"text_pole\" rows=\"8\" style=\"width:100%; box-sizing:border-box;\"></textarea></div></details><details class=\"oair-details\"><summary>漫画分镜模板</summary><div class=\"oair-details-content\"><textarea id=\"oair_comic_analysis_template\" class=\"text_pole\" rows=\"8\" style=\"width:100%; box-sizing:border-box;\"></textarea></div></details><details class=\"oair-details\"><summary>分析模板</summary><div class=\"oair-details-content\"><textarea id=\"oair_analysis_template\" class=\"text_pole\" rows=\"6\" style=\"width:100%; box-sizing:border-box;\"></textarea></div></details><details class=\"oair-details\"><summary>清洗模板</summary><div class=\"oair-details-content\"><textarea id=\"oair_cleanup_template\" class=\"text_pole\" rows=\"5\" style=\"width:100%; box-sizing:border-box;\" placeholder=\"预留：后续把清洗提示词模板集中到这里\"></textarea></div></details><details class=\"oair-details\"><summary>消息总结模板</summary><div class=\"oair-details-content\"><textarea id=\"oair_summarize_template\" class=\"text_pole\" rows=\"5\" style=\"width:100%; box-sizing:border-box;\"></textarea></div></details><details class=\"oair-details\"><summary>安全重写模板</summary><div class=\"oair-details-content\"><label class=\"oair-field-label\">安全重写级别</label><select id=\"oair_prompt_safety_level\" class=\"text_pole\" style=\"width:100%; box-sizing:border-box;\"><option value=\"strict\">严格</option><option value=\"standard\">标准（保留非血腥动作）</option><option value=\"loose\">宽松</option></select><textarea id=\"oair_nsfw_avoidance_template\" class=\"text_pole\" rows=\"7\" style=\"width:100%; box-sizing:border-box; margin-top:6px;\"></textarea><label class=\"oair-toggle-label\" style=\"margin-top:8px;\"><input id=\"oair_nsfw_avoidance\" type=\"checkbox\">启用安全重写</label></div></details><details class=\"oair-details\"><summary>提取正则</summary><div class=\"oair-details-content\"><label class=\"oair-field-label\">提取提示词正则</label><textarea id=\"oair_extraction_regex\" class=\"text_pole\" rows=\"2\" style=\"width:100%; box-sizing:border-box;\"></textarea><label class=\"oair-field-label\">返回图片正则回退</label><textarea id=\"oair_response_image_regex\" class=\"text_pole\" rows=\"2\" style=\"width:100%; box-sizing:border-box;\"></textarea></div></details></div>\n    </div>\n\n    <div class=\"oair-tab-panel\" id=\"oair_panel_models\">\n        <div class=\"oair-section\"><div class=\"oair-section-title\">一键 chatgpt2api 预设</div><button id=\"oair_btn_chatgpt2api_preset\" class=\"menu_button\" style=\"width:100%; justify-content:center;\">⚡ 一键 chatgpt2api 预设</button><div class=\"oair-hint\">Images 模式 / gpt-image-2 / b64_json / 超时 600s。</div></div>\n        <div class=\"oair-section\"><div class=\"oair-section-title\">图片后端连接</div><label class=\"oair-field-label\">API 模式</label><select id=\"oair_api_mode\" class=\"text_pole\" style=\"width:100%; box-sizing:border-box;\"><option value=\"chat\">Chat Completions</option><option value=\"images\">Images API</option></select><label class=\"oair-field-label\">服务地址</label><input id=\"oair_service_url\" class=\"text_pole\" style=\"width:100%; box-sizing:border-box;\" placeholder=\"http://127.0.0.1:8199/v1\"><label class=\"oair-field-label\">API 密钥</label><div class=\"oair-password-row\"><input id=\"oair_api_key\" type=\"password\" class=\"text_pole\" placeholder=\"sk-any\"><button type=\"button\" class=\"oair-eye-btn\" title=\"显示/隐藏密钥\"><i class=\"fa-solid fa-eye\"></i></button></div><label class=\"oair-field-label\">模型</label><div class=\"oair-model-row\"><input id=\"oair_model\" class=\"text_pole\" placeholder=\"any\"><button id=\"oair_btn_fetch_model\" class=\"menu_button\">获取模型</button></div><select id=\"oair_model_select\" class=\"text_pole\"></select><label class=\"oair-field-label\">超时（毫秒）</label><div class=\"oair-save-row\"><input id=\"oair_timeout_ms\" type=\"number\" min=\"1000\" step=\"1000\" class=\"text_pole\" placeholder=\"120000\"><button id=\"oair_btn_save_api\" class=\"menu_button\">💾 保存设置</button></div><div class=\"oair-row\"><div><label class=\"oair-field-label\">图片尺寸</label><select id=\"oair_image_size\" class=\"text_pole\" style=\"width:100%; box-sizing:border-box;\"><option value=\"256x256\">256x256</option><option value=\"512x512\">512x512</option><option value=\"1024x1024\">1024x1024</option><option value=\"1024x1792\">1024x1792</option><option value=\"1792x1024\">1792x1024</option></select></div><div><label class=\"oair-field-label\">生成数量</label><input id=\"oair_image_count\" type=\"number\" min=\"1\" max=\"10\" class=\"text_pole\" style=\"width:100%; box-sizing:border-box;\"></div></div><label class=\"oair-field-label\">响应格式</label><select id=\"oair_image_response_format\" class=\"text_pole\" style=\"width:100%; box-sizing:border-box;\"><option value=\"url\">URL</option><option value=\"b64_json\">Base64</option></select><label class=\"oair-field-label\">额外请求体 JSON</label><textarea id=\"oair_extra_body\" class=\"text_pole\" rows=\"3\" style=\"width:100%; box-sizing:border-box;\" placeholder='{\"preset_name\":\"image\"}'></textarea></div>\n        <div class=\"oair-section\"><div class=\"oair-section-title\">文本步骤模型</div><label class=\"oair-toggle-label\"><input id=\"oair_optimize_enabled\" type=\"checkbox\">启用编译后精修</label><label class=\"oair-toggle-label\" style=\"margin-top:8px;\"><input id=\"oair_optimize_auto\" type=\"checkbox\">自动精修编译提示词</label><label class=\"oair-field-label\">文本回复长度上限 max_tokens</label><input id=\"oair_text_max_tokens\" class=\"text_pole\" type=\"number\" min=\"256\" step=\"256\" placeholder=\"8192\"><label class=\"oair-toggle-label\" style=\"margin-top:10px;\"><input id=\"oair_optimize_use_custom\" type=\"checkbox\">使用自定义精修 LLM 后端</label><div class=\"oair-custom-backend-content\" id=\"oair_custom_backend_fields\"><div class=\"oair-section-title\" style=\"font-size:.82em; margin-top:8px;\">自定义精修 LLM 后端</div><label class=\"oair-field-label\">精修 LLM 服务地址</label><input id=\"oair_optimize_api_url\" class=\"text_pole\" style=\"width:100%; box-sizing:border-box;\" placeholder=\"http://127.0.0.1:11434/v1\"><label class=\"oair-field-label\">精修 LLM API 密钥</label><div class=\"oair-password-row\"><input id=\"oair_optimize_api_key\" type=\"password\" class=\"text_pole\" placeholder=\"sk-...\"><button type=\"button\" class=\"oair-eye-btn\" title=\"显示/隐藏密钥\"><i class=\"fa-solid fa-eye\"></i></button></div><label class=\"oair-field-label\">精修 LLM 模型</label><div class=\"oair-model-row\"><input id=\"oair_optimize_model\" class=\"text_pole\" placeholder=\"gpt-4o-mini\"><button id=\"oair_btn_fetch_optimize_model\" class=\"menu_button\">获取模型</button></div><select id=\"oair_optimize_model_select\" class=\"text_pole\"></select></div></div>\n    </div>\n\n    <div class=\"oair-tab-panel\" id=\"oair_panel_history\">\n        <div class=\"oair-section\"><div class=\"oair-history-toolbar\"><div class=\"oair-section-title\" style=\"margin:0;\">图库历史 <span id=\"oair_gallery_count\" class=\"oair-badge oair-badge-green\">0 张</span></div><div class=\"oair-history-actions oair-gallery-actions\"><button id=\"oair_btn_gallery_refresh\" class=\"menu_button\">刷新</button><button id=\"oair_btn_gallery_clear\" class=\"menu_button\">清空图库</button></div></div><div class=\"oair-hint\">点击缩略图放大；清空图库只清记录，不删磁盘文件。刷新/清空按钮保持横向排布，避免中文竖排。</div><div id=\"oair_gallery_grid\" class=\"oair-gallery-grid\" style=\"margin-top:8px;\"></div></div>\n        <div class=\"oair-section\"><div class=\"oair-history-toolbar\"><div class=\"oair-section-title\" style=\"margin:0;\">生成历史 <span id=\"oair_generation_history_count\" class=\"oair-badge oair-badge-orange\">0 条</span></div><div class=\"oair-history-actions\"><button id=\"oair_btn_history_refresh\" class=\"menu_button\">刷新</button><button id=\"oair_btn_history_clear\" class=\"menu_button\">清空历史</button></div></div><div id=\"oair_generation_history_list\" class=\"oair-history-list\" style=\"margin-top:8px;\"></div></div>\n        <div class=\"oair-section\"><div class=\"oair-section-title\">失败记录</div><div id=\"oair_failed_history_list\" class=\"oair-history-list\"></div></div>\n        <div class=\"oair-section\"><div class=\"oair-section-title\">重试入口</div><div id=\"oair_retry_history_list\" class=\"oair-history-list\"></div></div>\n    </div>\n</div>\n";
 /**
  * 加载完整设置 HTML 到悬浮窗 body，并初始化绑定和默认标签
  */
@@ -218,15 +490,26 @@ function loadFullSettings(body, html) {
     // Set default tab
     const s = extension_settings[extensionName];
     const tabMap = {
-        basic: "#oair_tab_basic",
-        backend: "#oair_tab_backend",
-        extract: "#oair_tab_extract",
-        optimize: "#oair_tab_optimize",
-        worldbook: "#oair_tab_worldbook",
-        manual: "#oair_tab_manual",
-        gallery: "#oair_tab_gallery",
+        workbench: "#oair_tab_workbench",
+        generate: "#oair_tab_workbench",
+        manual: "#oair_tab_workbench",
+        library: "#oair_tab_library",
+        style: "#oair_tab_library",
+        character: "#oair_tab_library",
+        worldbook: "#oair_tab_library",
+        scene: "#oair_tab_library",
+        prompts: "#oair_tab_prompts",
+        templates: "#oair_tab_prompts",
+        extract: "#oair_tab_prompts",
+        models: "#oair_tab_models",
+        basic: "#oair_tab_models",
+        backend: "#oair_tab_models",
+        text: "#oair_tab_models",
+        optimize: "#oair_tab_models",
+        history: "#oair_tab_history",
+        gallery: "#oair_tab_history",
     };
-    const targetTab = tabMap[s.floatingDefaultTab] || tabMap.manual;
+    const targetTab = tabMap[s.floatingDefaultTab] || tabMap.workbench;
     $(targetTab).prop("checked", true);
 }
 
@@ -266,12 +549,24 @@ $(function () {
         }
 
         eventSource.on(event_types.MESSAGE_RECEIVED, onMessageReceived);
-        eventSource.on(event_types.MESSAGE_RENDERED, onMessageRendered);
+        eventSource.on(event_types.CHARACTER_MESSAGE_RENDERED, onMessageRendered);
+        eventSource.on(event_types.USER_MESSAGE_RENDERED, onMessageRendered);
+        eventSource.on(event_types.MORE_MESSAGES_LOADED, injectMessageActionsForVisibleMessages);
+        eventSource.on(event_types.CHAT_LOADED, () => setTimeout(injectMessageActionsForVisibleMessages, 300));
+        setTimeout(injectMessageActionsForVisibleMessages, 0);
+        setTimeout(injectMessageActionsForVisibleMessages, 1500);
 
         // 聊天切换时清理 inFlightMessages，避免旧聊天的 key 残留
         eventSource.on(event_types.CHAT_CHANGED, () => {
             inFlightMessages.clear();
+            cancelAutomaticMessageTasks();
+            automaticMessageInFlight.clear();
             clearWorldBookCache();
+            manualWorkbenchState.characterCandidates = [];
+            manualWorkbenchState.confirmedCharacters = [];
+            updateFloatingUi();
+            refreshWorkbenchCharacterCandidates();
+            setTimeout(injectMessageActionsForVisibleMessages, 300);
         });
     })();
 });
@@ -517,11 +812,153 @@ function removeFab() {
 
 // ─── L2: Floating Panel ──────────────────────────────────────
 
+let floatingViewportFitTimer = null;
+let floatingVisualScopeRefreshTimer = null;
+let lastRenderedVisualScopeKey = "";
+const FLOATING_VISUAL_SCOPE_REFRESH_MS = 350;
+
+function getFloatingPanelViewportMargin() {
+    return window.innerWidth <= 400 ? 4 : 8;
+}
+
+function fitFloatingPanelToViewport(panelLike) {
+    const panel = $(panelLike);
+    const el = panel[0];
+    if (!el) return;
+
+    const margin = getFloatingPanelViewportMargin();
+    const viewportWidth = Math.max(0, window.innerWidth || document.documentElement?.clientWidth || 0);
+    const viewportHeight = Math.max(0, window.innerHeight || document.documentElement?.clientHeight || 0);
+    const availableWidth = Math.max(240, viewportWidth - margin * 2);
+    const availableHeight = Math.max(220, viewportHeight - margin * 2);
+
+    el.style.setProperty("box-sizing", "border-box", "important");
+    el.style.setProperty("max-width", `${availableWidth}px`, "important");
+    el.style.setProperty("max-height", `${availableHeight}px`, "important");
+    el.style.setProperty("min-width", availableWidth < 520 ? "0" : "520px", "important");
+    el.style.setProperty("min-height", `${Math.min(460, availableHeight)}px`, "important");
+
+    if (availableWidth < 640) {
+        el.style.setProperty("width", `${availableWidth}px`, "important");
+    } else {
+        el.style.removeProperty("width");
+    }
+
+    if (availableHeight < 460) {
+        el.style.setProperty("height", `${availableHeight}px`, "important");
+    } else {
+        el.style.removeProperty("height");
+    }
+
+    clampFloatingPanelToViewport(panel);
+}
+
+function clampFloatingPanelToViewport(panelLike) {
+    const panel = $(panelLike);
+    const el = panel[0];
+    if (!el) return;
+
+    const margin = getFloatingPanelViewportMargin();
+    for (let i = 0; i < 3; i++) {
+        const rect = el.getBoundingClientRect();
+        const maxRight = window.innerWidth - margin;
+        const maxBottom = window.innerHeight - margin;
+        let dx = 0;
+        let dy = 0;
+
+        if (rect.width > window.innerWidth - margin * 2) {
+            dx = margin - rect.left;
+        } else if (rect.left < margin) {
+            dx = margin - rect.left;
+        } else if (rect.right > maxRight) {
+            dx = maxRight - rect.right;
+        }
+
+        if (rect.height > window.innerHeight - margin * 2) {
+            dy = margin - rect.top;
+        } else if (rect.top < margin) {
+            dy = margin - rect.top;
+        } else if (rect.bottom > maxBottom) {
+            dy = maxBottom - rect.bottom;
+        }
+
+        if (Math.abs(dx) <= 0.5 && Math.abs(dy) <= 0.5) break;
+
+        const left = Number.parseFloat(panel.css("left"));
+        const top = Number.parseFloat(panel.css("top"));
+
+        if (Number.isFinite(left) && Math.abs(dx) > 0.5) {
+            el.style.setProperty("transform", "none", "important");
+            el.style.setProperty("left", `${Math.max(margin, left + dx)}px`, "important");
+        }
+        if (Number.isFinite(top) && Math.abs(dy) > 0.5) {
+            el.style.setProperty("top", `${Math.max(margin, top + dy)}px`, "important");
+        }
+    }
+}
+
+function bindFloatingViewportFit(panelLike) {
+    const panel = $(panelLike);
+    if (!panel.length) return;
+
+    $(window).off("resize.oair_floating orientationchange.oair_floating");
+    $(window).on("resize.oair_floating orientationchange.oair_floating", function () {
+        if (!panel.hasClass("oair-floating--visible")) return;
+        if (floatingViewportFitTimer) window.clearTimeout(floatingViewportFitTimer);
+        floatingViewportFitTimer = window.setTimeout(() => {
+            floatingViewportFitTimer = null;
+            fitFloatingPanelToViewport(panel);
+        }, 40);
+    });
+
+    fitFloatingPanelToViewport(panel);
+}
+
+function refreshFloatingUiIfVisualScopeChanged() {
+    const panel = $("#oair_floating_panel");
+    if (!panel.length || !panel.hasClass("oair-floating--visible")) return;
+
+    const currentScopeKey = createChatVisualScopeKey(getCurrentChatVisualContext());
+    if (!lastRenderedVisualScopeKey) {
+        lastRenderedVisualScopeKey = currentScopeKey;
+        return;
+    }
+    if (currentScopeKey === lastRenderedVisualScopeKey) return;
+
+    manualWorkbenchState.characterCandidates = [];
+    manualWorkbenchState.confirmedCharacters = [];
+    updateFloatingUi();
+    refreshWorkbenchCharacterCandidates();
+}
+
+function startFloatingVisualScopeWatch(panelLike = "#oair_floating_panel") {
+    const panel = $(panelLike);
+    if (!panel.length) return;
+
+    stopFloatingVisualScopeWatch();
+    refreshFloatingUiIfVisualScopeChanged();
+    floatingVisualScopeRefreshTimer = window.setInterval(() => {
+        refreshFloatingUiIfVisualScopeChanged();
+    }, FLOATING_VISUAL_SCOPE_REFRESH_MS);
+    $(window).off("focus.oair_visualscope").on("focus.oair_visualscope", refreshFloatingUiIfVisualScopeChanged);
+    $(document).off("visibilitychange.oair_visualscope").on("visibilitychange.oair_visualscope", refreshFloatingUiIfVisualScopeChanged);
+}
+
+function stopFloatingVisualScopeWatch() {
+    if (floatingVisualScopeRefreshTimer) {
+        window.clearInterval(floatingVisualScopeRefreshTimer);
+        floatingVisualScopeRefreshTimer = null;
+    }
+    $(window).off("focus.oair_visualscope");
+    $(document).off("visibilitychange.oair_visualscope");
+    lastRenderedVisualScopeKey = "";
+}
+
 async function createFloatingPanel() {
     if ($("#oair_floating_panel").length) return;
 
     const panel = $(`
-        <div id="oair_floating_panel" style="min-height:460px; height:auto; position:fixed; z-index:3000; overflow:hidden; flex-direction:column;">
+        <div id="oair_floating_panel" style="min-height:460px; height:auto; position:fixed; z-index:3200; overflow:hidden; flex-direction:column;">
             <div class="oair-floating-header">
                 <h3>🖼️ 图片中继 - 详细配置</h3>
                 <button class="oair-floating-close" title="关闭"><i class="fa-solid fa-xmark"></i></button>
@@ -562,6 +999,8 @@ async function createFloatingPanel() {
         console.log(`[${extensionName}] Using inline settings HTML (file load failed)`);
         loadFullSettings(body, SETTINGS_FULL_HTML);
     }
+    bindFloatingViewportFit(panel);
+    startFloatingVisualScopeWatch(panel);
 
     // Draggable via header (mouse + touch)
     let headerDragging = false;
@@ -587,6 +1026,7 @@ async function createFloatingPanel() {
     }
 
     function endDrag() {
+        if (headerDragging) clampFloatingPanelToViewport(panel);
         headerDragging = false;
     }
 
@@ -651,10 +1091,20 @@ function closeFloatingPanel() {
         visibility: "",
         minHeight: "",
         height: "",
+        width: "",
+        maxWidth: "",
+        maxHeight: "",
+        minWidth: "",
     });
 
     // Clean up document-level event handlers (mouse + touch + keyboard)
     $(document).off("mousemove.oair_floating mouseup.oair_floating touchmove.oair_floating touchend.oair_floating touchcancel.oair_floating keydown.oair_floating");
+    $(window).off("resize.oair_floating orientationchange.oair_floating");
+    if (floatingViewportFitTimer) {
+        window.clearTimeout(floatingViewportFitTimer);
+        floatingViewportFitTimer = null;
+    }
+    stopFloatingVisualScopeWatch();
 
     // Sync panel UI when closing (in case enabled/fabEnabled changed in floating window)
     updatePanelUi();
@@ -681,6 +1131,7 @@ function toggleFloatingPanel() {
 
         // 强制浏览器重绘
         void newPanel[0]?.offsetHeight;
+        bindFloatingViewportFit(newPanel);
 
         // 调试日志：输出面板实际尺寸
         const rect = newPanel[0]?.getBoundingClientRect();
@@ -727,6 +1178,7 @@ function toggleFloatingPanel() {
         });
 
         $(document).on("mouseup.oair_floating", function () {
+            if (headerDragging) clampFloatingPanelToViewport(panel);
             headerDragging = false;
         });
 
@@ -748,6 +1200,7 @@ function toggleFloatingPanel() {
         }, { passive: false });
 
         $(document).on("touchend.oair_floating touchcancel.oair_floating", function () {
+            if (headerDragging) clampFloatingPanelToViewport(panel);
             headerDragging = false;
         });
 
@@ -763,15 +1216,26 @@ function toggleFloatingPanel() {
         // Set default tab
         const s = extension_settings[extensionName];
         const tabMap = {
-            basic: "#oair_tab_basic",
-            backend: "#oair_tab_backend",
-            extract: "#oair_tab_extract",
-            optimize: "#oair_tab_optimize",
-            worldbook: "#oair_tab_worldbook",
-            manual: "#oair_tab_manual",
-            gallery: "#oair_tab_gallery",
+            workbench: "#oair_tab_workbench",
+            generate: "#oair_tab_workbench",
+            manual: "#oair_tab_workbench",
+            library: "#oair_tab_library",
+            style: "#oair_tab_library",
+            character: "#oair_tab_library",
+            worldbook: "#oair_tab_library",
+            scene: "#oair_tab_library",
+            prompts: "#oair_tab_prompts",
+            templates: "#oair_tab_prompts",
+            extract: "#oair_tab_prompts",
+            models: "#oair_tab_models",
+            basic: "#oair_tab_models",
+            backend: "#oair_tab_models",
+            text: "#oair_tab_models",
+            optimize: "#oair_tab_models",
+            history: "#oair_tab_history",
+            gallery: "#oair_tab_history",
         };
-        const targetTab = tabMap[s.floatingDefaultTab] || tabMap.manual;
+        const targetTab = tabMap[s.floatingDefaultTab] || tabMap.workbench;
         $(targetTab).prop("checked", true);
 
         panel.addClass("oair-floating--visible");
@@ -786,6 +1250,8 @@ function toggleFloatingPanel() {
 
         // 强制浏览器重绘
         void panel[0]?.offsetHeight;
+        bindFloatingViewportFit(panel);
+        startFloatingVisualScopeWatch(panel);
 
         // 调试日志
         const rect = panel[0]?.getBoundingClientRect();
@@ -813,6 +1279,49 @@ function bindFloatingEvents() {
     bindSettingInput("#oair_main_prompt", "mainPrompt", () => fp.find("#oair_main_prompt").val());
     bindSettingInput("#oair_message_gen_enabled", "messageGenEnabled", () => fp.find("#oair_message_gen_enabled").prop("checked"));
     bindSettingInput("#oair_summarize_template", "summarizeTemplate", () => fp.find("#oair_summarize_template").val());
+    bindSettingInput("#oair_automatic_flow_enabled", "automaticFlowEnabled", () => fp.find("#oair_automatic_flow_enabled").prop("checked"));
+    bindSettingInput("#oair_automatic_flow_follow_workbench", "automaticFlowFollowWorkbench", () => fp.find("#oair_automatic_flow_follow_workbench").prop("checked"));
+    bindSettingInput("#oair_automatic_flow_min_chars", "automaticFlowMinChars", () => Math.max(0, Number(fp.find("#oair_automatic_flow_min_chars").val()) || 0));
+    bindSettingInput("#oair_automatic_flow_failure_policy", "automaticFlowFailurePolicy", () => normalizeAutomaticFlowFailurePolicy(fp.find("#oair_automatic_flow_failure_policy").val()));
+    bindSettingInput("#oair_automatic_flow_show_queue", "automaticFlowShowQueue", () => fp.find("#oair_automatic_flow_show_queue").prop("checked"));
+    bindSettingInput("#oair_automatic_flow_cancel_enabled", "automaticFlowCancelEnabled", () => fp.find("#oair_automatic_flow_cancel_enabled").prop("checked"));
+    bindSettingInput("#oair_multi_image_enabled", "multiImageEnabled", () => {
+        const checked = fp.find("#oair_multi_image_enabled").prop("checked");
+        // 与生成模式选择器联动：勾选=多图，取消=单图（不影响 comic 之外的状态）
+        const s = extension_settings[extensionName];
+        s.generationMode = checked ? "multi" : (s.generationMode === "multi" ? "single" : s.generationMode);
+        fp.find("#oair_generation_mode").val(normalizeGenerationMode(s.generationMode));
+        return checked;
+    });
+    bindSettingInput("#oair_generation_mode", "generationMode", () => {
+        const mode = normalizeGenerationMode(fp.find("#oair_generation_mode").val());
+        // 同步旧开关，保持 Phase 4 兼容
+        extension_settings[extensionName].multiImageEnabled = mode === "multi";
+        fp.find("#oair_multi_image_enabled").prop("checked", mode === "multi");
+        return mode;
+    });
+    bindSettingInput("#oair_default_beat_count", "defaultBeatCount", () => normalizeBeatCount(fp.find("#oair_default_beat_count").val()));
+    bindSettingInput("#oair_multi_image_failure_policy", "multiImageFailurePolicy", () => normalizePlanFailurePolicy(fp.find("#oair_multi_image_failure_policy").val()));
+    bindSettingInput("#oair_comic_panel_count", "comicPanelCount", () => normalizeComicPanelCount(fp.find("#oair_comic_panel_count").val()));
+    bindSettingInput("#oair_comic_dialogue_enabled", "comicDialogueEnabled", () => fp.find("#oair_comic_dialogue_enabled").prop("checked"));
+    bindSettingInput("#oair_comic_dialogue_mode", "comicDialogueMode", () => normalizeComicDialogueMode(fp.find("#oair_comic_dialogue_mode").val()));
+    bindSettingInput("#oair_comic_failure_policy", "comicFailurePolicy", () => normalizePlanFailurePolicy(fp.find("#oair_comic_failure_policy").val()));
+    bindSettingInput("#oair_continuity_mode", "continuityMode", () => normalizeContinuityMode(fp.find("#oair_continuity_mode").val()));
+    fp.find("#oair_btn_cancel_auto_queue").off("click.oair_auto").on("click.oair_auto", (e) => {
+        e.preventDefault();
+        const s = extension_settings[extensionName];
+        if (!s.automaticFlowCancelEnabled) {
+            toastr.warning("自动任务取消功能未启用。");
+            return;
+        }
+        const chatId = getContext()?.chatId || "chat";
+        const cancelled = cancelAutomaticMessageTasks(chatId);
+        if (cancelled) {
+            toastr.info(`已请求取消 ${cancelled} 个自动任务。`);
+        } else {
+            toastr.info("当前没有可取消的自动任务。");
+        }
+    });
 
     // ─── 后端设置 ──────────────────────────────────────────
     bindSettingInput("#oair_api_mode", "apiMode", () => fp.find("#oair_api_mode").val());
@@ -844,17 +1353,85 @@ function bindFloatingEvents() {
     bindSettingInput("#oair_optimize_enabled", "optimizeEnabled", () => fp.find("#oair_optimize_enabled").prop("checked"));
     bindSettingInput("#oair_optimize_auto", "optimizeAuto", () => fp.find("#oair_optimize_auto").prop("checked"));
     bindSettingInput("#oair_optimize_template", "optimizeTemplate", () => fp.find("#oair_optimize_template").val());
+    bindSettingInput("#oair_multi_analysis_template", "multiAnalysisTemplate", () => fp.find("#oair_multi_analysis_template").val());
+    bindSettingInput("#oair_comic_analysis_template", "comicAnalysisTemplate", () => fp.find("#oair_comic_analysis_template").val());
+    bindSettingInput("#oair_analysis_template", "analysisTemplate", () => fp.find("#oair_analysis_template").val());
+    bindSettingInput("#oair_cleanup_template", "cleanupTemplate", () => fp.find("#oair_cleanup_template").val());
+    bindSettingInput("#oair_single_image_strategy", "singleImageStrategy", () => normalizeSingleImageStrategy(fp.find("#oair_single_image_strategy").val()));
+    bindSettingInput("#oair_visual_sanitization_level", "visualSanitizationLevel", () => normalizeVisualSanitizationLevel(fp.find("#oair_visual_sanitization_level").val()));
+    bindSettingInput("#oair_prompt_safety_level", "promptSafetyLevel", () => normalizePromptSafetyLevel(fp.find("#oair_prompt_safety_level").val()));
     bindSettingInput("#oair_text_max_tokens", "textMaxTokens", () => Number(fp.find("#oair_text_max_tokens").val()) || 8192);
-    bindSettingInput("#oair_character_appearance", "characterAppearance", () => fp.find("#oair_character_appearance").val());
-    bindSettingInput("#oair_style_library", "styleLibrary", () => fp.find("#oair_style_library").val());
-    bindSettingInput("#oair_style_active", "styleActive", () => fp.find("#oair_style_active").val());
+    // ─── 设定库（风格 / 人物 / 场景）───────────────────────────
+    bindVisualScopeInput("#oair_character_appearance", "characterAppearance", () => fp.find("#oair_character_appearance").val());
+    bindVisualScopeInput("#oair_style_library", "styleLibrary", () => fp.find("#oair_style_library").val());
+    bindVisualScopeInput("#oair_style_active", "styleActive", () => fp.find("#oair_style_active").val());
+    bindVisualScopeInput("#oair_scene_library", "sceneLibrary", () => fp.find("#oair_scene_library").val());
+    bindVisualScopeInput("#oair_scene_active", "sceneActive", () => fp.find("#oair_scene_active").val());
     bindSettingInput("#oair_style_auto_select", "styleAutoSelect", () => fp.find("#oair_style_auto_select").prop("checked"));
     bindSettingInput("#oair_character_llm_extract", "characterLlmExtract", () => fp.find("#oair_character_llm_extract").prop("checked"));
-    bindSettingInput("#oair_worldbook_enabled", "worldBookEnabled", () => fp.find("#oair_worldbook_enabled").prop("checked"));
+    bindSettingInput("#oair_auto_extract_characters", "autoExtractCharactersEnabled", () => fp.find("#oair_auto_extract_characters").prop("checked"));
+    bindSettingInput("#oair_auto_extract_scenes", "autoExtractScenesEnabled", () => fp.find("#oair_auto_extract_scenes").prop("checked"));
+    bindSettingInput("#oair_scene_auto_select", "sceneAutoSelect", () => fp.find("#oair_scene_auto_select").prop("checked"));
+    fp.find("#oair_btn_import_builtin_styles").off("click.oair_styles").on("click.oair_styles", (e) => {
+        e.preventDefault();
+        importBuiltInStylesIntoCurrentCard();
+    });
+    fp.find("#oair_btn_style_library").off("click.oair_lib").on("click.oair_lib", (e) => {
+        e.preventDefault();
+        openLibraryModal("style");
+    });
+    fp.find("#oair_btn_character_library").off("click.oair_lib").on("click.oair_lib", (e) => {
+        e.preventDefault();
+        openLibraryModal("character");
+    });
+    fp.find("#oair_btn_scene_library").off("click.oair_lib").on("click.oair_lib", (e) => {
+        e.preventDefault();
+        openLibraryModal("scene");
+    });
+    fp.find("#oair_btn_character_clear").off("click.oair_lib").on("click.oair_lib", (e) => {
+        e.preventDefault();
+        clearLibrary("character");
+    });
+    fp.find("#oair_btn_scene_clear").off("click.oair_lib").on("click.oair_lib", (e) => {
+        e.preventDefault();
+        clearLibrary("scene");
+    });
+    fp.find("#oair_btn_character_from_chat").off("click.oair_extract").on("click.oair_extract", async (e) => {
+        e.preventDefault();
+        await extractLibraryFromChat("character");
+    });
+    fp.find("#oair_btn_character_from_worldbook").off("click.oair_extract").on("click.oair_extract", async (e) => {
+        e.preventDefault();
+        await extractLibraryFromWorldBook("character");
+    });
+    fp.find("#oair_btn_scene_from_chat").off("click.oair_extract").on("click.oair_extract", async (e) => {
+        e.preventDefault();
+        await extractLibraryFromChat("scene");
+    });
+    fp.find("#oair_btn_scene_from_worldbook").off("click.oair_extract").on("click.oair_extract", async (e) => {
+        e.preventDefault();
+        await extractLibraryFromWorldBook("scene");
+    });
+    fp.find('input[name="oair_character_worldbook_mode"]').off("change.oair_mode").on("change.oair_mode", function () {
+        const mode = String($(this).val() || "off");
+        const s = extension_settings[extensionName];
+        s.characterWorldBookMode = ["off", "inject", "extract"].includes(mode) ? mode : "off";
+        normalizeWorldBookModes(s, { hadCharacterMode: true, hadSceneMode: true });
+        saveSettingsDebounced();
+        renderAllLibrarySummaries();
+    });
+    fp.find('input[name="oair_scene_worldbook_mode"]').off("change.oair_mode").on("change.oair_mode", function () {
+        const mode = String($(this).val() || "off");
+        const s = extension_settings[extensionName];
+        s.sceneWorldBookMode = ["off", "inject", "extract"].includes(mode) ? mode : "off";
+        normalizeWorldBookModes(s, { hadCharacterMode: true, hadSceneMode: true });
+        saveSettingsDebounced();
+        renderAllLibrarySummaries();
+    });
     bindSettingInput("#oair_worldbook_headings", "worldBookSectionHeadings", () => fp.find("#oair_worldbook_headings").val());
     bindSettingInput("#oair_worldbook_maxchars", "worldBookMaxChars", () => Number(fp.find("#oair_worldbook_maxchars").val()) || 0);
 
-    // 自定义优化LLM后端复选框
+    // 自定义精修 LLM 后端复选框
     bindSettingInput("#oair_optimize_use_custom", "optimizeUseCustom", () => fp.find("#oair_optimize_use_custom").prop("checked"));
     fp.find("#oair_optimize_use_custom").off("change.oair_toggle").on("change.oair_toggle", function () {
         const isChecked = $(this).prop("checked");
@@ -867,7 +1444,7 @@ function bindFloatingEvents() {
     bindSettingInput("#oair_optimize_model", "optimizeModel", () => fp.find("#oair_optimize_model").val());
     bindSettingInput("#oair_optimize_api_key", "optimizeApiKey", () => fp.find("#oair_optimize_api_key").val());
 
-    // 获取自定义优化LLM模型列表按钮
+    // 获取自定义精修 LLM 模型列表按钮
     fp.find("#oair_btn_fetch_optimize_model").off("click").on("click", async (e) => {
         e.preventDefault();
         const btn = fp.find("#oair_btn_fetch_optimize_model");
@@ -900,7 +1477,7 @@ function bindFloatingEvents() {
         }
     });
 
-    // ─── NSFW 规避 ──────────────────────────────────────────
+    // ─── 安全重写 ──────────────────────────────────────────
     bindSettingInput("#oair_nsfw_avoidance", "nsfwAvoidance", () => fp.find("#oair_nsfw_avoidance").prop("checked"));
     bindSettingInput("#oair_nsfw_avoidance_template", "nsfwAvoidanceTemplate", () => fp.find("#oair_nsfw_avoidance_template").val());
 
@@ -910,8 +1487,14 @@ function bindFloatingEvents() {
     fp.find("#oair_btn_clear_manual").off("click").on("click", (e) => {
         e.preventDefault();
         fp.find("#oair_manual_preview").empty();
+        fp.find("#oair_plan_progress").empty();
         fp.find("#oair_manual_optimized_prompt").hide();
         fp.find("#oair_manual_optimized_text").text("");
+        fp.find("#oair_manual_prompt").val("");
+        manualWorkbenchState.characterCandidates = [];
+        manualWorkbenchState.confirmedCharacters = [];
+        manualWorkbenchState.lastJobs = [];
+        renderCharacterConfirmationUi();
         setStatus("预览已清空");
     });
 
@@ -923,6 +1506,7 @@ function bindFloatingEvents() {
             fp.find("#oair_manual_optimized_text").text("");
             setStatus("提示词已修改，已清除旧的优化结果");
         }
+        refreshWorkbenchCharacterCandidates();
     });
 
     // ─── 导入消息 ──────────────────────────────────────────
@@ -955,6 +1539,7 @@ function bindFloatingEvents() {
         // 清除之前的优化结果
         fp.find("#oair_manual_optimized_prompt").hide();
         fp.find("#oair_manual_optimized_text").text("");
+        refreshWorkbenchCharacterCandidates();
         toastr.success("已导入消息内容");
     });
 
@@ -992,9 +1577,9 @@ function bindFloatingEvents() {
             lastAssistantIdx = chat.length - 1;
             lastAssistantMsg = chat[lastAssistantIdx];
         }
-        attachGeneratedImages(lastAssistantMsg, previewImgs, ["手动生图"]);
+        attachGeneratedImages(lastAssistantMsg, previewImgs, ["手动生图"], createDialogueAttachmentMetadata(manualWorkbenchState.lastJobs));
         // 仅附加图片，不重新渲染正文（rerenderMessage:false）——保留该消息已渲染的 HTML，避免被重置回源码格式
-        updateMessageBlock(lastAssistantIdx, lastAssistantMsg, { rerenderMessage: false });
+        await updateMessageBlockWhenReady(lastAssistantIdx, lastAssistantMsg, { rerenderMessage: false });
         try { await context.saveChat(); } catch (_) {}
         toastr.success(`已附加 ${previewImgs.length} 张图片到消息`);
     });
@@ -1070,19 +1655,21 @@ function bindFloatingEvents() {
         toastr.success("已应用 chatgpt2api 预设：Images 模式 / gpt-image-2 / b64_json / 超时 600s。请确认服务地址与 API 密钥。");
     });
 
-    // 重置优化模板为 5 模块新模板
+    // 重置精修模板为编译后轻量精修模板
     fp.find("#oair_btn_reset_optimize_template").off("click").on("click", (e) => {
         e.preventDefault();
         const s = extension_settings[extensionName];
         s.optimizeTemplate = DEFAULT_OPTIMIZE_TEMPLATE;
         saveSettingsDebounced();
         fp.find("#oair_optimize_template").val(DEFAULT_OPTIMIZE_TEMPLATE);
-        setStatus("已重置优化模板为 5 模块版", "success");
-        toastr.success("优化模板已重置为内置 5 模块版（含 {{style}}/{{characters}} 占位符）。");
+        setStatus("已重置为编译后精修模板", "success");
+        toastr.success("精修模板已重置：保留编译器规划，只做轻量润色。");
     });
 
-    // 风格库内容变更 → 重建「当前固定风格」下拉
-    fp.find("#oair_style_library").off("input.oair_style").on("input.oair_style", () => populateStyleSelect());
+    // 隐藏存储字段被弹窗/提取按钮改写后，同步摘要。
+    fp.find("#oair_style_library, #oair_style_active, #oair_character_appearance, #oair_scene_library, #oair_scene_active")
+        .off("input.oair_library change.oair_library")
+        .on("input.oair_library change.oair_library", () => renderAllLibrarySummaries());
 
     // ─── 密码眼睛按钮 ──────────────────────────────────────
     fp.find(".oair-eye-btn").off("click").on("click", function () {
@@ -1101,6 +1688,7 @@ function bindFloatingEvents() {
     fp.find("#oair_btn_gallery_refresh").off("click").on("click", (e) => {
         e.preventDefault();
         refreshGalleryUi();
+        refreshGenerationHistoryUi();
     });
     fp.find("#oair_btn_gallery_clear").off("click").on("click", (e) => {
         e.preventDefault();
@@ -1109,6 +1697,21 @@ function bindFloatingEvents() {
             toastr.success("图库已清空");
         }
     });
+    fp.find("#oair_btn_history_refresh").off("click").on("click", (e) => {
+        e.preventDefault();
+        refreshGenerationHistoryUi();
+    });
+    fp.find("#oair_btn_history_clear").off("click").on("click", (e) => {
+        e.preventDefault();
+        if (confirm("清空生成历史记录？（不会删除磁盘图片文件）")) {
+            clearGenerationHistory();
+            toastr.success("生成历史已清空");
+        }
+    });
+
+    refreshWorkbenchCharacterCandidates();
+    renderPlanProgress(manualWorkbenchState.lastJobs);
+    refreshGenerationHistoryUi();
 }
 
 // ─── Generic Setting Input Binder ────────────────────────────
@@ -1121,6 +1724,671 @@ function bindSettingInput(selector, key, getter) {
         saveSettingsDebounced();
         applyMainPromptInjection();
     });
+}
+
+function bindVisualScopeInput(selector, key, getter) {
+    $(selector).off("input.oair change.oair").on("input.oair change.oair", () => {
+        saveCurrentChatVisualScopePatch({ [key]: getter() });
+        renderAllLibrarySummaries();
+        applyMainPromptInjection();
+    });
+}
+
+function getCurrentChatVisualContext() {
+    const ctx = getContext?.() || {};
+    const chatMetadata = ctx.chatMetadata || {};
+    let runtimeChatId = "";
+    try {
+        runtimeChatId = typeof ctx.getCurrentChatId === "function" ? ctx.getCurrentChatId() : "";
+    } catch (_) {}
+    const character = Array.isArray(ctx.characters) && ctx.characterId != null
+        ? ctx.characters[ctx.characterId]
+        : null;
+    const characterId = ctx.characterId ?? ctx.character?.id ?? character?.id ?? "";
+    const characterName = character?.name || ctx.name2 || ctx.characterName || ctx.name || "";
+    const characterAvatar = character?.avatar || ctx.characterAvatar || ctx.avatar || "";
+    return {
+        chatId: ctx.chatId || runtimeChatId || chatMetadata.chat_id || chatMetadata.chatId || chatMetadata.file_name || chatMetadata.name || "chat",
+        chatFile: chatMetadata.file_name || chatMetadata.filename || chatMetadata.chat_file || chatMetadata.name || "",
+        chatMetadata,
+        userName: ctx.userName || ctx.name1 || name1 || chatMetadata.userName || chatMetadata.name1 || "",
+        name1: ctx.name1 || name1 || chatMetadata.name1 || chatMetadata.userName || "",
+        personaName: ctx.personaName || ctx.userName || ctx.name1 || name1 || chatMetadata.personaName || chatMetadata.userName || "",
+        personaAppearance: ctx.personaAppearance || ctx.userAppearance || chatMetadata.personaAppearance || chatMetadata.userAppearance || "",
+        personaDescription: ctx.personaDescription || ctx.userDescription || chatMetadata.personaDescription || chatMetadata.userDescription || "",
+        characterId: characterId,
+        characterName: characterName,
+        characterAvatar: characterAvatar,
+        characterCardKey: characterAvatar || characterId || characterName,
+    };
+}
+
+function getChatVisualStore() {
+    return {
+        getItem(key) {
+            try { return localStorage.getItem(key); } catch { return null; }
+        },
+        setItem(key, value) {
+            try { localStorage.setItem(key, value); } catch (err) { console.warn(`[${extensionName}] visual scope save failed`, err); }
+        },
+    };
+}
+
+function scheduleChatMetadataSave(ctx = getContext?.()) {
+    if (!ctx || typeof ctx.saveChat !== "function") return;
+    clearTimeout(chatVisualMetadataSaveTimer);
+    chatVisualMetadataSaveTimer = setTimeout(() => {
+        Promise.resolve(ctx.saveChat()).catch((err) => console.warn(`[${extensionName}] chat visual metadata save failed`, err));
+    }, 250);
+}
+
+function loadCurrentChatVisualScope(settings = extension_settings[extensionName]) {
+    return loadChatVisualScope({
+        context: getCurrentChatVisualContext(),
+        settings,
+        store: getChatVisualStore(),
+    });
+}
+
+function getEffectiveVisualSettings(settings = extension_settings[extensionName]) {
+    const scope = loadCurrentChatVisualScope(settings);
+    return {
+        ...settings,
+        ...scope.values,
+        __visualScopeKey: scope.scopeKey,
+        __visualScopeSources: scope.sources,
+    };
+}
+
+function saveCurrentChatVisualScopePatch(patch = {}) {
+    const cleanPatch = {};
+    for (const key of CHAT_VISUAL_FIELDS) {
+        if (Object.prototype.hasOwnProperty.call(patch, key)) {
+            cleanPatch[key] = patch[key];
+        }
+    }
+    if (!Object.keys(cleanPatch).length) return null;
+    return saveChatVisualScopePatch({
+        context: getCurrentChatVisualContext(),
+        store: getChatVisualStore(),
+        patch: cleanPatch,
+    });
+}
+
+function resolveCurrentChatVisualBible(sourceText, settings = extension_settings[extensionName]) {
+    return resolveChatVisualBible({
+        context: getCurrentChatVisualContext(),
+        settings,
+        store: getChatVisualStore(),
+        sourceText,
+    });
+}
+
+function getVisualScopeLabel(settings = extension_settings[extensionName]) {
+    const scope = loadCurrentChatVisualScope(settings);
+    const sourceText = Object.values(scope.sources).includes("card") ? "当前角色卡" : "角色卡空库";
+    return `${sourceText} · ${createChatVisualScopeKey(getCurrentChatVisualContext()).replace(/^ST-OpenAI-Image-Relay:visual-scope:/, "")}`;
+}
+
+function updateVisualScopeStatus() {
+    const fp = $("#oair_floating_panel");
+    fp.find("#oair_visual_scope_status").text(`当前视觉设定作用域：${getVisualScopeLabel()}`);
+}
+
+// ─── Library UI helpers (style / character / scene) ───────────
+
+const LIBRARY_CONFIGS = {
+    style: {
+        key: "styleLibrary",
+        activeKey: "styleActive",
+        summarySelector: "#oair_style_library_summary",
+        title: "风格库",
+        nameLabel: "风格名",
+        bodyLabel: "风格描述",
+        emptyText: "当前角色卡还没有风格预设。可导入上方内置风格，或点击“管理风格预设”手动添加。",
+        activeText: "当前固定风格",
+    },
+    character: {
+        key: "characterAppearance",
+        activeKey: "",
+        summarySelector: "#oair_character_library_summary",
+        title: "人物库",
+        nameLabel: "人物名",
+        bodyLabel: "外貌设定",
+        emptyText: "还没有人物预设。可手动添加，或从对话/世界书提取。",
+        activeText: "",
+    },
+    scene: {
+        key: "sceneLibrary",
+        activeKey: "sceneActive",
+        summarySelector: "#oair_scene_library_summary",
+        title: "场景库",
+        nameLabel: "场景名",
+        bodyLabel: "场景设定",
+        emptyText: "还没有场景预设。可手动添加，或从对话/世界书提取。",
+        activeText: "当前固定场景",
+    },
+};
+
+function getLibraryConfig(kind) {
+    return LIBRARY_CONFIGS[kind] || LIBRARY_CONFIGS.character;
+}
+
+function commitLibrary(kind, items, activeName = null) {
+    const cfg = getLibraryConfig(kind);
+    const visual = getEffectiveVisualSettings();
+    const names = new Set((items || []).map((item) => String(item?.name || "").trim()).filter(Boolean));
+    const patch = { [cfg.key]: serializeNamedLibrary(items) };
+    if (cfg.activeKey) {
+        if (activeName != null) {
+            patch[cfg.activeKey] = names.has(activeName) ? activeName : "";
+        } else if (visual[cfg.activeKey] && !names.has(visual[cfg.activeKey])) {
+            patch[cfg.activeKey] = "";
+        }
+    }
+    saveCurrentChatVisualScopePatch(patch);
+    updateLibraryHiddenFields(kind);
+    renderLibrarySummary(kind);
+    updateVisualScopeStatus();
+}
+
+function updateLibraryHiddenFields(kind) {
+    const cfg = getLibraryConfig(kind);
+    const s = getEffectiveVisualSettings();
+    const fp = $("#oair_floating_panel");
+    fp.find(`#oair_${cfg.key.replace(/[A-Z]/g, (m) => `_${m.toLowerCase()}`)}`).val(s[cfg.key] || "");
+    if (cfg.activeKey) {
+        fp.find(`#oair_${cfg.activeKey.replace(/[A-Z]/g, (m) => `_${m.toLowerCase()}`)}`).val(s[cfg.activeKey] || "");
+    }
+}
+
+function renderAllLibrarySummaries() {
+    renderBuiltInStylePresets();
+    renderLibrarySummary("style");
+    renderLibrarySummary("character");
+    renderLibrarySummary("scene");
+}
+
+function renderBuiltInStylePresets() {
+    const fp = $("#oair_floating_panel");
+    const box = fp.find("#oair_builtin_style_presets");
+    if (!box.length) return;
+    box.empty();
+    for (const preset of BUILT_IN_STYLE_PRESETS) {
+        const card = $("<div>").addClass("oair-built-in-style");
+        $("<div>").addClass("oair-built-in-style-name").text(preset.name).appendTo(card);
+        $("<div>").addClass("oair-built-in-style-text").text(preset.text).appendTo(card);
+        card.appendTo(box);
+    }
+}
+
+function importBuiltInStylesIntoCurrentCard() {
+    const scope = loadCurrentChatVisualScope(extension_settings[extensionName]);
+    const merged = mergeBuiltInStylePresets(scope.values.styleLibrary || "");
+    if (!merged.changed) {
+        toastr.info("内置风格已在当前角色卡风格库中。");
+        setStatus("内置风格无需重复导入", "info");
+        return;
+    }
+    saveCurrentChatVisualScopePatch({ styleLibrary: merged.text });
+    updateLibraryHiddenFields("style");
+    renderAllLibrarySummaries();
+    updateVisualScopeStatus();
+    const count = merged.added.length;
+    toastr.success(`已导入 ${count} 个内置风格到当前角色卡。`);
+    setStatus(`已导入 ${count} 个内置风格`, "success");
+}
+
+function renderLibrarySummary(kind) {
+    const cfg = getLibraryConfig(kind);
+    const s = getEffectiveVisualSettings();
+    const fp = $("#oair_floating_panel");
+    const box = fp.find(cfg.summarySelector);
+    if (!box.length) return;
+
+    const items = parseNamedLibrary(s[cfg.key]);
+    const active = cfg.activeKey ? String(s[cfg.activeKey] || "").trim() : "";
+    box.empty();
+
+    if (!items.length) {
+        $("<div>").addClass("oair-library-empty").text(cfg.emptyText).appendTo(box);
+        return;
+    }
+
+    for (const item of items.slice(0, 4)) {
+        const card = $("<div>").addClass("oair-library-card");
+        const title = $("<div>").addClass("oair-library-card-title").appendTo(card);
+        $("<span>").text(item.name).appendTo(title);
+        if (active && item.name === active) {
+            $("<span>").addClass("oair-active-chip").text("当前").appendTo(title);
+        }
+        $("<div>").addClass("oair-library-card-body").text(item.body).appendTo(card);
+        card.appendTo(box);
+    }
+
+    if (items.length > 4) {
+        $("<div>")
+            .addClass("oair-hint")
+            .text(`共 ${items.length} 条，已显示前 4 条。点击管理查看完整列表。`)
+            .appendTo(box);
+    } else {
+        $("<div>").addClass("oair-hint").text(`共 ${items.length} 条。`).appendTo(box);
+    }
+}
+
+function clearLibrary(kind) {
+    const cfg = getLibraryConfig(kind);
+    const s = getEffectiveVisualSettings();
+    const count = parseNamedLibrary(s[cfg.key]).length;
+    const activeValue = cfg.activeKey ? String(s[cfg.activeKey] || "").trim() : "";
+    const hasConfirmedCharacters = kind === "character"
+        && (Array.isArray(s.confirmedCharacters)
+            ? s.confirmedCharacters.length > 0
+            : !!String(s.confirmedCharacters || "").trim());
+    const hasAssociatedState = !!activeValue || hasConfirmedCharacters;
+    if (!count && !hasAssociatedState) {
+        toastr.warning(`${cfg.title}已经是空的。`);
+        return;
+    }
+    const clearTarget = count ? `中的 ${count} 条预设` : "的关联状态";
+    if (!window.confirm(`清空${cfg.title}${clearTarget}？此操作只清空当前角色卡库文本和关联选择，不会删除世界书或聊天记录。`)) return;
+
+    const patch = { [cfg.key]: "" };
+    if (cfg.activeKey) {
+        patch[cfg.activeKey] = "";
+    }
+    if (kind === "character") {
+        patch.confirmedCharacters = [];
+    }
+    saveCurrentChatVisualScopePatch(patch);
+    updateLibraryHiddenFields(kind);
+    renderLibrarySummary(kind);
+    updateVisualScopeStatus();
+    toastr.success(`${cfg.title}已清空。`);
+    setStatus(`${cfg.title}已清空`, "success");
+}
+
+function openLibraryModal(kind) {
+    const cfg = getLibraryConfig(kind);
+    const s = getEffectiveVisualSettings();
+    let items = parseNamedLibrary(s[cfg.key]);
+    let active = cfg.activeKey ? String(s[cfg.activeKey] || "").trim() : "";
+    let selected = items.length ? 0 : -1;
+
+    $(document).off("keydown.oair_library_modal");
+    $("#oair_library_modal").remove();
+    const modal = $('<div id="oair_library_modal" class="oair-library-modal oair-visible"></div>');
+    const dialog = $('<div class="oair-library-dialog"></div>').appendTo(modal);
+    const header = $('<div class="oair-library-dialog-header"></div>').appendTo(dialog);
+    $("<h3>").addClass("oair-library-dialog-title").text(cfg.title).appendTo(header);
+    $('<button type="button" class="oair-floating-close" title="关闭"><i class="fa-solid fa-xmark"></i></button>')
+        .on("click", close)
+        .appendTo(header);
+
+    const body = $('<div class="oair-library-dialog-body"></div>').appendTo(dialog);
+    const list = $('<div class="oair-library-list"></div>').appendTo(body);
+    const editor = $('<div class="oair-library-editor"></div>').appendTo(body);
+    $("<label>").addClass("oair-field-label").text(cfg.nameLabel).appendTo(editor);
+    const nameInput = $('<input class="text_pole" style="width:100%; box-sizing:border-box;">').appendTo(editor);
+    $("<label>").addClass("oair-field-label").text(cfg.bodyLabel).appendTo(editor);
+    const bodyInput = $('<textarea class="text_pole" style="width:100%; box-sizing:border-box;"></textarea>').appendTo(editor);
+    $("<div>").addClass("oair-hint").text("预设按“名字：描述”存储；旧数据会自动显示在这里。").appendTo(editor);
+
+    const editButtons = $('<div class="oair-btn-row"></div>').appendTo(editor);
+    $('<button type="button" class="menu_button" style="flex:1; justify-content:center;">新增</button>')
+        .on("click", () => {
+            selected = -1;
+            nameInput.val("");
+            bodyInput.val("");
+            renderList();
+            nameInput.trigger("focus");
+        })
+        .appendTo(editButtons);
+    $('<button type="button" class="menu_button" style="flex:1; justify-content:center;">保存条目</button>')
+        .on("click", () => {
+            const name = String(nameInput.val() || "").trim();
+            const bodyText = String(bodyInput.val() || "").trim();
+            if (!name || !bodyText) {
+                toastr.warning("请填写名字和描述。");
+                return;
+            }
+            if (selected >= 0 && items[selected]) {
+                const oldName = items[selected].name;
+                items[selected] = { name, body: bodyText, raw: `${name}：${bodyText}` };
+                if (active === oldName) active = name;
+            } else {
+                const existing = items.findIndex((item) => item.name === name);
+                if (existing >= 0) {
+                    items[existing] = { name, body: bodyText, raw: `${name}：${bodyText}` };
+                    selected = existing;
+                } else {
+                    items.push({ name, body: bodyText, raw: `${name}：${bodyText}` });
+                    selected = items.length - 1;
+                }
+            }
+            commitLibrary(kind, items, active);
+            items = parseNamedLibrary(getEffectiveVisualSettings()[cfg.key]);
+            renderList();
+            loadEditor(selected);
+            toastr.success("预设已保存。");
+        })
+        .appendTo(editButtons);
+
+    const footer = $('<div class="oair-library-dialog-footer"></div>').appendTo(dialog);
+    $('<button type="button" class="menu_button">关闭</button>').on("click", close).appendTo(footer);
+
+    function close() {
+        $(document).off("keydown.oair_library_modal");
+        modal.removeClass("oair-visible").remove();
+    }
+
+    function loadEditor(index) {
+        selected = index;
+        const item = items[index];
+        nameInput.val(item?.name || "");
+        bodyInput.val(item?.body || "");
+    }
+
+    function selectLibraryRow(index) {
+        if (!items[index]) return;
+        selected = index;
+        renderList();
+        loadEditor(index);
+    }
+
+    function isLibraryRowInteractiveTarget(event) {
+        return $(event.target).closest("button,input,textarea,select,a,label").length > 0;
+    }
+
+    function renderList() {
+        list.empty();
+        if (!items.length) {
+            $("<div>").addClass("oair-library-empty").text(cfg.emptyText).appendTo(list);
+            return;
+        }
+        items.forEach((item, index) => {
+            const row = $("<div>")
+                .addClass("oair-library-row")
+                .attr({ tabindex: 0, role: "button", "aria-label": `${cfg.title}：${item.name}` })
+                .toggleClass("oair-active", index === selected);
+            const title = $("<div>").addClass("oair-library-row-title").appendTo(row);
+            $("<span>").text(item.name).appendTo(title);
+            if (cfg.activeKey && active === item.name) {
+                $("<span>").addClass("oair-active-chip").text("当前").appendTo(title);
+            }
+            $("<div>").addClass("oair-library-row-body").text(item.body).appendTo(row);
+            const actions = $("<div>").addClass("oair-library-row-actions").appendTo(row);
+            $('<button type="button" class="menu_button">编辑</button>')
+                .on("click", (e) => { e.stopPropagation(); selectLibraryRow(index); })
+                .appendTo(actions);
+            if (cfg.activeKey) {
+                $('<button type="button" class="menu_button">设为当前</button>')
+                    .on("click", (e) => {
+                        e.stopPropagation();
+                        active = item.name;
+                        commitLibrary(kind, items, active);
+                        renderList();
+                    })
+                    .appendTo(actions);
+            }
+            $('<button type="button" class="menu_button">删除</button>')
+                .on("click", (e) => {
+                    e.stopPropagation();
+                    if (!confirm(`删除「${item.name}」？`)) return;
+                    if (active === item.name) active = "";
+                    items.splice(index, 1);
+                    selected = Math.min(index, items.length - 1);
+                    commitLibrary(kind, items, active);
+                    renderList();
+                    loadEditor(selected);
+                })
+                .appendTo(actions);
+            row.on("click", (e) => {
+                if (isLibraryRowInteractiveTarget(e)) return;
+                selectLibraryRow(index);
+            });
+            row.on("keydown", (e) => {
+                if (e.target !== e.currentTarget) return;
+                if (e.key === "Enter" || e.key === " ") {
+                    e.preventDefault();
+                    selectLibraryRow(index);
+                }
+            });
+            row.appendTo(list);
+        });
+    }
+
+    renderList();
+    loadEditor(selected);
+    $("body").append(modal);
+    $(document).off("keydown.oair_library_modal").on("keydown.oair_library_modal", (e) => {
+        if (e.key === "Escape") {
+            $(document).off("keydown.oair_library_modal");
+            close();
+        }
+    });
+}
+
+async function extractLibraryFromChat(kind) {
+    const cfg = getLibraryConfig(kind);
+    const s = getEffectiveVisualSettings();
+    const source = collectRecentChatText(8);
+    if (!source.trim()) {
+        toastr.warning("没有可提取的对话内容。");
+        return;
+    }
+
+    const buttonSelector = kind === "character" ? "#oair_btn_character_from_chat" : "#oair_btn_scene_from_chat";
+    setButtonLoading(buttonSelector, true);
+    setStatus(`正在从对话提取${cfg.title}...`, "info");
+
+    try {
+        const items = await extractNamedItemsWithLlm(kind, source);
+        if (!items.length) {
+            toastr.warning("未提取到可用预设。");
+            return;
+        }
+        saveCurrentChatVisualScopePatch({ [cfg.key]: addNamedLibraryItems(s[cfg.key], items) });
+        updateLibraryHiddenFields(kind);
+        renderLibrarySummary(kind);
+        openLibraryModal(kind);
+        toastr.success(`已从对话提取 ${items.length} 条${cfg.title}预设，请在弹窗中检查/编辑。`);
+        setStatus(`已提取 ${items.length} 条${cfg.title}预设`, "success");
+    } catch (err) {
+        console.error(`[${extensionName}] extract ${kind} from chat failed`, err);
+        toastr.error(err.message || "对话提取失败。");
+        setStatus(err.message || "对话提取失败", "error");
+    } finally {
+        setButtonLoading(buttonSelector, false);
+    }
+}
+
+async function extractLibraryFromWorldBook(kind) {
+    const cfg = getLibraryConfig(kind);
+    const buttonSelector = kind === "character" ? "#oair_btn_character_from_worldbook" : "#oair_btn_scene_from_worldbook";
+    setButtonLoading(buttonSelector, true);
+    setStatus(`正在从世界书筛选${cfg.title}候选...`, "info");
+
+    try {
+        const candidates = await extractWorldBookCandidates(kind);
+        if (!candidates.length) {
+            toastr.warning(`世界书中没有筛选到高相关的${cfg.title}候选。`);
+            setStatus("没有可用世界书候选", "warning");
+            return;
+        }
+        openExtractionCandidateModal(kind, candidates);
+        toastr.success(`已筛选出 ${candidates.length} 条${cfg.title}候选，请确认后再入库。`);
+        setStatus(`已筛选 ${candidates.length} 条${cfg.title}候选`, "success");
+    } catch (err) {
+        console.error(`[${extensionName}] extract ${kind} from world book failed`, err);
+        toastr.error(err.message || "世界书提取失败。");
+        setStatus(err.message || "世界书提取失败", "error");
+    } finally {
+        setButtonLoading(buttonSelector, false);
+    }
+}
+
+async function extractWorldBookCandidates(kind) {
+    const s = extension_settings[extensionName];
+    const entries = await loadActiveWorldBookEntries();
+    const headings = String(s.worldBookSectionHeadings || "")
+        .split(/[,，]/)
+        .map((h) => h.trim())
+        .filter(Boolean);
+    return entries
+        .map((entry) => classifyWorldBookEntry(entry, kind, headings))
+        .filter((item) => item && item.score >= 2)
+        .sort((a, b) => b.score - a.score)
+        .slice(0, 40);
+}
+
+function classifyWorldBookEntry(entry, kind, headings = []) {
+    const name = String(entry?.comment || entry?.keys?.[0] || "").trim();
+    const content = String(entry?.content || "").trim();
+    if (!name || !content) return null;
+    const lowerName = name.toLowerCase();
+    const keyText = [name, ...(entry.keys || [])].join(" ").toLowerCase();
+    const section = extractEntrySection(content, headings);
+    const text = `${name}\n${section || content}`;
+
+    const rejectWords = ["规则", "系统", "格式", "模板", "提示", "世界观", "背景", "剧情", "摘要", "说明", "组织", "阵营", "国家", "种族", "能力", "技能", "任务", "章节"];
+    if (rejectWords.some((w) => lowerName.includes(w) || keyText.includes(w.toLowerCase()))) return null;
+
+    const charWords = ["外貌", "长相", "外观", "发", "瞳", "眼", "身高", "体型", "服装", "裙", "甲", "饰品", "气质", "少年", "少女", "青年", "男人", "女人", "脸", "肤", "耳", "角", "尾"];
+    const sceneWords = ["场景", "环境", "地点", "建筑", "房间", "街", "广场", "城", "镇", "村", "森林", "洞", "宫殿", "旅馆", "学校", "教堂", "光线", "天气", "陈设", "空间", "地形", "氛围", "门", "窗", "灯", "墙"];
+    const words = kind === "scene" ? sceneWords : charWords;
+    const antiWords = kind === "scene" ? charWords.slice(0, 8) : sceneWords.slice(0, 10);
+
+    let score = 0;
+    const reasons = [];
+    const nameLen = [...name].length;
+    if (nameLen >= 2 && nameLen <= 16) { score += 1; reasons.push("名称长度合理"); }
+    for (const w of words) {
+        if (text.includes(w)) { score += 1; reasons.push(`含${w}`); break; }
+    }
+    for (const h of headings) {
+        if (!h) continue;
+        const isCharHeading = charWords.some((w) => h.toLowerCase().includes(w.toLowerCase()) || w.includes(h));
+        const isSceneHeading = sceneWords.some((w) => h.toLowerCase().includes(w.toLowerCase()) || w.includes(h));
+        if ((kind === "character" && isCharHeading) || (kind === "scene" && isSceneHeading)) {
+            if (content.includes(`${h}：`) || content.includes(`${h}:`)) { score += 1; reasons.push(`命中小节${h}`); break; }
+        }
+    }
+    if (antiWords.some((w) => lowerName.includes(w) || keyText.includes(w.toLowerCase()))) score -= 1;
+    if ([...section].length < 12) score -= 1;
+    if ([...section].length > 500) score -= 1;
+
+    if (score < 2) return null;
+    return { name, body: section || content.slice(0, 300), score, reason: dedupeStrings(reasons).join("、") || "规则命中" };
+}
+
+function openExtractionCandidateModal(kind, candidates) {
+    const cfg = getLibraryConfig(kind);
+    let items = (candidates || []).map((item) => ({ ...item, checked: item.score >= 3 }));
+    $(document).off("keydown.oair_extract_modal");
+    $("#oair_extract_modal").remove();
+
+    const modal = $('<div id="oair_extract_modal" class="oair-library-modal oair-visible"></div>');
+    const dialog = $('<div class="oair-library-dialog"></div>').appendTo(modal);
+    const header = $('<div class="oair-library-dialog-header"></div>').appendTo(dialog);
+    $("<h3>").addClass("oair-library-dialog-title").text(`${cfg.title}提取候选`).appendTo(header);
+    $('<button type="button" class="oair-floating-close" title="关闭"><i class="fa-solid fa-xmark"></i></button>').on("click", close).appendTo(header);
+    const body = $('<div class="oair-library-dialog-body" style="grid-template-columns:1fr;"></div>').appendTo(dialog);
+    const list = $('<div class="oair-library-list"></div>').appendTo(body);
+    const footer = $('<div class="oair-library-dialog-footer"></div>').appendTo(dialog);
+    $('<button type="button" class="menu_button">取消</button>').on("click", close).appendTo(footer);
+    $('<button type="button" class="menu_button">确认加入库</button>').on("click", () => {
+        const selected = items.filter((item) => item.checked).map(({ name, body }) => ({ name, body }));
+        if (!selected.length) {
+            toastr.warning("请至少选择一条候选。");
+            return;
+        }
+        const s = getEffectiveVisualSettings();
+        saveCurrentChatVisualScopePatch({ [cfg.key]: addNamedLibraryItems(s[cfg.key], selected) });
+        updateLibraryHiddenFields(kind);
+        renderLibrarySummary(kind);
+        close();
+        openLibraryModal(kind);
+        toastr.success(`已加入 ${selected.length} 条${cfg.title}预设。`);
+    }).appendTo(footer);
+
+    function close() {
+        $(document).off("keydown.oair_extract_modal");
+        modal.removeClass("oair-visible").remove();
+    }
+
+    function render() {
+        list.empty();
+        items.forEach((item, index) => {
+            const row = $('<div class="oair-library-row"></div>').appendTo(list);
+            const title = $('<div class="oair-library-row-title"></div>').appendTo(row);
+            const check = $('<input type="checkbox">').prop("checked", !!item.checked).on("change", function () { item.checked = $(this).prop("checked"); }).appendTo(title);
+            $("<span>").text(`评分 ${item.score} · ${item.reason || "候选"}`).appendTo(title);
+            $('<label class="oair-field-label">名称</label>').appendTo(row);
+            $('<input class="text_pole" style="width:100%; box-sizing:border-box;">').val(item.name).on("input", function () { item.name = String($(this).val() || "").trim(); }).appendTo(row);
+            $('<label class="oair-field-label">描述</label>').appendTo(row);
+            $('<textarea class="text_pole" rows="3" style="width:100%; box-sizing:border-box;"></textarea>').val(item.body).on("input", function () { item.body = String($(this).val() || "").trim(); }).appendTo(row);
+            check.attr("aria-label", `选择候选 ${index + 1}`);
+        });
+    }
+
+    render();
+    $("body").append(modal);
+    $(document).off("keydown.oair_extract_modal").on("keydown.oair_extract_modal", (e) => { if (e.key === "Escape") close(); });
+}
+
+function collectRecentChatText(limit = 8) {
+    const ctx = getContext();
+    const chat = Array.isArray(ctx?.chat) ? ctx.chat : [];
+    const parts = [];
+    for (let i = chat.length - 1; i >= 0 && parts.length < limit; i--) {
+        const msg = chat[i];
+        if (!msg || msg.is_system) continue;
+        const text = cleanRpText(msg.mes || msg.content || "");
+        if (text) parts.unshift(text);
+    }
+    return parts.join("\n\n");
+}
+
+async function extractNamedItemsWithLlm(kind, sourceText) {
+    const isScene = kind === "scene";
+    const systemPrompt = "你是 SillyTavern 生图设定库整理助手，只输出 JSON。";
+    const userPrompt = [
+        isScene
+            ? "请从以下对话内容中提取可复用的场景/地点/环境预设。"
+            : "请从以下对话内容中提取可复用的人物外貌预设。",
+        "",
+        "输出格式必须是紧凑 JSON：",
+        '{"items":[{"name":"名字","body":"描述"}]}',
+        "",
+        "要求：",
+        "1. name 必须短，适合作为预设名。",
+        isScene
+            ? "2. body 只写稳定环境特征，例如地点、空间结构、时间氛围、陈设、光线、天气，不写一次性动作。"
+            : "2. body 只写稳定人物外貌，例如发型发色、瞳色、体型、服装、标志性饰品、气质，不写一次性动作。",
+        "3. 没有明确可复用信息时输出 {\"items\":[]}",
+        "4. 不要输出解释，不要代码块。",
+        "",
+        "对话内容：",
+        sourceText,
+    ].join("\n");
+    const text = await callLlmForText(systemPrompt, userPrompt);
+    return parseExtractItemsJson(text);
+}
+
+function parseExtractItemsJson(text) {
+    const raw = String(text || "");
+    const m = raw.match(/\{[\s\S]*\}/);
+    if (!m) return [];
+    let obj = null;
+    try { obj = JSON.parse(m[0]); } catch { return []; }
+    const arr = Array.isArray(obj?.items) ? obj.items : [];
+    return arr
+        .map((item) => ({
+            name: String(item?.name || "").trim(),
+            body: String(item?.body || "").trim(),
+        }))
+        .filter((item) => item.name && item.body);
 }
 
 // ═══════════════════════════════════════════════════════════════
@@ -1149,28 +2417,12 @@ function updatePanelUi() {
 /**
  * Update the floating window (L2) — all settings fields
  */
-/**
- * 用风格库的名字重建「当前固定风格」<select>，并回填已选 styleActive。
- * 用 jQuery .text/.val 写入，天然转义；空选项表示"不指定/自动"。
- */
-function populateStyleSelect() {
-    const fp = $("#oair_floating_panel");
-    const sel = fp.find("#oair_style_active");
-    if (!sel.length) return;
-    const s = extension_settings[extensionName];
-    const lib = parseNamedLibrary(s.styleLibrary);
-    sel.empty();
-    sel.append($("<option>").val("").text("（不指定 / 自动）"));
-    for (const item of lib) {
-        sel.append($("<option>").val(item.name).text(item.name));
-    }
-    sel.val(String(s.styleActive || ""));
-}
-
 function updateFloatingUi() {
     const s = extension_settings[extensionName];
+    const visualSettings = getEffectiveVisualSettings(s);
     const fp = $("#oair_floating_panel");
     if (!fp.length) return;
+    lastRenderedVisualScopeKey = createChatVisualScopeKey(getCurrentChatVisualContext());
 
     // Status bar
     fp.find("#oair_floating_enabled").prop("checked", !!s.enabled);
@@ -1179,6 +2431,22 @@ function updateFloatingUi() {
     fp.find("#oair_main_prompt").val(s.mainPrompt || "");
     fp.find("#oair_message_gen_enabled").prop("checked", s.messageGenEnabled !== false);
     fp.find("#oair_summarize_template").val(s.summarizeTemplate || "");
+    fp.find("#oair_automatic_flow_enabled").prop("checked", !!s.automaticFlowEnabled);
+    fp.find("#oair_automatic_flow_follow_workbench").prop("checked", s.automaticFlowFollowWorkbench !== false);
+    fp.find("#oair_automatic_flow_min_chars").val(Number(s.automaticFlowMinChars) || 0);
+    fp.find("#oair_automatic_flow_failure_policy").val(normalizeAutomaticFlowFailurePolicy(s.automaticFlowFailurePolicy));
+    fp.find("#oair_automatic_flow_show_queue").prop("checked", s.automaticFlowShowQueue !== false);
+    fp.find("#oair_automatic_flow_cancel_enabled").prop("checked", s.automaticFlowCancelEnabled !== false);
+    fp.find("#oair_multi_image_enabled").prop("checked", !!s.multiImageEnabled);
+    fp.find("#oair_generation_mode").val(normalizeGenerationMode(s.generationMode));
+    fp.find("#oair_default_beat_count").val(normalizeBeatCount(s.defaultBeatCount));
+    fp.find("#oair_multi_image_failure_policy").val(normalizePlanFailurePolicy(s.multiImageFailurePolicy));
+    fp.find("#oair_comic_panel_count").val(normalizeComicPanelCount(s.comicPanelCount));
+    fp.find("#oair_comic_dialogue_enabled").prop("checked", s.comicDialogueEnabled !== false);
+    fp.find("#oair_comic_dialogue_mode").val(normalizeComicDialogueMode(s.comicDialogueMode));
+    fp.find("#oair_comic_failure_policy").val(normalizePlanFailurePolicy(s.comicFailurePolicy));
+    fp.find("#oair_continuity_mode").val(normalizeContinuityMode(s.continuityMode));
+    updateAutomaticQueueStatus();
 
     // 后端
     fp.find("#oair_api_mode").val(s.apiMode || "chat");
@@ -1206,13 +2474,29 @@ function updateFloatingUi() {
     fp.find("#oair_optimize_enabled").prop("checked", !!s.optimizeEnabled);
     fp.find("#oair_optimize_auto").prop("checked", !!s.optimizeAuto);
     fp.find("#oair_optimize_template").val(s.optimizeTemplate || "");
+    fp.find("#oair_multi_analysis_template").val(s.multiAnalysisTemplate || "");
+    fp.find("#oair_comic_analysis_template").val(s.comicAnalysisTemplate || "");
+    fp.find("#oair_analysis_template").val(s.analysisTemplate || "");
+    fp.find("#oair_cleanup_template").val(s.cleanupTemplate || "");
+    fp.find("#oair_single_image_strategy").val(normalizeSingleImageStrategy(s.singleImageStrategy));
+    fp.find("#oair_visual_sanitization_level").val(normalizeVisualSanitizationLevel(s.visualSanitizationLevel));
+    fp.find("#oair_prompt_safety_level").val(normalizePromptSafetyLevel(s.promptSafetyLevel));
     fp.find("#oair_text_max_tokens").val(s.textMaxTokens ?? 8192);
-    fp.find("#oair_character_appearance").val(s.characterAppearance || "");
-    fp.find("#oair_style_library").val(s.styleLibrary || "");
+    fp.find("#oair_character_appearance").val(visualSettings.characterAppearance || "");
+    fp.find("#oair_style_library").val(visualSettings.styleLibrary || "");
+    fp.find("#oair_style_active").val(visualSettings.styleActive || "");
+    fp.find("#oair_scene_library").val(visualSettings.sceneLibrary || "");
+    fp.find("#oair_scene_active").val(visualSettings.sceneActive || "");
+    updateVisualScopeStatus();
     fp.find("#oair_style_auto_select").prop("checked", !!s.styleAutoSelect);
     fp.find("#oair_character_llm_extract").prop("checked", !!s.characterLlmExtract);
-    populateStyleSelect();   // 填充风格下拉并回填 styleActive
-    fp.find("#oair_worldbook_enabled").prop("checked", !!s.worldBookEnabled);
+    fp.find("#oair_auto_extract_characters").prop("checked", !!s.autoExtractCharactersEnabled);
+    fp.find("#oair_auto_extract_scenes").prop("checked", !!s.autoExtractScenesEnabled);
+    fp.find("#oair_scene_auto_select").prop("checked", !!s.sceneAutoSelect);
+    fp.find(`input[name="oair_character_worldbook_mode"][value="${libraryWorldBookMode(s, "character")}"]`).prop("checked", true);
+    fp.find(`input[name="oair_scene_worldbook_mode"][value="${libraryWorldBookMode(s, "scene")}"]`).prop("checked", true);
+    renderBuiltInStylePresets();
+    renderAllLibrarySummaries();
     fp.find("#oair_worldbook_headings").val(s.worldBookSectionHeadings || "");
     fp.find("#oair_worldbook_maxchars").val(s.worldBookMaxChars ?? 800);
     fp.find("#oair_optimize_use_custom").prop("checked", !!s.optimizeUseCustom);
@@ -1221,7 +2505,7 @@ function updateFloatingUi() {
     fp.find("#oair_optimize_model").val(s.optimizeModel || "");
     fp.find("#oair_optimize_api_key").val(s.optimizeApiKey || "");
 
-    // NSFW 规避
+    // 安全重写
     fp.find("#oair_nsfw_avoidance").prop("checked", !!s.nsfwAvoidance);
     fp.find("#oair_nsfw_avoidance_template").val(s.nsfwAvoidanceTemplate || "");
 }
@@ -1230,12 +2514,77 @@ function updateFloatingUi() {
 // SECTION 6: MAIN PROMPT INJECTION & STATUS
 // ═══════════════════════════════════════════════════════════════
 
+function normalizeTemplateText(text) {
+    return String(text || "").replace(/\r\n/g, "\n").trim();
+}
+
+function normalizeStyleLibrarySetting(settings) {
+    if (!String(settings.styleLibrary || "").trim()) {
+        settings.styleLibrary = DEFAULT_STYLE_LIBRARY;
+    }
+}
+
+function normalizeOptimizeTemplateSetting(settings) {
+    const template = String(settings.optimizeTemplate || "");
+    const isOldDefaultTemplate = LEGACY_OPTIMIZE_TEMPLATES.some((legacy) =>
+        normalizeTemplateText(template) === normalizeTemplateText(legacy),
+    );
+    const looksLikeOldDefaultTemplate = !/本地提示词编译器|编译后提示词|精修编辑/.test(template)
+        && LEGACY_OPTIMIZE_TEMPLATE_MARKERS.some((marker) => template.includes(marker))
+        && /{{\s*prompt\s*}}/.test(template);
+    if (!template.trim() || isOldDefaultTemplate || looksLikeOldDefaultTemplate) {
+        settings.optimizeTemplate = DEFAULT_OPTIMIZE_TEMPLATE;
+    }
+}
+
+function normalizeSafetyTemplateSetting(settings) {
+    const template = String(settings.nsfwAvoidanceTemplate || "");
+    const looksLikeOldDefaultTemplate = !/安全级别|{{\s*safetyLevel\s*}}|安全重写专家/.test(template)
+        && LEGACY_NSFW_TEMPLATE_MARKERS.some((marker) => template.includes(marker))
+        && /{{\s*prompt\s*}}/.test(template);
+    if (!template.trim() || looksLikeOldDefaultTemplate) {
+        settings.nsfwAvoidanceTemplate = DEFAULT_NSFW_TEMPLATE;
+    }
+}
+
 function ensureSettings() {
     const current = extension_settings[extensionName] || {};
+    const hadWorldBookMode = Object.prototype.hasOwnProperty.call(current, "worldBookMode");
+    const hadCharacterMode = Object.prototype.hasOwnProperty.call(current, "characterWorldBookMode");
+    const hadSceneMode = Object.prototype.hasOwnProperty.call(current, "sceneWorldBookMode");
     extension_settings[extensionName] = {
         ...structuredClone(defaultSettings),
         ...current,
     };
+    const settings = extension_settings[extensionName];
+    if (!hadWorldBookMode && current.worldBookEnabled === true) {
+        settings.worldBookMode = "inject";
+    }
+    normalizeWorldBookModes(settings, { hadCharacterMode, hadSceneMode });
+    settings.singleImageStrategy = normalizeSingleImageStrategy(settings.singleImageStrategy);
+    settings.visualSanitizationLevel = normalizeVisualSanitizationLevel(settings.visualSanitizationLevel);
+    settings.promptCompilerEnabled = settings.promptCompilerEnabled !== false;
+    settings.promptSafetyLevel = normalizePromptSafetyLevel(settings.promptSafetyLevel);
+    Object.assign(settings, normalizeAutomaticFlowSettings(settings));
+    Object.assign(settings, normalizeVisualExtractionSettings(settings));
+    settings.defaultBeatCount = normalizeBeatCount(settings.defaultBeatCount);
+    settings.multiImageFailurePolicy = normalizePlanFailurePolicy(settings.multiImageFailurePolicy);
+    settings.splitStrategy = ["auto", "fixed"].includes(String(settings.splitStrategy || "")) ? String(settings.splitStrategy) : "auto";
+    // 迁移：Phase 4 只有 multiImageEnabled 开关；用户存档没有 generationMode 时按旧开关推导
+    if (!Object.prototype.hasOwnProperty.call(current, "generationMode") && current.multiImageEnabled === true) {
+        settings.generationMode = "multi";
+    }
+    settings.generationMode = normalizeGenerationMode(settings.generationMode);
+    settings.multiImageEnabled = settings.generationMode === "multi";
+    settings.comicPanelCount = normalizeComicPanelCount(settings.comicPanelCount);
+    settings.comicDialogueMode = normalizeComicDialogueMode(settings.comicDialogueMode);
+    settings.comicFailurePolicy = normalizePlanFailurePolicy(settings.comicFailurePolicy);
+    if (!String(settings.comicAnalysisTemplate || "").trim()) {
+        settings.comicAnalysisTemplate = DEFAULT_COMIC_ANALYSIS_TEMPLATE;
+    }
+    normalizeStyleLibrarySetting(settings);
+    normalizeOptimizeTemplateSetting(settings);
+    normalizeSafetyTemplateSetting(settings);
 }
 
 function applyMainPromptInjection() {
@@ -1274,6 +2623,79 @@ function setStatus(text, kind = "info") {
 
     // Update FAB state
     updateFabStatus(kind);
+
+    console.log(`[${extensionName}] [状态] ${text}`);
+}
+
+function getMessageBlockElement(messageId) {
+    const wanted = String(messageId);
+    return Array.from(document.querySelectorAll("#chat [mesid]"))
+        .find((element) => element.getAttribute("mesid") === wanted) || null;
+}
+
+function sleepForMessageBlock(ms) {
+    return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+async function waitForMessageBlock(messageId, attempts = 15, delayMs = 100) {
+    for (let i = 0; i < attempts; i++) {
+        const element = getMessageBlockElement(messageId);
+        if (element) return element;
+        await sleepForMessageBlock(delayMs);
+    }
+    return null;
+}
+
+function isHostMissingMessageBlockError(error) {
+    const message = String(error?.message || "");
+    const stack = String(error?.stack || "");
+    return message.includes("getAttribute")
+        && (stack.includes("ReasoningHandler.initHandleMessage") || stack.includes("updateReasoningUI"));
+}
+
+async function updateMessageBlockWhenReady(messageId, message, options = {}) {
+    const element = await waitForMessageBlock(messageId);
+    if (!element) {
+        console.warn(`[${extensionName}] updateMessageBlock skipped: message block not ready`, messageId);
+        return false;
+    }
+
+    try {
+        updateMessageBlock(messageId, message, options);
+        return true;
+    } catch (error) {
+        if (isHostMissingMessageBlockError(error)) {
+            console.warn(`[${extensionName}] updateMessageBlock host reasoning UI skipped`, error);
+            return false;
+        }
+        throw error;
+    }
+}
+
+function stripRenderedPicTagsFromMessageBlock(messageId) {
+    const block = getMessageBlockElement(messageId);
+    const textRoot = block?.querySelector?.(".mes_text");
+    if (!textRoot) return false;
+
+    let changed = false;
+    textRoot.querySelectorAll?.("pic").forEach((element) => {
+        element.remove();
+        changed = true;
+    });
+
+    const pattern = /<pic\b[^>]*>/gi;
+    const textNodeType = globalThis.NodeFilter?.SHOW_TEXT || 4;
+    const walker = document.createTreeWalker(textRoot, textNodeType);
+    const nodes = [];
+    for (let node = walker.nextNode(); node; node = walker.nextNode()) {
+        if (pattern.test(node.nodeValue || "")) nodes.push(node);
+        pattern.lastIndex = 0;
+    }
+    for (const node of nodes) {
+        node.nodeValue = String(node.nodeValue || "").replace(pattern, "");
+        changed = true;
+    }
+    return changed;
 }
 
 function updateFabStatus(kind) {
@@ -1329,11 +2751,11 @@ async function callLlmForText(systemPrompt, userPrompt) {
         return String(viaMain).trim();
     }
 
-    throw new Error("无法调用文本模型：请确认 SillyTavern 已连接可用的聊天 API，或在「优化」标签勾选并填写自定义优化后端。");
+    throw new Error("无法调用文本模型：请确认 SillyTavern 已连接可用的聊天 API，或在「模型后端」勾选并填写自定义精修后端。");
 }
 
 /**
- * 通过酒馆主模型生成纯文本（用于优化 / NSFW 安全审查 / 消息总结）。
+ * 通过酒馆主模型生成纯文本（用于编译后精修 / 安全重写 / 消息总结）。
  * generateRaw 不带聊天上下文，最适合"输入提示词→输出文本"的转换。
  * 兼容新版对象参数签名与旧版位置参数签名；generateRaw 不可用时返回 null。
  */
@@ -1345,7 +2767,7 @@ async function callMainLlm(systemPrompt, userPrompt) {
     }
 
     const settings = extension_settings[extensionName];
-    // 文本优化/审查/总结的回复长度上限（可配置）。推理模型(glm/o1 等)的 max_tokens 需同时覆盖
+    // 文本精修/审查/总结的回复长度上限（可配置）。推理模型(glm/o1 等)的 max_tokens 需同时覆盖
     // 「思考 + 最终答案」，太小（如 1500）会让思考吃光预算、最终提示词被截断 → 质量很低；
     // 太大（如继承主模型的 65535）某些 glm 代理会挂起/拒绝。默认 8192，用户可在「优化」tab 调整。
     const responseLength = Number(settings.textMaxTokens) || 8192;
@@ -1367,7 +2789,7 @@ async function callMainLlm(systemPrompt, userPrompt) {
             invoke,
             new Promise((_, reject) => {
                 timer = setTimeout(
-                    () => reject(new Error(`文本模型 ${Math.round(timeoutMs / 1000)}s 内无响应（已超时）。若角色卡含大量世界书/JS 模板，建议在「优化」tab 勾选「使用自定义优化 LLM 后端」走独立后端。`)),
+                    () => reject(new Error(`文本模型 ${Math.round(timeoutMs / 1000)}s 内无响应（已超时）。若角色卡含大量世界书/JS 模板，建议在「模型后端」勾选「使用自定义精修 LLM 后端」走独立后端。`)),
                     timeoutMs,
                 );
             }),
@@ -1410,26 +2832,37 @@ async function callCustomLlmBackend(systemPrompt, userPrompt) {
     return extractContentFromPayload(parseBackendPayload(responseText)).trim();
 }
 
+function summarizeLogText(text, maxChars = 120) {
+    const value = String(text || "").replace(/\s+/g, " ").trim();
+    if (!value) return "空";
+    return value.length > maxChars ? `${value.slice(0, maxChars)}...（${value.length} 字符）` : `${value}（${value.length} 字符）`;
+}
+
 /**
- * 使用 LLM 优化提示词
+ * 使用 LLM 精修编译后的提示词
  */
 async function optimizePrompt(prompt, fixed = null) {
     const settings = extension_settings[extensionName];
     if (!settings.optimizeEnabled) return prompt;
 
     const template = settings.optimizeTemplate || defaultSettings.optimizeTemplate;
-    const systemPrompt = "你是一个专业的图片提示词优化专家。";
+    const systemPrompt = "你是一个专业的图片提示词精修编辑。";
     const userMessage = optimizeHasSlots(template)
         ? renderOptimizeTemplate(template, {
             prompt,
             style: fixed?.styleText,
             characters: fixed?.charactersText,
+            scenes: fixed?.scenesText,
+            singleStrategy: settings.singleImageStrategy,
         })
         : renderPrompt(template, prompt);
 
     try {
+        console.log(`[${extensionName}] 精修提示词输入摘要：${summarizeLogText(userMessage)}`);
         const result = await callLlmForText(systemPrompt, userMessage);
-        return result || prompt;
+        const optimized = result || prompt;
+        console.log(`[${extensionName}] 精修提示词输出摘要：${summarizeLogText(optimized)}`);
+        return optimized;
     } catch (error) {
         console.warn(`[${extensionName}] Prompt optimization failed, using original`, error);
         return prompt;
@@ -1437,15 +2870,16 @@ async function optimizePrompt(prompt, fixed = null) {
 }
 
 /**
- * NSFW 安全审查 — 使用 LLM 净化提示词
+ * 安全重写 — 使用 LLM 对最终提示词做分级 SFW 处理
  */
 async function sanitizePrompt(prompt) {
     const settings = extension_settings[extensionName];
     if (!settings.nsfwAvoidance) return prompt;
 
     const template = settings.nsfwAvoidanceTemplate || defaultSettings.nsfwAvoidanceTemplate;
-    const systemPrompt = "你是一个内容安全审查专家。";
-    const userMessage = renderPrompt(template, prompt);
+    const systemPrompt = "你是一个图片提示词安全重写专家。";
+    const safetyLevel = normalizePromptSafetyLevel(settings.promptSafetyLevel);
+    const userMessage = renderSafetyTemplate(template, prompt, safetyLevel);
 
     try {
         const result = await callLlmForText(systemPrompt, userMessage);
@@ -1457,43 +2891,1245 @@ async function sanitizePrompt(prompt) {
 }
 
 /**
- * 提示词处理流水线：原始 → 优化 → 安全审查
+ * 旧入口提示词处理流水线：原始 → 精修 → 安全重写。
+ * 新的单图/多图/漫画入口会先规划并编译，再调用 finalizeCompiledJobPrompt。
  * @param {string} prompt - 原始提示词
- * @param {object} options - { forceOptimize: boolean }
+ * @param {object} options - { forceOptimize: boolean, skipOptimize: boolean, skipFixedAppend: boolean }
  */
 async function processPromptPipeline(prompt, options = {}) {
     const settings = extension_settings[extensionName];
 
     // Step 0: 收集固定设定（风格 + 人物）
-    const fixed = await resolveFixedSettings(prompt, settings);
+    const fixed = options.fixed || await resolveFixedSettings(prompt, settings);
 
-    // Step 1: 优化（启用且满足条件时）
-    const shouldOptimize = options.forceOptimize || settings.optimizeAuto;
+    // Step 1: 精修（启用且满足条件时）
+    const shouldOptimize = !options.skipOptimize && (options.forceOptimize || settings.optimizeAuto);
     const optimizeActive = settings.optimizeEnabled && shouldOptimize;
     let injected = false;
     if (optimizeActive) {
-        setStatus("正在优化提示词...", "info");
+        setStatus("正在精修提示词...", "info");
         const template = settings.optimizeTemplate || defaultSettings.optimizeTemplate;
         if (optimizeHasSlots(template)) {
-            prompt = await optimizePrompt(prompt, fixed);   // 固定设定融进优化模板
-            injected = true;
+            prompt = await optimizePrompt(prompt, fixed);   // 固定设定与单图取景策略融进精修模板
+            injected = optimizeHasFixedReferenceSlots(template);
         } else {
             prompt = await optimizePrompt(prompt, null);     // 老模板无占位符 → 优化后再拼接
         }
     }
 
-    // Step 2: NSFW 安全审查（如果启用）
+    // Step 2: 安全重写（如果启用）
     if (settings.nsfwAvoidance) {
-        setStatus("正在安全审查...", "info");
+        setStatus("正在安全重写...", "info");
         prompt = await sanitizePrompt(prompt);
     }
 
     // Step 3: 未注入到模板的固定设定 → 末尾拼【设定参考】块
-    if (!injected) {
+    if (!injected && !options.skipFixedAppend) {
         prompt = appendFixedBlock(prompt, fixed);
     }
 
     return prompt;
+}
+
+function dedupeLocalStrings(values) {
+    return [...new Set((values || []).filter(Boolean))];
+}
+
+function normalizeVisualSanitizationLevel(value) {
+    const key = String(value || "").trim();
+    return ["strict", "standard", "loose"].includes(key) ? key : "standard";
+}
+
+function isPollutedReferenceLine(line, level = "standard") {
+    const text = String(line || "").trim();
+    if (!text) return true;
+    if (/[<%][\s\S]*[_%>]/.test(text) || /<%_|_%>|getMessageVar|TavernDB|Wrapper|WrapperStart|WrapperEnd|readableData|_.cloneDeep|const\s+|let\s+|var\s+|function\s*\(/i.test(text)) return true;
+    if (/插图插入|任务规则|任务确认|按要求插入|now_plot|system prompt|prompt-template|状态栏|变量|数据库|配置项|规则说明|不是视觉设定|workflow|instruction/i.test(text)) return true;
+    if (/^[-*_`~|\s:：]+$/.test(text)) return true;
+    if (level === "strict" && /^[⚙️#>\-\*\s]*(规则|设定规则|强化|任务|系统|配置|模板|宏|脚本|插入)\s*[：:]/.test(text)) return true;
+    if (level !== "loose" && /^[⚙️#>\-\*\s]*(规则|任务|系统|配置|模板|宏|脚本|插入|强化)\s*[：:]/.test(text)) return true;
+    return false;
+}
+
+function stripReferenceNoise(line) {
+    return String(line || "")
+        .replace(/<%_[\s\S]*?_%>/g, "")
+        .replace(/TavernDB[-\w]*|Wrapper(?:Start|End)?[-\w]*|getMessageVar\([^)]*\)/gi, "")
+        .replace(/^[\s>*#\-]+/, "")
+        .trim();
+}
+
+function hasCharacterVisualValue(text) {
+    return /发|瞳|眼|脸|肤|身高|体型|体态|年龄|气质|服装|衣|裙|袍|甲|披风|饰|装备|武器|表情|姿态|妆|外貌|外观|长相|耳|尾|角|翼|色/.test(String(text || ""));
+}
+
+function hasSceneVisualValue(text) {
+    return /地点|场景|环境|广场|街|巷|城|镇|村|室|房|厅|宫|塔|森林|山|海|河|湖|天空|地面|石板|喷泉|建筑|灯|光|影|天气|雨|雪|雾|风|夜|昼|黄昏|清晨|氛围|人群|空间|布局|前景|中景|远景|地标|招牌|网格|WARNING|色|红|蓝|金|银/.test(String(text || ""));
+}
+
+function extractCharacterReferenceFromTableLine(line) {
+    const text = String(line || "").trim();
+    if (!/^\|.*\|$/.test(text)) return "";
+    const cols = text.split("|").map((c) => c.trim()).filter(Boolean);
+    if (cols.length < 3) return "";
+    const name = cols[0].replace(/[*_`]/g, "").trim();
+    const appearance = cols.slice(1).find((c) => /外貌|外观|长相|发|瞳|眼|脸|服|衣|裙|袍|体型|气质|表情|披风/.test(c));
+    if (!name || !appearance || /名称|名字|角色|人物/.test(name) || !hasCharacterVisualValue(appearance)) return "";
+    return `${name}：${appearance.replace(/^外貌\s*[：:]/, "").trim()}`;
+}
+
+function sanitizeVisualReferenceText(text, { kind = "generic", level = "standard" } = {}) {
+    const mode = normalizeVisualSanitizationLevel(level);
+    const lines = String(text || "").split(/\r?\n/);
+    const out = [];
+    for (const rawLine of lines) {
+        const line = stripReferenceNoise(rawLine);
+        if (isPollutedReferenceLine(line, mode)) continue;
+        if (kind === "scene" && /^\|.*\|$/.test(line)) continue;
+        if (kind === "character") {
+            const tableRef = extractCharacterReferenceFromTableLine(line);
+            if (tableRef) {
+                out.push(tableRef);
+                continue;
+            }
+        }
+        if (kind === "character" && !hasCharacterVisualValue(line)) continue;
+        if (kind === "scene" && !hasSceneVisualValue(line)) continue;
+        out.push(line);
+    }
+    return dedupeLocalStrings(out).join("\n").trim();
+}
+
+function sanitizeCharacterReferenceText(text, level = "standard", fallbackName = "") {
+    const cleaned = sanitizeVisualReferenceText(text, { kind: "character", level });
+    const out = [];
+    for (const line of cleaned.split(/\r?\n/).map((l) => l.trim()).filter(Boolean)) {
+        const m = line.match(/^([^：:|]{1,24})[：:]\s*(.+)$/);
+        if (m) {
+            const name = m[1].trim();
+            const body = m[2].trim();
+            if (name && body && hasCharacterVisualValue(body)) out.push(`${name}：${body}`);
+        } else if (fallbackName && hasCharacterVisualValue(line)) {
+            out.push(`${fallbackName}：${line}`);
+        }
+    }
+    return dedupeLocalStrings(out).join("\n");
+}
+
+function sanitizeSceneReferenceText(text, level = "standard") {
+    const cleaned = sanitizeVisualReferenceText(text, { kind: "scene", level });
+    const out = [];
+    for (const line of cleaned.split(/\r?\n/).map((l) => l.trim()).filter(Boolean)) {
+        if (/^([^：:|]{1,24})[：:]\s*(.+)$/.test(line) || hasSceneVisualValue(line)) out.push(line);
+    }
+    return dedupeLocalStrings(out).join("\n");
+}
+
+function logSanitizationSummary(kind, beforeItems, afterItems, level) {
+    const before = (beforeItems || []).filter((item) => String(item?.text || "").trim()).length;
+    const after = (afterItems || []).filter((item) => String(item?.text || "").trim()).length;
+    if (before !== after) {
+        console.log(`[${extensionName}] 设定清洗(${kind}/${normalizeVisualSanitizationLevel(level)})：保留 ${after}/${before} 条，已过滤 ${before - after} 条污染或低视觉价值内容。`);
+    }
+}
+
+function renderSafetyTemplate(template, prompt, safetyLevel = "standard") {
+    return renderPrompt(template, prompt)
+        .replace(/\{\{\s*safetyLevel\s*\}\}/g, normalizePromptSafetyLevel(safetyLevel));
+}
+
+function parseCharacterReferenceItems(text) {
+    const out = [];
+    for (const line of String(text || "").split(/\r?\n/)) {
+        const m = line.trim().match(/^([^：:|]{1,40})[：:]\s*(.+)$/);
+        if (!m) continue;
+        const name = m[1].trim();
+        const body = m[2].trim();
+        if (name && body) out.push({ name, text: body });
+    }
+    return out;
+}
+
+function createCharacterCandidate(input = {}) {
+    const name = String(input.name || "").trim();
+    let text = String(input.text || input.body || "").trim();
+    text = text.replace(new RegExp(`^${name.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")}\\s*[：:]\\s*`), "").trim();
+    return {
+        id: String(input.id || `char_${name || Math.random().toString(36).slice(2)}`),
+        name,
+        text,
+        source: String(input.source || "story"),
+        stable: !!input.stable,
+        selected: input.selected !== false,
+    };
+}
+
+function collectCharacterCandidatesForWorkbench(sourceText, settings = {}, options = {}) {
+    const source = String(sourceText || "");
+    const seen = new Set();
+    const candidates = [];
+    const push = (candidate) => {
+        const item = createCharacterCandidate(candidate);
+        if (!item.name || !item.text || seen.has(item.name)) return;
+        seen.add(item.name);
+        candidates.push(item);
+    };
+
+    const librarySource = settings.__visualScopeSources?.characterAppearance === "legacy" ? "legacy" : "library";
+    for (const item of parseCharacterReferenceItems(settings.characterAppearance)) {
+        if (source && !source.includes(item.name)) continue;
+        push({ ...item, source: librarySource, stable: true, selected: true });
+    }
+
+    for (const item of options.storyCandidates || []) {
+        push({
+            name: item.name,
+            text: item.text || item.body,
+            source: item.source || "story",
+            stable: !!item.stable,
+            selected: item.selected !== false,
+        });
+    }
+
+    return candidates;
+}
+
+function normalizeConfirmedCharacterReferences(candidates = []) {
+    const out = [];
+    const seen = new Set();
+    for (const candidate of candidates || []) {
+        if (!candidate || candidate.selected === false) continue;
+        const item = createCharacterCandidate(candidate);
+        if (!item.name || !item.text || seen.has(item.name)) continue;
+        seen.add(item.name);
+        out.push({
+            name: item.name,
+            text: item.text,
+            source: item.source,
+            stable: !!item.stable,
+        });
+    }
+    return out;
+}
+
+function applyConfirmedCharacterReferences(options = {}, confirmed = []) {
+    const refs = normalizeConfirmedCharacterReferences(confirmed);
+    if (!refs.length) return { ...options, confirmedCharacters: [] };
+    const fixed = { ...(options.fixed || {}) };
+    fixed.characters = refs.map((item) => `${item.name}: ${item.text}`).join("\n");
+    fixed.charactersText = refs.map((item) => `${item.name}：${item.text}`).join("\n");
+    return {
+        ...options,
+        fixed,
+        confirmedCharacters: refs,
+    };
+}
+
+// ═══════════════════════════════════════════════════════════════
+// SECTION 7.5: IMAGE PLAN / IMAGE JOB（规划层骨架）
+// ═══════════════════════════════════════════════════════════════
+
+const IMAGE_JOB_STATUSES = ["pending", "running", "succeeded", "failed", "cancelRequested"];
+let imagePlanSeq = 0;
+let imageJobSeq = 0;
+
+function createContinuityState(mode = "off", options = {}) {
+    return {
+        mode: String(mode || "off"),
+        referenceImages: Array.isArray(options.referenceImages) ? [...options.referenceImages] : [],
+        firstImage: String(options.firstImage || ""),
+        previousImage: String(options.previousImage || ""),
+    };
+}
+
+function createStoryBeat(input = {}) {
+    return {
+        index: Number(input.index) || 0,
+        title: String(input.title || ""),
+        visualMoment: String(input.visualMoment || ""),
+        characters: coerceStringArray(input.characters),
+        scene: String(input.scene || ""),
+        actions: coerceStringArray(input.actions),
+        anchors: coerceStringArray(input.anchors),
+    };
+}
+
+function createComicPanel(input = {}) {
+    return {
+        index: Number(input.index) || 0,
+        shotType: String(input.shotType || ""),
+        imageDescription: String(input.imageDescription || ""),
+        characters: coerceStringArray(input.characters),
+        actions: coerceStringArray(input.actions),
+        dialogue: coerceStringArray(input.dialogue, { dialogue: true }),
+        caption: String(input.caption || ""),
+        anchors: coerceStringArray(input.anchors),
+    };
+}
+
+function createImageJob(input = {}) {
+    const prompt = String(input.prompt || "").trim();
+    return {
+        id: String(input.id || `job_${++imageJobSeq}`),
+        mode: String(input.mode || "single"),
+        kind: String(input.kind || "text2image"),
+        index: Number(input.index) || 0,
+        title: String(input.title || ""),
+        prompt,
+        promptDiagnostics: input.promptDiagnostics && typeof input.promptDiagnostics === "object" ? { ...input.promptDiagnostics } : {},
+        compiledPrompt: String(input.compiledPrompt || ""),
+        refinedPrompt: String(input.refinedPrompt || ""),
+        safetyPrompt: String(input.safetyPrompt || ""),
+        sourceText: String(input.sourceText || prompt),
+        characters: Array.isArray(input.characters) ? [...input.characters] : [],
+        scene: String(input.scene || ""),
+        anchors: Array.isArray(input.anchors) ? [...input.anchors] : [],
+        dialogue: input.dialogue ?? null,
+        dialogueMode: String(input.dialogueMode || input.promptDiagnostics?.dialogueMode || ""),
+        caption: String(input.caption || ""),
+        referenceImages: Array.isArray(input.referenceImages) ? [...input.referenceImages] : [],
+        result: input.result || null,
+        status: IMAGE_JOB_STATUSES.includes(input.status) ? input.status : "pending",
+        error: String(input.error || ""),
+        errorClass: String(input.errorClass || ""),
+        errorSummary: String(input.errorSummary || ""),
+        rawError: String(input.rawError || ""),
+        retryable: !!input.retryable,
+        policyRetryCount: Number(input.policyRetryCount) || 0,
+        safeRetryPrompt: String(input.safeRetryPrompt || ""),
+        policyOriginalPrompt: String(input.policyOriginalPrompt || ""),
+        safetyRewritten: !!input.safetyRewritten,
+        source: String(input.source || ""),
+        requestedCount: Number(input.requestedCount) || 0,
+        missingPlaceholder: !!input.missingPlaceholder,
+        createdAt: Number(input.createdAt) || Date.now(),
+        startedAt: Number(input.startedAt) || 0,
+        finishedAt: Number(input.finishedAt) || 0,
+        durationMs: Number(input.durationMs) || 0,
+    };
+}
+
+function createImagePlan(input = {}) {
+    const mode = String(input.mode || "single");
+    return {
+        id: String(input.id || `plan_${++imagePlanSeq}`),
+        mode,
+        sourceText: String(input.sourceText || ""),
+        fixed: input.fixed || null,
+        visualBible: input.visualBible || input.fixed?.visualBible || null,
+        strategy: mode === "single" ? normalizeSingleImageStrategy(input.strategy) : String(input.strategy || ""),
+        selectedTarget: input.selectedTarget || null,
+        globalStyle: String(input.globalStyle || ""),
+        characters: Array.isArray(input.characters) ? [...input.characters] : [],
+        scenes: Array.isArray(input.scenes) ? [...input.scenes] : [],
+        beats: Array.isArray(input.beats) ? input.beats.map((beat) => createStoryBeat(beat)) : [],
+        panels: Array.isArray(input.panels) ? input.panels.map((panel) => createComicPanel(panel)) : [],
+        continuity: input.continuity || createContinuityState(),
+        failurePolicy: String(input.failurePolicy || "continue"),
+        jobs: Array.isArray(input.jobs) ? input.jobs.map((job) => createImageJob(job)) : [],
+    };
+}
+
+function compileJobPrompt(mode, jobInput = {}, fixed = null, options = {}) {
+    const settings = extension_settings?.[extensionName] || defaultSettings;
+    const fallback = String(jobInput.prompt || jobInput.promptParts?.visualMoment || jobInput.title || "").trim();
+    if (settings.promptCompilerEnabled === false) {
+        return {
+            prompt: fallback,
+            diagnostics: { mode, compiler: "disabled" },
+        };
+    }
+    const compiled = compileImagePrompt({
+        mode,
+        fixed,
+        visualBible: options.visualBible || fixed?.visualBible || null,
+        dialogueEnabled: options.dialogueEnabled,
+        strategy: options.strategy,
+        job: jobInput,
+    });
+    return {
+        prompt: compiled.prompt || fallback,
+        diagnostics: compiled.diagnostics || {},
+    };
+}
+
+function createSingleImagePlan(sourceText, options = {}) {
+    const raw = String(sourceText || "").trim();
+    const fixed = options.fixed || null;
+    const visualBible = options.visualBible || fixed?.visualBible || null;
+    const strategy = normalizeSingleImageStrategy(options.strategy || extension_settings?.[extensionName]?.singleImageStrategy);
+    const selectedTarget = options.selectedTarget || planSingleImageTarget(raw, {
+        strategy,
+        fixed,
+        characters: options.characters,
+    });
+    const jobInput = {
+        mode: "single",
+        title: options.title || selectedTarget.title || "单图",
+        characters: selectedTarget.characters || options.characters || [],
+        scene: selectedTarget.scene || options.scene || "",
+        anchors: selectedTarget.anchors || options.anchors || [],
+        promptParts: selectedTarget,
+    };
+    const compiled = compileJobPrompt("single", jobInput, fixed, { strategy, visualBible });
+    const prompt = String(options.prompt || compiled.prompt || raw).trim();
+    const job = createImageJob({
+        mode: "single",
+        kind: "text2image",
+        index: 0,
+        title: jobInput.title,
+        prompt,
+        compiledPrompt: compiled.prompt,
+        promptDiagnostics: compiled.diagnostics,
+        sourceText: raw,
+        characters: jobInput.characters,
+        scene: jobInput.scene,
+        anchors: jobInput.anchors,
+        referenceImages: options.referenceImages,
+    });
+    return createImagePlan({
+        mode: "single",
+        sourceText: raw,
+        fixed,
+        visualBible,
+        strategy,
+        selectedTarget,
+        continuity: options.continuity || createContinuityState(extension_settings?.[extensionName]?.continuityMode),
+        failurePolicy: options.failurePolicy || "stop",
+        jobs: [job],
+    });
+}
+
+function validateImageJob(job) {
+    if (!job || typeof job !== "object") throw new Error("ImageJob 无效：不是对象。");
+    if (!String(job.id || "").trim()) throw new Error("ImageJob 无效：缺少 id。");
+    if (!String(job.prompt || "").trim()) throw new Error("ImageJob 无效：缺少 prompt。");
+    if (!IMAGE_JOB_STATUSES.includes(job.status)) throw new Error(`ImageJob 状态无效：${job.status}`);
+    return true;
+}
+
+function setImageJobStatus(job, status, patch = {}) {
+    if (!IMAGE_JOB_STATUSES.includes(status)) throw new Error(`ImageJob 状态无效：${status}`);
+    job.status = status;
+    if (patch.result !== undefined) job.result = patch.result;
+    if (patch.error !== undefined) job.error = String(patch.error || "");
+    if (patch.errorClass !== undefined) job.errorClass = String(patch.errorClass || "");
+    if (patch.errorSummary !== undefined) job.errorSummary = String(patch.errorSummary || "");
+    if (patch.rawError !== undefined) job.rawError = String(patch.rawError || "");
+    if (patch.retryable !== undefined) job.retryable = !!patch.retryable;
+    if (patch.policyRetryCount !== undefined) job.policyRetryCount = Number(patch.policyRetryCount) || 0;
+    if (patch.safeRetryPrompt !== undefined) job.safeRetryPrompt = String(patch.safeRetryPrompt || "");
+    if (patch.policyOriginalPrompt !== undefined) job.policyOriginalPrompt = String(patch.policyOriginalPrompt || "");
+    if (patch.safetyRewritten !== undefined) job.safetyRewritten = !!patch.safetyRewritten;
+    if (patch.startedAt !== undefined) job.startedAt = Number(patch.startedAt) || 0;
+    if (patch.finishedAt !== undefined) job.finishedAt = Number(patch.finishedAt) || 0;
+    if (patch.durationMs !== undefined) job.durationMs = Number(patch.durationMs) || 0;
+    return job;
+}
+
+function requestCancelImageJob(job) {
+    return setImageJobStatus(job, "cancelRequested");
+}
+
+// ─── 图生图连续性（预留）────────────────────────────────
+
+function normalizeContinuityMode(value) {
+    const key = String(value || "").trim();
+    return ["off", "previous", "firstAndPrevious", "characterAndPrevious"].includes(key) ? key : "off";
+}
+
+/** 编辑/图生图能力是否可用：当前仅检查预留配置；接口调研接入后在此扩展探测逻辑。 */
+function isImageEditAvailable() {
+    const s = extension_settings?.[extensionName];
+    return !!(s?.imageEditEnabled && String(s?.imageEditEndpoint || "").trim());
+}
+
+/**
+ * 执行前按 plan.continuity 把参考图写入 job.referenceImages（仅元数据，不影响文生图请求）：
+ * - previous / characterAndPrevious：上一张成功图（角色参考图位待人物库挂图后注入）
+ * - firstAndPrevious：首图 + 上一张（去重）
+ */
+function applyContinuityToJob(plan, job) {
+    const continuity = plan?.continuity;
+    const mode = normalizeContinuityMode(continuity?.mode);
+    if (mode === "off") return;
+
+    const refs = [];
+    if (mode === "firstAndPrevious" && continuity.firstImage) refs.push(continuity.firstImage);
+    if (continuity.previousImage) refs.push(continuity.previousImage);
+
+    const seen = new Set(job.referenceImages);
+    for (const url of refs) {
+        if (url && !seen.has(url)) {
+            seen.add(url);
+            job.referenceImages.push(url);
+        }
+    }
+}
+
+/** 成功 job 后更新 plan.continuity 的首图/上一张记录。 */
+function updateContinuityAfterJob(plan, job) {
+    const continuity = plan?.continuity;
+    if (!continuity) return;
+    const url = job?.result?.images?.[0];
+    if (!url) return;
+    if (!continuity.firstImage) continuity.firstImage = url;
+    continuity.previousImage = url;
+}
+
+/**
+ * 7.3 任务级图片请求分发器：内部先分派 text2image，预留 edit/image-to-image 分派点。
+ * job.kind === "edit" 且编辑能力不可用（当前恒不可用）→ 失败降级路径：回退文生图，不中断整个 plan。
+ */
+async function requestImageForJob(job, meta = {}) {
+    if (String(job?.kind || "text2image") === "edit") {
+        if (isImageEditAvailable()) {
+            // 预留分派点：chatgpt2api 编辑接口调研接入后，在此调用 requestViaImageEdits(job, meta)
+            console.warn(`[${extensionName}] 编辑接口已配置但尚未实现请求逻辑，job ${job.id} 暂以文生图执行。`);
+        } else {
+            console.warn(`[${extensionName}] 编辑接口未配置，job ${job.id} 降级为文生图。`);
+        }
+    }
+    return requestImagesFromBackend(job.prompt, { ...meta, prompt: meta.prompt || job.prompt, kind: job.kind });
+}
+
+function collectImagePlanResults(plan) {
+    const jobs = Array.isArray(plan?.jobs) ? plan.jobs : [];
+    const images = [];
+    const contentParts = [];
+    for (const job of jobs) {
+        if (job.status !== "succeeded" || !job.result) continue;
+        if (Array.isArray(job.result.images)) images.push(...job.result.images);
+        if (job.result.content) contentParts.push(String(job.result.content));
+    }
+    return {
+        images,
+        content: contentParts.join("\n").trim(),
+        jobs,
+        plan,
+    };
+}
+
+async function executeImageJob(job, requester, meta = {}) {
+    validateImageJob(job);
+    if (job.status === "cancelRequested") {
+        return job.result || { images: [], content: "" };
+    }
+    const startedAt = Date.now();
+    setImageJobStatus(job, "running", {
+        error: "",
+        errorClass: "",
+        errorSummary: "",
+        rawError: "",
+        retryable: false,
+        startedAt,
+        finishedAt: 0,
+        durationMs: 0,
+    });
+    try {
+        const fullMeta = {
+            ...meta,
+            prompt: meta.prompt || job.prompt,
+            mode: job.mode,
+            jobId: job.id,
+            index: job.index,
+            jobPrompt: job.prompt,
+        };
+        // requester 为空 → 走任务级分发器（text2image 优先，edit 预留降级）；显式传入则保持旧 (prompt, meta) 契约
+        const result = requester
+            ? await requester(job.prompt, fullMeta)
+            : await requestImageForJob(job, fullMeta);
+        const normalized = {
+            ...result,
+            images: Array.isArray(result?.images) ? result.images : [],
+            content: String(result?.content || ""),
+        };
+        if (job.status === "cancelRequested") {
+            return normalized;
+        }
+        const finishedAt = Date.now();
+        setImageJobStatus(job, "succeeded", {
+            result: normalized,
+            error: "",
+            errorClass: "",
+            errorSummary: "",
+            rawError: "",
+            retryable: false,
+            finishedAt,
+            durationMs: Math.max(0, finishedAt - startedAt),
+        });
+        return normalized;
+    } catch (error) {
+        if (job.status !== "cancelRequested") {
+            const finishedAt = Date.now();
+            const classified = classifyImageGenerationError(error);
+            setImageJobStatus(job, "failed", {
+                error: classified.rawMessage || error?.message || String(error || "生成失败"),
+                errorClass: classified.errorClass,
+                errorSummary: classified.summary,
+                rawError: classified.rawMessage,
+                finishedAt,
+                durationMs: Math.max(0, finishedAt - startedAt),
+            });
+        }
+        throw error;
+    }
+}
+
+async function executeImagePlan(plan, requester, meta = {}) {
+    const jobs = Array.isArray(plan?.jobs) ? plan.jobs : [];
+    const policy = normalizePlanFailurePolicy(plan?.failurePolicy || "continue");
+    const autoPolicyRetry = meta.policyAutoRetry !== false;
+    plan.failurePolicy = policy;
+    for (let index = 0; index < jobs.length; index += 1) {
+        const job = jobs[index];
+        try {
+            applyContinuityToJob(plan, job);
+            await executeImageJob(job, requester, meta);
+            updateContinuityAfterJob(plan, job);
+        } catch (error) {
+            markImageJobFailure(job, error, policy);
+            if (autoPolicyRetry && canUsePolicySafeRetry(job)) {
+                try {
+                    await retryImageJob(job, requester, {
+                        ...meta,
+                        source: meta.source || "policy-safe-retry",
+                        policySafeRetry: true,
+                    });
+                    updateContinuityAfterJob(plan, job);
+                    continue;
+                } catch (retryError) {
+                    markImageJobFailure(job, retryError, policy);
+                }
+            }
+            if (policy === "stop") {
+                markPendingJobsStopped(jobs.slice(index + 1), error);
+                break;
+            }
+        }
+    }
+    return collectImagePlanResults(plan);
+}
+
+function markImageJobFailure(job, error, policy = "continue") {
+    if (!job) return;
+    const classified = classifyImageGenerationError(error || job.rawError || job.error || "生成失败");
+    const message = classified.rawMessage || error?.message || String(error || job.error || "生成失败");
+    const safeRetryPrompt = classified.errorClass === "policy"
+        ? (job.safeRetryPrompt || createPolicySafeRetryPrompt(job.prompt, { visualBibleSummary: formatVisualBibleSummaryForRetry(job) }))
+        : "";
+    const retryable = normalizePlanFailurePolicy(policy) === "retry"
+        || !!job.missingPlaceholder
+        || canUsePolicySafeRetry({ ...job, errorClass: classified.errorClass });
+    setImageJobStatus(job, "failed", {
+        error: message,
+        errorClass: classified.errorClass,
+        errorSummary: classified.summary,
+        rawError: message,
+        safeRetryPrompt,
+        retryable,
+    });
+}
+
+function markPendingJobsStopped(jobs, error) {
+    const reason = error?.message || String(error || "前序任务失败");
+    for (const job of jobs || []) {
+        if (!job || job.status !== "pending") continue;
+        setImageJobStatus(job, "failed", {
+            error: `已停止：${reason}`,
+            errorClass: "backend",
+            errorSummary: `已停止：${reason}`,
+            retryable: false,
+            finishedAt: Date.now(),
+        });
+    }
+}
+
+function formatVisualBibleSummaryForRetry(job) {
+    const diagnostics = job?.promptDiagnostics || {};
+    const parts = [];
+    if (Array.isArray(diagnostics.scopedCharacters) && diagnostics.scopedCharacters.length) {
+        parts.push(`人物：${diagnostics.scopedCharacters.slice(0, 6).join("、")}`);
+    }
+    if (Array.isArray(diagnostics.candidateCharacters) && diagnostics.candidateCharacters.length) {
+        parts.push(`候选：${diagnostics.candidateCharacters.slice(0, 4).join("、")}`);
+    }
+    if (diagnostics.activeScene) parts.push(`场景：${diagnostics.activeScene}`);
+    if (diagnostics.activeStyle) parts.push(`风格：${diagnostics.activeStyle}`);
+    if (diagnostics.imageTextPolicy) parts.push(`对白：${diagnostics.imageTextPolicy}`);
+    return parts.join("；");
+}
+
+function preparePolicySafeRetry(job) {
+    if (!canUsePolicySafeRetry(job)) return false;
+    const safePrompt = job.safeRetryPrompt || createPolicySafeRetryPrompt(job.prompt, {
+        visualBibleSummary: formatVisualBibleSummaryForRetry(job),
+    });
+    job.policyOriginalPrompt = job.policyOriginalPrompt || job.prompt;
+    job.safeRetryPrompt = safePrompt;
+    job.prompt = safePrompt;
+    job.safetyPrompt = safePrompt;
+    job.safetyRewritten = true;
+    job.policyRetryCount = Number(job.policyRetryCount || 0) + 1;
+    return true;
+}
+
+function recoverMissingStoryBeatPrompt(job) {
+    if (!job?.missingPlaceholder) return String(job?.prompt || "").trim();
+    const source = String(job.sourceText || "").trim();
+    const index = Number(job.index) + 1;
+    return [
+        `【补齐节点 ${index}】文本模型未返回该剧情节点，请根据源文本提炼一个安全、清晰、可单独成图的画面。`,
+        source ? `【源文本】${source}` : "",
+        "画面要求：只生成这一张缺失节点的画面，不重复已成功节点；保持人物、场景和剧情连续性。",
+    ].filter(Boolean).join("\n\n");
+}
+
+async function retryImageJob(job, requester = requestImagesFromBackend, meta = {}) {
+    if (!job) throw new Error("缺少可重试的 ImageJob。");
+    if (meta.policySafeRetry) {
+        if (!preparePolicySafeRetry(job)) {
+            throw new Error("该任务没有可用的安全重试次数。");
+        }
+    }
+    if (job.missingPlaceholder && !String(job.prompt || "").trim()) {
+        job.prompt = recoverMissingStoryBeatPrompt(job);
+    }
+    if (!String(job.prompt || "").trim()) {
+        throw new Error("该任务缺少 prompt，无法重试。");
+    }
+    try {
+        setImageJobStatus(job, "pending", { error: "", errorClass: "", errorSummary: "", rawError: "", retryable: false });
+        const result = await executeImageJob(job, requester, {
+            ...meta,
+            source: meta.source || (meta.policySafeRetry ? "policy-safe-retry" : "job-retry"),
+            retryOf: job.id,
+            prompt: meta.policySafeRetry ? job.prompt : (meta.prompt || job.prompt),
+        });
+        return result;
+    } catch (error) {
+        markImageJobFailure(job, error, "retry");
+        throw error;
+    }
+}
+
+async function finalizeCompiledJobPrompt(job, options = {}) {
+    const settings = extension_settings[extensionName];
+    const fixed = options.fixed || null;
+    job.compiledPrompt = job.compiledPrompt || job.prompt;
+
+    const shouldOptimize = !options.skipOptimize && (options.forceOptimize || settings.optimizeAuto);
+    if (settings.optimizeEnabled && shouldOptimize) {
+        setStatus("正在精修编译提示词...", "info");
+        const refined = await optimizePrompt(job.prompt, fixed);
+        if (refined) {
+            job.refinedPrompt = refined;
+            job.prompt = refined;
+            job.promptDiagnostics = { ...(job.promptDiagnostics || {}), refined: true };
+        }
+    }
+
+    if (settings.nsfwAvoidance) {
+        setStatus("正在安全重写提示词...", "info");
+        const safe = await sanitizePrompt(job.prompt);
+        if (safe) {
+            job.safetyPrompt = safe;
+            job.prompt = safe;
+            job.promptDiagnostics = {
+                ...(job.promptDiagnostics || {}),
+                safety: true,
+                safetyLevel: normalizePromptSafetyLevel(settings.promptSafetyLevel),
+            };
+        }
+    }
+    return job.prompt;
+}
+
+async function finalizeImagePlanPrompts(plan, options = {}) {
+    const jobs = Array.isArray(plan?.jobs) ? plan.jobs : [];
+    for (const job of jobs) {
+        if (!job || job.missingPlaceholder || job.status === "failed") continue;
+        await finalizeCompiledJobPrompt(job, { ...options, fixed: options.fixed || plan.fixed || null });
+    }
+    return plan;
+}
+
+async function requestSingleImagePlan(sourceText, requestMeta = {}, planOptions = {}) {
+    const settings = extension_settings[extensionName];
+    const raw = String(planOptions.sourceText || sourceText || "");
+    const fixed = planOptions.fixed || await resolveFixedSettings(raw, settings);
+    const plan = createSingleImagePlan(raw, { ...planOptions, fixed });
+    await finalizeImagePlanPrompts(plan, {
+        ...(planOptions.pipelineOptions || {}),
+        fixed,
+    });
+    return executeImagePlan(plan, requestImagesFromBackend, requestMeta);
+}
+
+async function runSingleImagePlan(sourceText, pipelineOptions = {}, requestMeta = {}, planOptions = {}) {
+    return requestSingleImagePlan(sourceText, requestMeta, {
+        ...planOptions,
+        prompt: pipelineOptions.promptOverride || planOptions.prompt,
+        fixed: pipelineOptions.fixed || planOptions.fixed,
+        strategy: pipelineOptions.strategy || planOptions.strategy,
+        pipelineOptions,
+        sourceText,
+    });
+}
+
+// ─── 多图模式 ───────────────────────────────────────────
+
+function normalizeBeatCount(value) {
+    const count = parseInt(value, 10);
+    if (isNaN(count) || count < 2) return 2;
+    if (count > 6) return 6;
+    return count;
+}
+
+/**
+ * 多图/漫画 plan 的失败策略归一化：非法存档值回退 continue（保留成功项），
+ * 与自动流程的 normalizeAutomaticFlowFailurePolicy（回退 stop）语义不同，勿混用。
+ */
+function normalizePlanFailurePolicy(value, fallback = "continue") {
+    const key = String(value || "").trim();
+    return ["stop", "continue", "retry"].includes(key) ? key : fallback;
+}
+
+/**
+ * LLM 数组条目安全字符串化：LLM 常违反模板返回对象（如 {speaker,text}）或数字，
+ * 直接 join 会把 [object Object] 写进生图 prompt。对象按 dialogue 取「说话人：台词」，
+ * 其余取 name 或丢弃；标量 String()；空值过滤。
+ */
+function coerceStringArray(value, { dialogue = false } = {}) {
+    if (!Array.isArray(value)) return [];
+    return value.map((item) => {
+        if (item == null) return "";
+        if (typeof item === "string") return item.trim();
+        if (typeof item === "object") {
+            if (dialogue && (item.speaker != null || item.text != null)) {
+                const speaker = String(item.speaker ?? "").trim();
+                const text = String(item.text ?? "").trim();
+                return speaker && text ? `${speaker}：${text}` : (text || speaker);
+            }
+            if (item.name != null) return String(item.name).trim();
+            return "";
+        }
+        return String(item).trim();
+    }).filter(Boolean);
+}
+
+function renderMultiAnalysisTemplate(template, prompt, beatCount) {
+    return String(template || "")
+        .replace(/\{\{\s*prompt\s*\}\}/g, String(prompt || "").trim())
+        .replace(/\{\{\s*beatCount\s*\}\}/g, String(beatCount || 3));
+}
+
+function splitStoryBeats(llmResponse, requestedCount) {
+    // 必须用原始对象解析：parseAnalysisJson 只保留 characters/style/scene，会丢掉 beats
+    const json = parseRawJsonObject(llmResponse);
+    const beats = Array.isArray(json?.beats) ? json.beats : [];
+    const count = Number(requestedCount) || 3;
+
+    if (beats.length > count) {
+        console.log(`[${extensionName}] 多图拆分返回 ${beats.length} 个节点，截断为请求的 ${count} 个。`);
+        return beats.slice(0, count).map((beat, i) => createStoryBeat({ ...beat, index: i }));
+    }
+
+    if (beats.length < count) {
+        console.log(`[${extensionName}] 多图拆分返回 ${beats.length} 个节点，少于请求的 ${count} 个，保留现有节点。`);
+    }
+
+    return beats.map((beat, i) => createStoryBeat({ ...beat, index: i }));
+}
+
+async function analyzeStoryBeats(sourceText, beatCount, settings) {
+    const template = settings.multiAnalysisTemplate || defaultSettings.multiAnalysisTemplate;
+    const systemPrompt = "你是剧情分镜专家。";
+    const userMessage = renderMultiAnalysisTemplate(template, sourceText, beatCount);
+
+    let result;
+    try {
+        setStatus(`正在拆分 ${beatCount} 个剧情节点...`, "info");
+        result = await callLlmForText(systemPrompt, userMessage);
+    } catch (error) {
+        console.error(`[${extensionName}] Story beat analysis failed`, error);
+        throw new Error(`剧情节点拆分失败：${error?.message || String(error)}`);
+    }
+
+    const beats = splitStoryBeats(result, beatCount);
+    if (!beats.length) {
+        // 区分于「后端没有返回图片」：是文本模型没按 JSON 输出，让用户排查正确的层
+        throw new Error("剧情节点拆分失败：未能从文本模型输出中解析出任何节点，请检查模型是否按 JSON 格式返回 beats 数组。");
+    }
+    return beats;
+}
+
+function createMultiImagePlan(sourceText, options = {}) {
+    const raw = String(sourceText || "").trim();
+    const beatCount = normalizeBeatCount(options.beatCount || extension_settings?.[extensionName]?.defaultBeatCount || 3);
+    const beats = Array.isArray(options.beats) ? options.beats : [];
+    const fixed = options.fixed || null;
+    const visualBible = options.visualBible || fixed?.visualBible || null;
+    const failurePolicy = normalizePlanFailurePolicy(options.failurePolicy || extension_settings?.[extensionName]?.multiImageFailurePolicy);
+
+    const jobs = beats.map((beat, i) => {
+        const legacyPrompt = buildBeatPrompt(beat, fixed, options);
+        const compiled = compileJobPrompt("multi", {
+            mode: "multi",
+            title: beat.title || `节点 ${i + 1}`,
+            prompt: legacyPrompt,
+            characters: beat.characters || [],
+            scene: beat.scene || "",
+            anchors: beat.anchors || [],
+            promptParts: {
+                title: beat.title || "",
+                visualMoment: beat.visualMoment || beat.title || "",
+                characters: beat.characters || [],
+                scene: beat.scene || "",
+                actions: beat.actions || [],
+                anchors: beat.anchors || [],
+            },
+        }, fixed, { ...options, visualBible });
+        return createImageJob({
+            mode: "multi",
+            kind: "text2image",
+            index: i,
+            title: beat.title || `节点 ${i + 1}`,
+            prompt: compiled.prompt,
+            compiledPrompt: compiled.prompt,
+            promptDiagnostics: compiled.diagnostics,
+            sourceText: raw,
+            characters: beat.characters || [],
+            scene: beat.scene || "",
+            anchors: beat.anchors || [],
+        });
+    });
+    if (jobs.length < beatCount) {
+        jobs.push(...createMissingStoryBeatJobs(raw, jobs.length, beatCount, { failurePolicy }));
+    }
+
+    return createImagePlan({
+        mode: "multi",
+        sourceText: raw,
+        fixed,
+        visualBible,
+        strategy: options.strategy || "auto",
+        beats,
+        continuity: options.continuity || createContinuityState(extension_settings?.[extensionName]?.continuityMode),
+        failurePolicy,
+        jobs,
+    });
+}
+
+function createMissingStoryBeatJobs(sourceText, startIndex, requestedCount, options = {}) {
+    const jobs = [];
+    const from = Math.max(0, Number(startIndex) || 0);
+    const to = normalizeBeatCount(requestedCount);
+    for (let index = from; index < to; index += 1) {
+        jobs.push(createImageJob({
+            mode: "multi",
+            kind: "text2image",
+            index,
+            title: `缺失节点 ${index + 1}`,
+            prompt: recoverMissingStoryBeatPrompt({ sourceText, index, missingPlaceholder: true }),
+            sourceText,
+            status: "failed",
+            error: `文本模型未返回第 ${index + 1} 个剧情节点，可单独重试补齐。`,
+            retryable: true,
+            missingPlaceholder: true,
+            requestedCount: to,
+            source: "missing-story-beat",
+        }));
+    }
+    return jobs;
+}
+
+function buildBeatPrompt(beat, fixed, options = {}) {
+    const parts = [];
+    const fixedStyle = fixed?.style ?? fixed?.styleText;
+    const fixedCharacters = fixed?.characters ?? fixed?.charactersText;
+    const fixedScenes = fixed?.scenes ?? fixed?.scenesText;
+
+    // 固定风格
+    if (fixedStyle) {
+        parts.push(`【风格】${fixedStyle}`);
+    }
+
+    // 固定人物外貌
+    if (fixedCharacters && String(fixedCharacters).trim()) {
+        parts.push(`【人物外貌】${fixedCharacters}`);
+    }
+
+    // 固定场景
+    if (fixedScenes && String(fixedScenes).trim()) {
+        parts.push(`【场景设定】${fixedScenes}`);
+    }
+
+    // 本节点视觉瞬间
+    parts.push(`【本节点画面】${beat.visualMoment || beat.title || ""}`);
+
+    // 场景环境
+    if (beat.scene) {
+        parts.push(`场景：${beat.scene}`);
+    }
+
+    // 人物与动作
+    if (Array.isArray(beat.characters) && beat.characters.length > 0) {
+        parts.push(`出场人物：${beat.characters.join("、")}`);
+    }
+
+    if (Array.isArray(beat.actions) && beat.actions.length > 0) {
+        parts.push(`动作：${beat.actions.join("、")}`);
+    }
+
+    // 视觉锚点
+    if (Array.isArray(beat.anchors) && beat.anchors.length > 0) {
+        parts.push(`视觉锚点：${beat.anchors.join("、")}`);
+    }
+
+    return parts.join("\n\n").trim();
+}
+
+async function requestMultiImagePlan(sourceText, requestMeta = {}, planOptions = {}) {
+    const settings = extension_settings[extensionName];
+    const beatCount = normalizeBeatCount(planOptions.beatCount || settings.defaultBeatCount || 3);
+
+    // Step 1: 收集固定设定
+    const fixed = planOptions.fixed || await resolveFixedSettings(sourceText, settings);
+
+    // Step 2: LLM 拆分剧情节点
+    const beats = await analyzeStoryBeats(sourceText, beatCount, settings);
+
+    // Step 3: 创建多图 plan
+    const plan = createMultiImagePlan(sourceText, { ...planOptions, beats, fixed, beatCount });
+
+    // Step 4: 编译后安全重写（多图默认不做通用精修）
+    await finalizeImagePlanPrompts(plan, { fixed, skipOptimize: true });
+
+    // Step 5: 执行
+    return executeImagePlan(plan, requestImagesFromBackend, requestMeta);
+}
+
+async function runMultiImagePlan(sourceText, pipelineOptions = {}, requestMeta = {}, planOptions = {}) {
+    // 多图模式不走 processPromptPipeline 优化单个 prompt
+    // 而是直接拆分 beats，每个 beat 独立构建 prompt
+    return requestMultiImagePlan(sourceText, requestMeta, { ...planOptions, sourceText });
+}
+
+// ─── 漫画模式 ───────────────────────────────────────────
+
+function normalizeGenerationMode(value) {
+    const key = String(value || "").trim();
+    return ["single", "multi", "comic"].includes(key) ? key : "single";
+}
+
+function normalizeComicPanelCount(value) {
+    const count = parseInt(value, 10);
+    if (isNaN(count) || count < 2) return 2;
+    if (count > 8) return 8;
+    return count;
+}
+
+function normalizeComicDialogueMode(value) {
+    const key = String(value || "").trim();
+    return ["bubble", "modelText"].includes(key) ? key : "bubble";
+}
+
+function renderComicAnalysisTemplate(template, prompt, panelCount) {
+    return String(template || "")
+        .replace(/\{\{\s*prompt\s*\}\}/g, String(prompt || "").trim())
+        .replace(/\{\{\s*panelCount\s*\}\}/g, String(panelCount || 4));
+}
+
+function splitComicPanels(llmResponse, requestedCount) {
+    // 必须用原始对象解析：parseAnalysisJson 只保留 characters/style/scene，会丢掉 panels
+    const json = parseRawJsonObject(llmResponse);
+    const panels = Array.isArray(json?.panels) ? json.panels : [];
+    const count = normalizeComicPanelCount(requestedCount);
+
+    if (panels.length > count) {
+        console.log(`[${extensionName}] 漫画分镜返回 ${panels.length} 格，截断为请求的 ${count} 格。`);
+        return panels.slice(0, count).map((panel, i) => createComicPanel({ ...panel, index: i + 1 }));
+    }
+
+    if (panels.length < count) {
+        console.log(`[${extensionName}] 漫画分镜返回 ${panels.length} 格，少于请求的 ${count} 格，保留现有分格。`);
+    }
+
+    return panels.map((panel, i) => createComicPanel({ ...panel, index: i + 1 }));
+}
+
+async function analyzeComicPanels(sourceText, panelCount, settings) {
+    const template = settings.comicAnalysisTemplate || defaultSettings.comicAnalysisTemplate;
+    const systemPrompt = "你是漫画分镜师。";
+    const dialogueInstruction = settings.comicDialogueEnabled === false
+        ? "\n\n【对白开关】本次对白生成已关闭。即使模板示例包含 dialogue/caption 字段，也不要强制创造对白；请让 dialogue 为空数组、caption 为空字符串，除非原文已有必须保留的可见文字。"
+        : "\n\n【对白开关】本次对白生成已开启。请为适合的分格填写 dialogue 数组和 caption 字段；没有对白的格子可留空，但不要整篇遗漏可用对白元数据。";
+    const userMessage = renderComicAnalysisTemplate(template, sourceText, panelCount) + dialogueInstruction;
+
+    let result;
+    try {
+        setStatus(`正在规划 ${panelCount} 格漫画分镜...`, "info");
+        result = await callLlmForText(systemPrompt, userMessage);
+    } catch (error) {
+        console.error(`[${extensionName}] Comic panel analysis failed`, error);
+        throw new Error(`漫画分镜规划失败：${error?.message || String(error)}`);
+    }
+
+    const panels = splitComicPanels(result, panelCount);
+    if (!panels.length) {
+        // 区分于「后端没有返回图片」：是文本模型没按 JSON 输出，让用户排查正确的层
+        throw new Error("漫画分镜规划失败：未能从文本模型输出中解析出任何分格，请检查模型是否按 JSON 格式返回 panels 数组。");
+    }
+    return panels;
+}
+
+/**
+ * 为单个 ComicPanel 构建生图 prompt。
+ * - bubble（插件气泡，默认）：画面不出现文字/气泡/字幕，对白只保留在元数据里，由插件后续叠加。
+ * - modelText（模型画字）：在 prompt 中加入对白气泡的文字布局提示，同时元数据仍完整保存。
+ */
+function buildPanelPrompt(panel, fixed, options = {}) {
+    const dialogueMode = normalizeComicDialogueMode(options.dialogueMode);
+    const dialogueEnabled = options.dialogueEnabled !== false;
+    const parts = [];
+    const fixedStyle = fixed?.style ?? fixed?.styleText;
+    const fixedCharacters = fixed?.characters ?? fixed?.charactersText;
+    const fixedScenes = fixed?.scenes ?? fixed?.scenesText;
+
+    if (fixedStyle) {
+        parts.push(`【风格】漫画分格，${fixedStyle}`);
+    } else {
+        parts.push("【风格】漫画分格");
+    }
+
+    if (fixedCharacters && String(fixedCharacters).trim()) {
+        parts.push(`【人物外貌】${fixedCharacters}`);
+    }
+
+    if (fixedScenes && String(fixedScenes).trim()) {
+        parts.push(`【场景设定】${fixedScenes}`);
+    }
+
+    const shot = panel.shotType ? `（${panel.shotType}）` : "";
+    parts.push(`【第${panel.index || 1}格画面】${shot}${panel.imageDescription || ""}`);
+
+    if (Array.isArray(panel.characters) && panel.characters.length > 0) {
+        parts.push(`出场人物：${panel.characters.join("、")}`);
+    }
+
+    if (Array.isArray(panel.actions) && panel.actions.length > 0) {
+        parts.push(`动作：${panel.actions.join("、")}`);
+    }
+
+    if (Array.isArray(panel.anchors) && panel.anchors.length > 0) {
+        parts.push(`视觉锚点：${panel.anchors.join("、")}`);
+    }
+
+    if (!dialogueEnabled) {
+        parts.push("对白要求：本次不生成对白、旁白或字幕，不要在画面中加入额外文字。");
+    } else if (dialogueMode === "modelText") {
+        const lines = Array.isArray(panel.dialogue) ? panel.dialogue.filter(Boolean) : [];
+        if (lines.length > 0) {
+            parts.push(`对白气泡：请在画面中为以下对白绘制清晰可读的中文对白气泡，按说话人位置摆放：${lines.join("；")}`);
+        }
+        if (panel.caption) {
+            parts.push(`旁白框：在画面边缘绘制旁白文字「${panel.caption}」`);
+        }
+    } else {
+        // bubble：明确禁止画面文字，对白由插件以 HTML/CSS 气泡叠加（元数据保存在 ImageJob.dialogue / plan.panels）
+        parts.push("画面要求：不要在图片中出现任何文字、对白气泡或字幕，仅靠人物表情与肢体语言传达情绪。");
+    }
+
+    return parts.join("\n\n").trim();
+}
+
+function createComicImagePlan(sourceText, options = {}) {
+    const raw = String(sourceText || "").trim();
+    const panels = Array.isArray(options.panels) ? options.panels : [];
+    const fixed = options.fixed || null;
+    const visualBible = options.visualBible || fixed?.visualBible || null;
+    const dialogueMode = normalizeComicDialogueMode(options.dialogueMode);
+    const dialogueEnabled = options.dialogueEnabled !== false;
+
+    const jobs = panels.map((panel, i) => {
+        const legacyPrompt = buildPanelPrompt(panel, fixed, { ...options, dialogueMode, dialogueEnabled });
+        const compiled = compileJobPrompt("comic", {
+            mode: "comic",
+            title: `第 ${panel.index || i + 1} 格`,
+            prompt: legacyPrompt,
+            characters: panel.characters || [],
+            anchors: panel.anchors || [],
+            dialogue: Array.isArray(panel.dialogue) ? [...panel.dialogue] : [],
+            promptParts: {
+                title: `第 ${panel.index || i + 1} 格`,
+                shot: panel.shotType || "",
+                visualMoment: panel.imageDescription || "",
+                characters: panel.characters || [],
+                actions: panel.actions || [],
+                anchors: panel.anchors || [],
+                dialogue: Array.isArray(panel.dialogue) ? [...panel.dialogue] : [],
+                caption: panel.caption || "",
+                dialogueMode,
+                dialogueEnabled,
+            },
+        }, fixed, { ...options, visualBible, dialogueMode, dialogueEnabled });
+        return createImageJob({
+            mode: "comic",
+            kind: "text2image",
+            index: i,
+            title: `第 ${panel.index || i + 1} 格`,
+            prompt: compiled.prompt,
+            compiledPrompt: compiled.prompt,
+            promptDiagnostics: compiled.diagnostics,
+            sourceText: raw,
+            characters: panel.characters || [],
+            anchors: panel.anchors || [],
+            dialogue: Array.isArray(panel.dialogue) ? [...panel.dialogue] : [],
+            dialogueMode,
+            dialogueEnabled,
+            caption: panel.caption || "",
+        });
+    });
+
+    return createImagePlan({
+        mode: "comic",
+        sourceText: raw,
+        fixed,
+        visualBible,
+        strategy: dialogueMode,
+        panels,
+        continuity: options.continuity || createContinuityState(extension_settings?.[extensionName]?.continuityMode),
+        failurePolicy: normalizePlanFailurePolicy(options.failurePolicy || extension_settings?.[extensionName]?.comicFailurePolicy),
+        jobs,
+    });
+}
+
+async function requestComicImagePlan(sourceText, requestMeta = {}, planOptions = {}) {
+    const settings = extension_settings[extensionName];
+    const panelCount = normalizeComicPanelCount(planOptions.panelCount || settings.comicPanelCount || 4);
+    const dialogueMode = normalizeComicDialogueMode(planOptions.dialogueMode || settings.comicDialogueMode);
+    const dialogueEnabled = planOptions.dialogueEnabled ?? (settings.comicDialogueEnabled !== false);
+
+    // Step 1: 收集固定设定
+    const fixed = planOptions.fixed || await resolveFixedSettings(sourceText, settings);
+
+    // Step 2: LLM 规划分镜
+    const panels = await analyzeComicPanels(sourceText, panelCount, { ...settings, comicDialogueEnabled: dialogueEnabled });
+
+    // Step 3: 创建漫画 plan（每格一个 ImageJob，对白元数据随 job 保存）
+    const plan = createComicImagePlan(sourceText, { ...planOptions, panels, fixed, panelCount, dialogueMode, dialogueEnabled });
+
+    // Step 4: 编译后安全重写（漫画默认不做通用精修）
+    await finalizeImagePlanPrompts(plan, { fixed, skipOptimize: true });
+
+    // Step 5: 逐格串行执行（保留后续整页四格/双格一组的扩展点：分组逻辑可在此分批）
+    return executeImagePlan(plan, requestImagesFromBackend, requestMeta);
+}
+
+async function runComicImagePlan(sourceText, pipelineOptions = {}, requestMeta = {}, planOptions = {}) {
+    // 漫画模式同多图：不走单 prompt 优化，直接分镜后逐格构建 prompt
+    return requestComicImagePlan(sourceText, requestMeta, { ...planOptions, sourceText });
 }
 
 // ═══════════════════════════════════════════════════════════════
@@ -1669,8 +4305,602 @@ function extractImagesFromImagesApiResponse(data) {
 }
 
 // ═══════════════════════════════════════════════════════════════
+// SECTION 10.5: AUTOMATIC WHOLE-MESSAGE FLOW（自动整条 AI 消息生图）
+// ═══════════════════════════════════════════════════════════════
+
+const automaticMessageQueues = new Map();
+const automaticMessageTaskIndex = new Map();
+const automaticMessageInFlight = new Set();
+let automaticTaskSeq = 0;
+
+function normalizeAutomaticFlowFailurePolicy(value) {
+    const key = String(value || "stop").trim();
+    return ["stop", "continue", "retry"].includes(key) ? key : "stop";
+}
+
+function normalizeAutomaticFlowSettings(input = {}) {
+    const minChars = Number(input.automaticFlowMinChars);
+    return {
+        automaticFlowEnabled: !!input.automaticFlowEnabled,
+        automaticFlowFollowWorkbench: input.automaticFlowFollowWorkbench !== false,
+        automaticFlowMinChars: Number.isFinite(minChars) ? Math.max(0, Math.floor(minChars)) : defaultSettings.automaticFlowMinChars,
+        automaticFlowFailurePolicy: normalizeAutomaticFlowFailurePolicy(input.automaticFlowFailurePolicy),
+        automaticFlowShowQueue: input.automaticFlowShowQueue !== false,
+        automaticFlowCancelEnabled: input.automaticFlowCancelEnabled !== false,
+    };
+}
+
+function getAutomaticMessageSkipReason(settings, message, cleanedText = null) {
+    if (!settings?.automaticFlowEnabled) return "disabled";
+    if (!message || message.is_user || message.is_system || !message.mes) return "user_or_system";
+    const text = cleanedText == null ? cleanRpText(message.mes).trim() : String(cleanedText || "").trim();
+    const minChars = normalizeAutomaticFlowSettings(settings).automaticFlowMinChars;
+    if (text.length < minChars) return "too_short";
+    return "";
+}
+
+function normalizeAutomaticChatId(value) {
+    const raw = value && typeof value === "object" ? value.chatId : value;
+    return String(raw || "chat");
+}
+
+function messageHasImageAttachment(message) {
+    const extra = message?.extra || {};
+    if (Array.isArray(extra.media) && extra.media.some((item) => item?.url && String(item.type || "image").toLowerCase() === "image")) {
+        return true;
+    }
+    if (Array.isArray(extra.image_swipes) && extra.image_swipes.some(Boolean)) return true;
+    return typeof extra.image === "string" && extra.image.trim().length > 0;
+}
+
+function wasAutomaticMessageAlreadyAttached(message) {
+    const meta = message?.extra?.[extensionName];
+    return meta?.source === "automatic-message" && messageHasImageAttachment(message);
+}
+
+function isSameAutomaticMessage(currentMessage, originalMessage, cleanedText = "") {
+    if (!currentMessage || currentMessage.is_user || currentMessage.is_system) return false;
+    if (currentMessage === originalMessage) return true;
+
+    const originalText = String(cleanedText || cleanRpText(originalMessage?.mes || "").trim()).trim();
+    const currentText = cleanRpText(currentMessage.mes || "").trim();
+    if (originalText && currentText === originalText) return true;
+
+    const currentSendDate = currentMessage.send_date ?? currentMessage.sendDate ?? currentMessage.extra?.send_date;
+    const originalSendDate = originalMessage?.send_date ?? originalMessage?.sendDate ?? originalMessage?.extra?.send_date;
+    return currentSendDate != null && originalSendDate != null && String(currentSendDate) === String(originalSendDate);
+}
+
+function findAutomaticAttachmentMessage(context, task, originalMessage) {
+    const chat = Array.isArray(context?.chat) ? context.chat : [];
+    const cleanedText = String(task?.cleanedText || "").trim();
+    const seen = new Set();
+    const tryIndex = (index) => {
+        if (!Number.isInteger(index) || index < 0 || index >= chat.length || seen.has(index)) return null;
+        seen.add(index);
+        const message = chat[index];
+        return isSameAutomaticMessage(message, originalMessage, cleanedText)
+            ? { messageId: index, message }
+            : null;
+    };
+
+    const preferredIndex = Number(task?.messageId);
+    const preferred = tryIndex(Number.isInteger(preferredIndex) ? preferredIndex : -1);
+    if (preferred) return preferred;
+
+    const identityIndex = originalMessage ? chat.indexOf(originalMessage) : -1;
+    const byIdentity = tryIndex(identityIndex);
+    if (byIdentity) return byIdentity;
+
+    const originalSendDate = originalMessage?.send_date ?? originalMessage?.sendDate ?? originalMessage?.extra?.send_date;
+    if (originalSendDate != null) {
+        for (let i = 0; i < chat.length; i += 1) {
+            const message = chat[i];
+            const sendDate = message?.send_date ?? message?.sendDate ?? message?.extra?.send_date;
+            if (sendDate != null && String(sendDate) === String(originalSendDate)) {
+                const found = tryIndex(i);
+                if (found) return found;
+            }
+        }
+    }
+
+    if (cleanedText) {
+        for (let i = 0; i < chat.length; i += 1) {
+            const message = chat[i];
+            if (!message || message.is_user || message.is_system) continue;
+            if (cleanRpText(message.mes || "").trim() === cleanedText) {
+                const found = tryIndex(i);
+                if (found) return found;
+            }
+        }
+    }
+
+    return null;
+}
+
+function resolveAutomaticAttachmentTarget(task, originalMessage) {
+    const currentContext = getContext();
+    if (normalizeAutomaticChatId(currentContext) !== normalizeAutomaticChatId(task?.chatId)) {
+        return { context: currentContext, messageId: task?.messageId, message: null, reason: "chat_changed" };
+    }
+
+    const target = findAutomaticAttachmentMessage(currentContext, task, originalMessage);
+    if (!target?.message) {
+        return { context: currentContext, messageId: task?.messageId, message: null, reason: "message_changed" };
+    }
+
+    return { context: currentContext, messageId: target.messageId, message: target.message, reason: "" };
+}
+
+function getAutomaticQueueState(chatId) {
+    const key = String(chatId || "chat");
+    let state = automaticMessageQueues.get(key);
+    if (!state) {
+        state = { tail: Promise.resolve(), tasks: [] };
+        automaticMessageQueues.set(key, state);
+    }
+    return state;
+}
+
+function createAutomaticMessageTask(chatId, messageId, message, cleanedText, settings = {}) {
+    const followWorkbench = settings.automaticFlowFollowWorkbench !== false;
+    const mode = followWorkbench
+        ? normalizeGenerationMode(settings.generationMode || (settings.multiImageEnabled ? "multi" : "single"))
+        : "single";
+    const task = {
+        id: `auto_${++automaticTaskSeq}`,
+        chatId: String(chatId || "chat"),
+        messageId,
+        message,
+        cleanedText: String(cleanedText || "").trim(),
+        status: "queued",
+        failurePolicy: normalizeAutomaticFlowFailurePolicy(settings.automaticFlowFailurePolicy),
+        followWorkbench,
+        mode,
+        beatCount: normalizeBeatCount(settings.defaultBeatCount),
+        panelCount: normalizeComicPanelCount(settings.comicPanelCount),
+        dialogueEnabled: settings.comicDialogueEnabled !== false,
+        dialogueMode: normalizeComicDialogueMode(settings.comicDialogueMode),
+        multiFailurePolicy: normalizePlanFailurePolicy(settings.multiImageFailurePolicy),
+        comicFailurePolicy: normalizePlanFailurePolicy(settings.comicFailurePolicy),
+        inFlightKey: `${String(chatId || "chat")}:${messageId}`,
+        createdAt: Date.now(),
+        startedAt: 0,
+        finishedAt: 0,
+        result: null,
+        error: "",
+    };
+    automaticMessageTaskIndex.set(task.id, task);
+    return task;
+}
+
+function updateAutomaticQueueStatus(chatId = null) {
+    const entries = chatId == null
+        ? Array.from(automaticMessageQueues.values()).flatMap((state) => state.tasks)
+        : getAutomaticQueueState(chatId).tasks;
+    const active = entries.filter((task) => !["succeeded", "failed", "cancelRequested", "skipped"].includes(task.status));
+    const text = active.length
+        ? `自动队列：${active.filter((task) => task.status === "running").length} 运行 / ${active.filter((task) => task.status === "queued").length} 排队`
+        : "自动队列：空闲";
+    try {
+        const visible = extension_settings?.[extensionName]?.automaticFlowShowQueue !== false;
+        $("#oair_automatic_flow_queue_status").toggle(visible).text(text);
+    } catch (_) {}
+    return text;
+}
+
+function recordAutomaticFlowEvent(kind, text, task = null) {
+    const eventKind = String(kind || "info").trim() || "info";
+    const message = String(text || "").trim();
+    if (!message) return;
+    const taskSuffix = task?.id ? ` [${task.id}]` : "";
+    console.log(`[${extensionName}] [自动流程:${eventKind}]${taskSuffix} ${message}`);
+    try {
+        const box = $("#oair_automatic_flow_events");
+        if (!box.length) return;
+        const item = $("<div>")
+            .addClass(`oair-auto-flow-event oair-auto-flow-${eventKind.replace(/[^a-z0-9_-]/gi, "-")}`)
+            .attr("data-oair-auto-flow-kind", eventKind);
+        $("<span>").addClass("oair-auto-flow-kind").text(eventKind).appendTo(item);
+        $("<span>").addClass("oair-auto-flow-text").text(message).appendTo(item);
+        box.prepend(item);
+        box.children().slice(20).remove();
+    } catch (_) {}
+}
+
+function getAutomaticQueueSnapshot(chatId = null) {
+    const states = chatId == null ? Array.from(automaticMessageQueues.values()) : [getAutomaticQueueState(chatId)];
+    return states.flatMap((state) => state.tasks.map((task) => ({
+        id: task.id,
+        chatId: task.chatId,
+        messageId: task.messageId,
+        status: task.status,
+        error: task.error,
+    })));
+}
+
+function releaseAutomaticTask(task) {
+    if (!task) return;
+    automaticMessageTaskIndex.delete(task.id);
+    if (task.inFlightKey) automaticMessageInFlight.delete(task.inFlightKey);
+}
+
+function cancelAutomaticMessageTask(taskId = "") {
+    const task = automaticMessageTaskIndex.get(String(taskId || ""));
+    if (!task) return false;
+    if (["queued", "running"].includes(task.status)) {
+        task.status = "cancelRequested";
+        releaseAutomaticTask(task);
+        updateAutomaticQueueStatus(task.chatId);
+        setStatus(`已请求取消自动任务 ${task.messageId}`, "warning");
+        return true;
+    }
+    return false;
+}
+
+function cancelAutomaticMessageTasks(chatId = null) {
+    let count = 0;
+    const states = chatId == null ? Array.from(automaticMessageQueues.values()) : [getAutomaticQueueState(chatId)];
+    for (const state of states) {
+        for (const task of state.tasks) {
+            if (["queued", "running"].includes(task.status)) {
+                task.status = "cancelRequested";
+                releaseAutomaticTask(task);
+                count += 1;
+            }
+        }
+    }
+    updateAutomaticQueueStatus(chatId);
+    if (count) setStatus(`已请求取消 ${count} 个自动任务`, "warning");
+    return count;
+}
+
+function pruneAutomaticQueue(chatId) {
+    const state = getAutomaticQueueState(chatId);
+    const done = state.tasks.filter((task) => ["succeeded", "failed", "cancelRequested", "skipped"].includes(task.status));
+    for (const task of done) releaseAutomaticTask(task);
+    state.tasks = state.tasks.filter((task) => !["succeeded", "failed", "cancelRequested", "skipped"].includes(task.status)).slice(-20);
+    updateAutomaticQueueStatus(chatId);
+}
+
+async function processAutomaticMessageTask(task, runner) {
+    if (task.status === "cancelRequested") {
+        task.finishedAt = Date.now();
+        return task.result || { images: [], content: "" };
+    }
+    task.status = "running";
+    task.startedAt = Date.now();
+    updateAutomaticQueueStatus(task.chatId);
+    try {
+        const result = await runner(task);
+        const normalized = {
+            ...result,
+            images: Array.isArray(result?.images) ? result.images : [],
+            content: String(result?.content || ""),
+        };
+        if (task.status === "cancelRequested") {
+            task.finishedAt = Date.now();
+            return normalized;
+        }
+        task.status = "succeeded";
+        task.result = normalized;
+        task.error = "";
+        task.finishedAt = Date.now();
+        return normalized;
+    } catch (error) {
+        if (task.status !== "cancelRequested") {
+            task.status = "failed";
+            task.error = error?.message || String(error || "自动生图失败");
+        }
+        task.finishedAt = Date.now();
+        throw error;
+    } finally {
+        updateAutomaticQueueStatus(task.chatId);
+    }
+}
+
+function enqueueAutomaticMessageTask(task, runner) {
+    const state = getAutomaticQueueState(task.chatId);
+    state.tasks.push(task);
+    updateAutomaticQueueStatus(task.chatId);
+    const run = state.tail.catch(() => null).then(async () => {
+        if (task.status === "cancelRequested") {
+            task.finishedAt = Date.now();
+            updateAutomaticQueueStatus(task.chatId);
+            return task.result || { images: [], content: "" };
+        }
+        return processAutomaticMessageTask(task, runner);
+    }).finally(() => pruneAutomaticQueue(task.chatId));
+    state.tail = run.catch(() => null);
+    return run;
+}
+
+async function runAutomaticImagePlanForTask(task) {
+    const cleanedText = String(task?.cleanedText || "").trim();
+    const requestMeta = { source: "automatic-message", prompt: cleanedText };
+    const mode = normalizeGenerationMode(task?.mode);
+    logCharacterSelectionSummary(cleanedText, extension_settings[extensionName], "自动整条消息");
+
+    if (mode === "comic") {
+        return runComicImagePlan(cleanedText, { forceOptimize: false }, requestMeta, {
+            panelCount: normalizeComicPanelCount(task.panelCount),
+            dialogueEnabled: task.dialogueEnabled !== false,
+            dialogueMode: normalizeComicDialogueMode(task.dialogueMode),
+            failurePolicy: normalizePlanFailurePolicy(task.comicFailurePolicy),
+        });
+    }
+
+    if (mode === "multi") {
+        return runMultiImagePlan(cleanedText, { forceOptimize: false }, requestMeta, {
+            beatCount: normalizeBeatCount(task.beatCount),
+            failurePolicy: normalizePlanFailurePolicy(task.multiFailurePolicy),
+        });
+    }
+
+    return runSingleImagePlan(cleanedText, { forceOptimize: false }, requestMeta, {
+        failurePolicy: normalizeAutomaticFlowFailurePolicy(task.failurePolicy),
+    });
+}
+
+async function handleAutomaticWholeMessage(messageId, context, settings) {
+    const message = context?.chat?.[messageId];
+    const cleanedText = cleanRpText(message?.mes || "").trim();
+    const skipReason = getAutomaticMessageSkipReason(settings, message, cleanedText);
+    if (skipReason) {
+        recordAutomaticFlowEvent("skip", `自动流程跳过：${skipReason} / 消息 ${messageId}`);
+        if (skipReason === "too_short") {
+            setStatus(`自动流程跳过：正文少于 ${normalizeAutomaticFlowSettings(settings).automaticFlowMinChars} 字`, "info");
+        }
+        return false;
+    }
+    if (wasAutomaticMessageAlreadyAttached(message)) {
+        recordAutomaticFlowEvent("skip", `自动流程跳过：消息 ${messageId} 已有自动生成图片`);
+        setStatus(`自动流程跳过：消息 ${messageId} 已自动生图`, "info");
+        return false;
+    }
+
+    const chatId = normalizeAutomaticChatId(context);
+    const inFlightKey = `${chatId}:${messageId}`;
+    if (automaticMessageInFlight.has(inFlightKey)) {
+        recordAutomaticFlowEvent("skip", `自动流程跳过：消息 ${messageId} 已在队列中`);
+        setStatus(`自动流程跳过：消息 ${messageId} 已在队列中`, "info");
+        return false;
+    }
+
+    const task = createAutomaticMessageTask(chatId, messageId, message, cleanedText, settings);
+    automaticMessageInFlight.add(inFlightKey);
+    recordAutomaticFlowEvent("queued", `自动流程已排队：消息 ${messageId}`, task);
+    setStatus(`自动流程已排队：消息 ${messageId}`, "info");
+
+    try {
+        await enqueueAutomaticMessageTask(task, async (currentTask) => {
+            recordAutomaticFlowEvent("start", `自动流程开始：消息 ${messageId}`, currentTask);
+            recordAutomaticFlowEvent("running", "本地编译提示词并请求图片后端", currentTask);
+            setStatus(`自动流程生图中：消息 ${messageId}`, "info");
+            const result = await runAutomaticImagePlanForTask(currentTask);
+            if ((result.jobs || []).some((job) => job?.safeRetryPrompt)) {
+                recordAutomaticFlowEvent("safety-rewrite", `自动流程触发安全重写：消息 ${messageId}`, currentTask);
+            }
+            if ((result.jobs || []).some((job) => Number(job?.policyRetryCount || 0) > 0 || job?.errorClass === "policy")) {
+                recordAutomaticFlowEvent("policy-retry", `自动流程记录策略重试/政策状态：消息 ${messageId}`, currentTask);
+            }
+            addGenerationHistoryRecord(createGenerationHistoryRecord({
+                source: "automatic-message",
+                mode: currentTask.mode,
+                prompt: cleanedText,
+                plan: result.plan,
+                jobs: result.jobs,
+                status: result.images.length ? "succeeded" : "failed",
+            }));
+            if (currentTask.status === "cancelRequested") return result;
+            const target = resolveAutomaticAttachmentTarget(currentTask, message);
+            if (!target.message) {
+                const reasonText = target.reason === "chat_changed" ? "已不在当前聊天" : "已被修改或移除";
+                recordAutomaticFlowEvent("skip", `自动流程跳过附加：消息 ${messageId} ${reasonText}`, currentTask);
+                setStatus(`自动流程跳过附加：消息 ${messageId} ${reasonText}`, "warning");
+                return result;
+            }
+            if (result.images.length > 0) {
+                const targetMessage = target.message;
+                const finalPrompt = result.jobs?.[0]?.prompt || cleanedText;
+                const originalMessageText = String(targetMessage.mes || "");
+                const hasLegacyPicTags = /<pic\b[^>]*>/i.test(originalMessageText);
+                if (hasLegacyPicTags) {
+                    targetMessage.mes = cleanupMessageText(originalMessageText.replace(/<pic\b[^>]*>/gi, ""));
+                }
+                const dialogueMeta = createDialogueAttachmentMetadata(result.jobs);
+                attachGeneratedImages(targetMessage, result.images, [finalPrompt], dialogueMeta);
+                targetMessage.extra = targetMessage.extra || {};
+                targetMessage.extra[extensionName] = {
+                    ...(targetMessage.extra[extensionName] || {}),
+                    lastRunAt: Date.now(),
+                    source: "automatic-message",
+                    taskId: currentTask.id,
+                    mode: currentTask.mode,
+                    images: dedupeStrings(result.images).length,
+                };
+                await updateMessageBlockWhenReady(target.messageId, targetMessage, { rerenderMessage: false });
+                if (hasLegacyPicTags) stripRenderedPicTagsFromMessageBlock(target.messageId);
+                try { await target.context?.saveChat?.(); } catch (e) { console.warn(`[${extensionName}] saveChat failed`, e); }
+                recordAutomaticFlowEvent("success", `自动流程完成：消息 ${messageId}，图片 ${dedupeStrings(result.images).length} 张`, currentTask);
+                setStatus(`自动流程完成：消息 ${messageId}`, "success");
+                toastr.success("自动消息生图完成。");
+            } else {
+                recordAutomaticFlowEvent("failure", `自动流程失败：消息 ${messageId} 未检测到图片输出`, currentTask);
+                setStatus("自动流程未检测到图片输出", "warning");
+                toastr.warning("后端没有返回图片结果。");
+            }
+            return result;
+        });
+    } catch (error) {
+        console.error(`[${extensionName}] Automatic whole-message generation failed`, error);
+        recordAutomaticFlowEvent("failure", `自动流程失败：消息 ${messageId} / ${error?.message || String(error || "")}`, task);
+        setStatus(error?.message || String(error || "自动生图失败"), "error");
+        toastr.error(error?.message || String(error || "自动生图失败"));
+    } finally {
+        automaticMessageInFlight.delete(inFlightKey);
+    }
+    return true;
+}
+
+function decodeHtmlAttribute(value) {
+    return String(value || "")
+        .replace(/&quot;/g, '"')
+        .replace(/&#34;/g, '"')
+        .replace(/&apos;/g, "'")
+        .replace(/&#39;/g, "'")
+        .replace(/&lt;/g, "<")
+        .replace(/&gt;/g, ">")
+        .replace(/&amp;/g, "&")
+        .trim();
+}
+
+function extractPicTagAttributes(fullMatch) {
+    const attrs = {};
+    const text = String(fullMatch || "");
+    const attrRegex = new RegExp("([a-zA-Z_:][-a-zA-Z0-9_:.]*)\\s*=\\s*(?:\\\"([^\\\"]*)\\\"|'([^']*)'|([^\\s\\\"'=<>]+))", "g");
+    for (let match = attrRegex.exec(text); match; match = attrRegex.exec(text)) {
+        attrs[String(match[1] || "").toLowerCase()] = decodeHtmlAttribute(match[2] ?? match[3] ?? match[4] ?? "");
+    }
+    return attrs;
+}
+
+function logPicTagWarning(message, logger = null) {
+    const text = `标签属性回退：${message}`;
+    if (logger && typeof logger.warn === "function") {
+        logger.warn(text);
+    } else {
+        console.warn(`[${extensionName}] ${text}`);
+    }
+}
+
+function parseBoundedTagNumber(value, fallback, min, max, label, logger) {
+    if (value == null || String(value).trim() === "") return fallback;
+    const raw = Number(value);
+    if (!Number.isFinite(raw)) {
+        logPicTagWarning(`${label}="${value}" 不是有效数字，已回退。`, logger);
+        return fallback;
+    }
+    const intValue = Math.floor(raw);
+    const clamped = Math.min(max, Math.max(min, intValue));
+    if (clamped !== intValue) {
+        logPicTagWarning(`${label}="${value}" 超出范围，已限制为 ${clamped}。`, logger);
+    }
+    return clamped;
+}
+
+function parseTagBoolean(value, fallback = true) {
+    if (value == null || String(value).trim() === "") return fallback;
+    const key = String(value).trim().toLowerCase();
+    if (["0", "false", "off", "no", "disabled"].includes(key)) return false;
+    if (["1", "true", "on", "yes", "enabled"].includes(key)) return true;
+    return fallback;
+}
+
+function parsePicTagAttributes(fullMatch, fallbackPrompt = "", logger = null) {
+    const attrs = extractPicTagAttributes(fullMatch);
+    const prompt = String(attrs.prompt || fallbackPrompt || "").trim();
+    let mode = String(attrs.mode || "single").trim();
+    if (!["single", "multi", "comic"].includes(mode)) {
+        if (mode) logPicTagWarning(`mode="${mode}" 不支持，已按 single 处理。`, logger);
+        mode = "single";
+    }
+
+    const beatCount = parseBoundedTagNumber(attrs.count, 3, 2, 6, "count", logger);
+    const panelCount = parseBoundedTagNumber(attrs.panels ?? attrs.count, 4, 2, 8, attrs.panels == null ? "count" : "panels", logger);
+
+    let dialogueMode = String(attrs.dialogue || "bubble").trim();
+    if (!["bubble", "modelText"].includes(dialogueMode)) {
+        if (dialogueMode) logPicTagWarning(`dialogue="${dialogueMode}" 不支持，已按 bubble 处理。`, logger);
+        dialogueMode = "bubble";
+    }
+    const dialogueEnabled = parseTagBoolean(attrs.dialogueenabled ?? attrs.dialogue_enabled ?? attrs.dialoguegen ?? attrs.dialogue_generation, true);
+
+    let failurePolicy = String(attrs.failure || attrs.failurepolicy || "").trim();
+    if (failurePolicy && !["stop", "continue", "retry"].includes(failurePolicy)) {
+        logPicTagWarning(`failure="${failurePolicy}" 不支持，已按 continue 处理。`, logger);
+        failurePolicy = "continue";
+    }
+
+    let strategy = String(attrs.strategy || "").trim();
+    if (strategy && !["climax", "poster", "final"].includes(strategy)) {
+        logPicTagWarning(`strategy="${strategy}" 不支持，已使用保存的单图策略。`, logger);
+        strategy = "";
+    }
+
+    return {
+        prompt,
+        mode,
+        beatCount,
+        panelCount,
+        dialogueEnabled,
+        dialogueMode,
+        failurePolicy,
+        strategy,
+        rawAttributes: attrs,
+    };
+}
+
+function resolvePicTagGenerationRequest(match, settings = {}) {
+    const attrs = parsePicTagAttributes(match?.fullMatch, match?.capture);
+    const mode = normalizeGenerationMode(attrs.mode);
+    const prompt = String(attrs.prompt || match?.capture || "").trim();
+    const requestMeta = { source: "auto-tag", prompt, tagMode: mode };
+    const planOptions = {};
+
+    if (mode === "comic") {
+        planOptions.panelCount = normalizeComicPanelCount(attrs.panelCount || settings.comicPanelCount);
+        planOptions.dialogueEnabled = attrs.dialogueEnabled ?? (settings.comicDialogueEnabled !== false);
+        planOptions.dialogueMode = normalizeComicDialogueMode(attrs.dialogueMode || settings.comicDialogueMode);
+        planOptions.failurePolicy = attrs.failurePolicy || normalizePlanFailurePolicy(settings.comicFailurePolicy);
+    } else if (mode === "multi") {
+        planOptions.beatCount = normalizeBeatCount(attrs.beatCount || settings.defaultBeatCount);
+        planOptions.failurePolicy = attrs.failurePolicy || normalizePlanFailurePolicy(settings.multiImageFailurePolicy);
+    } else {
+        planOptions.strategy = attrs.strategy || normalizeSingleImageStrategy(settings.singleImageStrategy);
+        planOptions.failurePolicy = attrs.failurePolicy || normalizeAutomaticFlowFailurePolicy(settings.automaticFlowFailurePolicy);
+    }
+
+    return {
+        prompt,
+        mode,
+        requestMeta,
+        planOptions,
+    };
+}
+
+// ═══════════════════════════════════════════════════════════════
 // SECTION 11: MESSAGE PROCESSING (auto pipeline)
 // ═══════════════════════════════════════════════════════════════
+
+function maybeAutoExtractVisualLibraries(sourceText, options = {}) {
+    const settings = extension_settings[extensionName] || defaultSettings;
+    const normalized = normalizeVisualExtractionSettings(settings);
+    if (!normalized.autoExtractCharactersEnabled && !normalized.autoExtractScenesEnabled) {
+        return null;
+    }
+    const result = applyAutomaticVisualExtraction({
+        context: getCurrentChatVisualContext(),
+        store: getChatVisualStore(),
+        settings: normalized,
+        sourceText,
+    });
+    const characterCount = result?.character?.added?.length || 0;
+    const sceneCount = result?.scene?.added?.length || 0;
+    const skippedCount = (result?.character?.skipped?.length || 0) + (result?.scene?.skipped?.length || 0);
+    if (characterCount || sceneCount) {
+        updateLibraryHiddenFields("character");
+        updateLibraryHiddenFields("scene");
+        renderAllLibrarySummaries();
+        updateVisualScopeStatus();
+        const text = `设定库自动提取：人物 +${characterCount}，场景 +${sceneCount}${skippedCount ? `，跳过重复 ${skippedCount}` : ""}`;
+        recordAutomaticFlowEvent("extract", text, options.task || null);
+        setStatus(text, "success");
+    } else if (skippedCount) {
+        recordAutomaticFlowEvent("extract", `设定库自动提取：跳过重复 ${skippedCount} 条`, options.task || null);
+    }
+    return result;
+}
 
 async function onMessageReceived(messageId) {
     const settings = extension_settings[extensionName];
@@ -1681,6 +4911,13 @@ async function onMessageReceived(messageId) {
     const context = getContext();
     const message = context.chat?.[messageId];
     if (!message || message.is_user || message.is_system || !message.mes) {
+        return;
+    }
+
+    maybeAutoExtractVisualLibraries(cleanRpText(message.mes || ""), { source: "message", messageId });
+
+    if (settings.automaticFlowEnabled) {
+        handleAutomaticWholeMessage(messageId, context, settings);
         return;
     }
 
@@ -1709,19 +4946,35 @@ async function onMessageReceived(messageId) {
         const replacements = [];
         const collectedImages = [];
         const collectedTitles = [];
+        const collectedJobs = [];
         let successCount = 0;
 
         for (const match of matches) {
-            let prompt = String(match.capture || "").trim();
+            const request = resolvePicTagGenerationRequest(match, settings);
+            let prompt = request.prompt;
             if (!prompt) {
                 replacements.push(match.fullMatch);
                 continue;
             }
 
-            // 运行提示词处理流水线
-            prompt = await processPromptPipeline(prompt, { forceOptimize: false });
-
-            const result = await requestImagesFromBackend(prompt, { source: "auto" });
+            logCharacterSelectionSummary(prompt, settings, `<pic:${request.mode}>`);
+            let result;
+            if (request.mode === "comic") {
+                result = await runComicImagePlan(prompt, { forceOptimize: false }, request.requestMeta, request.planOptions);
+            } else if (request.mode === "multi") {
+                result = await runMultiImagePlan(prompt, { forceOptimize: false }, request.requestMeta, request.planOptions);
+            } else {
+                result = await runSingleImagePlan(prompt, { forceOptimize: false }, request.requestMeta, request.planOptions);
+            }
+            addGenerationHistoryRecord(createGenerationHistoryRecord({
+                source: "auto-tag",
+                mode: request.mode,
+                prompt,
+                plan: result.plan,
+                jobs: result.jobs,
+                status: result.images.length ? "succeeded" : "failed",
+            }));
+            prompt = result.jobs?.find((job) => job.status === "succeeded")?.prompt || result.jobs?.[0]?.prompt || prompt;
             if (!result.images.length) {
                 replacements.push(match.fullMatch);
                 continue;
@@ -1729,7 +4982,8 @@ async function onMessageReceived(messageId) {
 
             replacements.push("");
             collectedImages.push(...result.images);
-            collectedTitles.push(prompt);
+            collectedJobs.push(...(Array.isArray(result.jobs) ? result.jobs : []));
+            collectedTitles.push(...result.jobs.filter((job) => job.status === "succeeded").map((job) => job.prompt || prompt));
             successCount += 1;
         }
 
@@ -1740,14 +4994,16 @@ async function onMessageReceived(messageId) {
 
         message.mes = cleanupMessageText(applyReplacements(message.mes, matches, replacements));
         message.extra = message.extra || {};
-        attachGeneratedImages(message, collectedImages, collectedTitles);
+        const dialogueMeta = createDialogueAttachmentMetadata(collectedJobs);
+        attachGeneratedImages(message, collectedImages, collectedTitles, dialogueMeta);
         message.extra[extensionName] = {
+            ...(message.extra[extensionName] || {}),
             lastRunAt: Date.now(),
             replacements: successCount,
             images: dedupeStrings(collectedImages).length,
         };
 
-        updateMessageBlock(messageId, message);
+        await updateMessageBlockWhenReady(messageId, message);
         try { await context.saveChat(); } catch (e) { console.warn(`[${extensionName}] saveChat failed`, e); }
         setStatus(`已替换 ${successCount} 处匹配`, "success");
     } catch (error) {
@@ -1763,6 +5019,234 @@ async function onMessageReceived(messageId) {
 // SECTION 12: MANUAL GENERATION
 // ═══════════════════════════════════════════════════════════════
 
+const manualWorkbenchState = {
+    characterCandidates: [],
+    confirmedCharacters: [],
+    lastJobs: [],
+};
+
+function logCharacterSelectionSummary(sourceText, settings, label = "自动路径", confirmed = null) {
+    const refs = Array.isArray(confirmed) ? confirmed : collectCharacterCandidatesForWorkbench(sourceText, getEffectiveVisualSettings(settings));
+    const names = refs.map((item) => item.name).filter(Boolean);
+    console.log(`[${extensionName}] 人物选择摘要(${label})：${names.length ? names.join("、") : "无显式人物引用"}。`);
+}
+
+function refreshWorkbenchCharacterCandidates() {
+    const fp = $("#oair_floating_panel");
+    const sourceText = String(fp.find("#oair_manual_prompt").val() || "").trim();
+    const visualBible = resolveCurrentChatVisualBible(sourceText, extension_settings[extensionName]);
+    const settings = getEffectiveVisualSettings(extension_settings[extensionName]);
+    const personaCandidates = visualBible.characterCandidates?.length
+        ? visualBible.characterCandidates
+        : resolvePersonaVisualCandidates({
+            context: getCurrentChatVisualContext(),
+            sourceText,
+            visualBible,
+        });
+    manualWorkbenchState.characterCandidates = collectCharacterCandidatesForWorkbench(sourceText, settings, {
+        storyCandidates: personaCandidates,
+    });
+    renderCharacterConfirmationUi();
+}
+
+function formatCharacterCandidateSource(candidate = {}) {
+    const source = String(candidate.source || "");
+    if (source === "library") return "当前角色卡库";
+    if (source === "story-derived" || source === "story") return "剧情候选";
+    if (source === "worldbook") return "世界书";
+    if (source === "legacy") return "旧库导入";
+    if (source === "missing") return "缺外貌";
+    return source || "候选";
+}
+
+function persistWorkbenchConfirmedCharacters({ saveProfile = false } = {}) {
+    const confirmed = normalizeConfirmedCharacterReferences(manualWorkbenchState.characterCandidates);
+    manualWorkbenchState.confirmedCharacters = confirmed;
+    saveCurrentChatVisualScopePatch({ confirmedCharacters: confirmed });
+    if (saveProfile && confirmed.length) {
+        confirmCharacterCandidatesIntoScope({
+            context: getCurrentChatVisualContext(),
+            store: getChatVisualStore(),
+            candidates: confirmed.map((item) => ({ ...item, selected: true })),
+        });
+        renderAllLibrarySummaries();
+    }
+    return confirmed;
+}
+
+function renderCharacterConfirmationUi() {
+    const fp = $("#oair_floating_panel");
+    const box = fp.find("#oair_character_confirmation");
+    if (!box.length) return;
+    box.empty();
+
+    const candidates = manualWorkbenchState.characterCandidates || [];
+    if (!candidates.length) {
+        box.append('<div class="oair-plan-placeholder">未匹配到人物库候选；生成时仍会使用当前固定设定和世界书注入。</div>');
+        manualWorkbenchState.confirmedCharacters = [];
+        saveCurrentChatVisualScopePatch({ confirmedCharacters: [] });
+        return;
+    }
+
+    for (const [index, candidate] of candidates.entries()) {
+        const card = $('<div class="oair-character-card"></div>');
+        const header = $('<div class="oair-character-card-head"></div>');
+        $('<input type="checkbox" class="oair-character-candidate-check">')
+            .prop("checked", candidate.selected !== false)
+            .attr("data-index", index)
+            .appendTo(header);
+        $("<span>").text(candidate.name).appendTo(header);
+        $("<span>")
+            .addClass(candidate.stable ? "oair-badge oair-badge-green" : "oair-badge oair-badge-orange")
+            .text(candidate.stable ? (candidate.source === "legacy" ? "旧库" : "当前库") : "候选")
+            .appendTo(header);
+        $("<span>").addClass("oair-character-source").text(formatCharacterCandidateSource(candidate)).appendTo(header);
+        $('<button type="button" class="menu_button oair-character-toggle-btn"></button>')
+            .attr("data-index", index)
+            .text(candidate.selected === false ? "选用" : "跳过")
+            .appendTo(header);
+        header.appendTo(card);
+        $('<textarea class="text_pole oair-character-candidate-text" rows="2"></textarea>')
+            .attr("data-index", index)
+            .val(candidate.text)
+            .appendTo(card);
+        card.appendTo(box);
+    }
+
+        box.find(".oair-character-candidate-check")
+            .off("click.oair_confirm change.oair_confirm")
+            .on("click.oair_confirm", (e) => e.stopPropagation())
+            .on("change.oair_confirm", function () {
+        const index = Number($(this).attr("data-index"));
+        if (manualWorkbenchState.characterCandidates[index]) {
+            manualWorkbenchState.characterCandidates[index].selected = $(this).prop("checked");
+        }
+        persistWorkbenchConfirmedCharacters({ saveProfile: true });
+    });
+    box.find(".oair-character-candidate-text").off("input.oair_confirm").on("input.oair_confirm", function () {
+        const index = Number($(this).attr("data-index"));
+        if (manualWorkbenchState.characterCandidates[index]) {
+            manualWorkbenchState.characterCandidates[index].text = String($(this).val() || "");
+        }
+        persistWorkbenchConfirmedCharacters({ saveProfile: true });
+    });
+    box.find(".oair-character-toggle-btn").off("click.oair_confirm").on("click.oair_confirm", function (e) {
+        e.preventDefault();
+        e.stopPropagation();
+        const index = Number($(this).attr("data-index"));
+        const candidate = manualWorkbenchState.characterCandidates[index];
+        if (!candidate) return;
+        candidate.selected = candidate.selected === false;
+        box.find(`.oair-character-candidate-check[data-index="${index}"]`).prop("checked", candidate.selected !== false);
+        $(this).text(candidate.selected === false ? "选用" : "跳过");
+        persistWorkbenchConfirmedCharacters({ saveProfile: true });
+    });
+    persistWorkbenchConfirmedCharacters({ saveProfile: false });
+}
+
+function getWorkbenchConfirmedCharacters() {
+    return persistWorkbenchConfirmedCharacters({ saveProfile: true });
+}
+
+async function buildManualPlanOptions(sourceText, baseOptions = {}) {
+    const settings = extension_settings[extensionName];
+    const confirmed = getWorkbenchConfirmedCharacters();
+    if (!confirmed.length) {
+        logCharacterSelectionSummary(sourceText, settings, "手动路径");
+        return baseOptions;
+    }
+    const fixed = await resolveFixedSettings(sourceText, settings);
+    logCharacterSelectionSummary(sourceText, settings, "手动确认", confirmed);
+    return applyConfirmedCharacterReferences({ ...baseOptions, fixed }, confirmed);
+}
+
+function formatPromptDiagnosticsForUi(diagnostics = {}) {
+    if (!diagnostics || typeof diagnostics !== "object") return "";
+    const parts = [];
+    if (diagnostics.storageSource || diagnostics.scopeKey) {
+        parts.push(`设定：${diagnostics.storageSource || "scope"}`);
+    }
+    if (diagnostics.activeStyle) parts.push(`风格：${diagnostics.activeStyle}`);
+    if (diagnostics.activeScene) parts.push(`场景：${diagnostics.activeScene}`);
+    if (Array.isArray(diagnostics.scopedCharacters) && diagnostics.scopedCharacters.length) {
+        parts.push(`人物：${diagnostics.scopedCharacters.slice(0, 4).join("、")}`);
+    }
+    if (Array.isArray(diagnostics.missingCharacters) && diagnostics.missingCharacters.length) {
+        parts.push(`缺外貌：${diagnostics.missingCharacters.slice(0, 4).join("、")}`);
+    }
+    if (diagnostics.imageTextPolicy) parts.push(`对白：${diagnostics.imageTextPolicy}`);
+    return parts.join(" · ");
+}
+
+function getImageJobFailureSummary(job) {
+    return String(job?.errorSummary || job?.error || "生成失败").replace(/\s+/g, " ").trim();
+}
+
+function renderPlanProgress(jobs = []) {
+    const fp = $("#oair_floating_panel");
+    const box = fp.find("#oair_plan_progress");
+    if (!box.length) return;
+    box.empty();
+    const list = Array.isArray(jobs) ? jobs : [];
+    if (!list.length) {
+        box.append('<div class="oair-plan-placeholder">暂无任务进度。</div>');
+        return;
+    }
+    for (const job of list) {
+        const card = $('<div class="oair-progress-card"></div>');
+        $("<div>")
+            .addClass("oair-progress-title")
+            .text(`${Number(job.index) + 1}. ${job.title || "图片任务"}`)
+            .appendTo(card);
+        $("<div>")
+            .addClass(`oair-progress-status oair-status-${job.status}`)
+            .text(job.status === "succeeded" ? "成功" : job.status === "failed" ? `失败：${getImageJobFailureSummary(job)}` : job.status === "running" ? "运行中" : "等待中")
+            .appendTo(card);
+        if (job.status === "failed" && job.error && job.error !== job.errorSummary) {
+            $("<div>")
+                .addClass("oair-error-summary")
+                .text(job.error)
+                .appendTo(card);
+        }
+        const diagnosticsText = formatPromptDiagnosticsForUi(job.promptDiagnostics);
+        if (diagnosticsText) {
+            $("<div>")
+                .addClass("oair-progress-status")
+                .text(diagnosticsText)
+                .appendTo(card);
+        }
+        if (job.retryable) {
+            const policySafeRetry = canUsePolicySafeRetry(job);
+            $('<button type="button" class="menu_button oair-retry-job-btn"></button>')
+                .text(policySafeRetry ? "安全重试" : "重试本项")
+                .on("click", async function () {
+                    $(this).prop("disabled", true).text("重试中...");
+                    try {
+                        await retryImageJob(job, requestImagesFromBackend, {
+                            source: policySafeRetry ? "policy-safe-retry" : "manual-retry",
+                            prompt: job.prompt,
+                            policySafeRetry,
+                        });
+                        addGenerationHistoryRecord(createGenerationHistoryRecord({
+                            source: policySafeRetry ? "policy-safe-retry" : "manual-retry",
+                            mode: job.mode,
+                            prompt: job.prompt,
+                            jobs: [job],
+                            status: job.status,
+                        }));
+                        setStatus(`${job.title || "任务"} 重试完成`, job.status === "succeeded" ? "success" : "warning");
+                    } catch (error) {
+                        setStatus(`${job.title || "任务"} 重试失败：${error?.message || error}`, "error");
+                    }
+                    renderPlanProgress(list);
+                    renderManualPreview([], "", list);
+                })
+                .appendTo(card);
+        }
+        card.appendTo(box);
+    }
+}
+
 async function manualGenerate() {
     const fp = $("#oair_floating_panel");
     let prompt = String(fp.find("#oair_manual_prompt").val() || "").trim();
@@ -1771,23 +5255,63 @@ async function manualGenerate() {
         return;
     }
 
+    const settings = extension_settings[extensionName];
     setStatus("手动生图中...", "info");
     setButtonLoading("#oair_btn_manual_gen", true);
     $("#oair_fab").addClass("oair-fab--loading");
 
     try {
-        // 如果有优化后的提示词，使用优化版本
-        const optimizedText = String(fp.find("#oair_manual_optimized_text").text() || "").trim();
-        if (optimizedText) {
-            prompt = optimizedText;
+        let result;
+        // 根据生成模式选择执行路径（single | multi | comic）；
+        // 手动精修结果只在单图分支使用——comic/multi 需要原始剧情文本来拆分分镜/节点
+        const mode = normalizeGenerationMode(settings.generationMode || (settings.multiImageEnabled ? "multi" : "single"));
+        let effectiveMode = mode;
+        if (mode === "comic") {
+            effectiveMode = "comic";
+            // 漫画模式：LLM 分镜 → 逐格生成，对白元数据随结果保留
+            const panelCount = normalizeComicPanelCount(settings.comicPanelCount);
+            const dialogueEnabled = settings.comicDialogueEnabled !== false;
+            const dialogueMode = normalizeComicDialogueMode(settings.comicDialogueMode);
+            const failurePolicy = normalizePlanFailurePolicy(settings.comicFailurePolicy);
+            const planOptions = await buildManualPlanOptions(prompt, { panelCount, dialogueEnabled, dialogueMode, failurePolicy });
+            result = await runComicImagePlan(prompt, {}, { source: "manual-comic", policyAutoRetry: false }, planOptions);
+            // 按成功 job 数统计：imageCount>1 时一个 job 可返回多张图，用 images.length 会虚报
+            const okCount = result.jobs.filter((j) => j.status === "succeeded").length;
+            setStatus(`漫画模式：成功 ${okCount} / ${panelCount} 格`, okCount === panelCount ? "success" : "warning");
+        } else if (mode === "multi" || settings.multiImageEnabled) {
+            effectiveMode = "multi";
+            // 多图模式：拆分 StoryBeat，每个 beat 独立生成
+            const beatCount = normalizeBeatCount(settings.defaultBeatCount);
+            const failurePolicy = normalizePlanFailurePolicy(settings.multiImageFailurePolicy);
+            const planOptions = await buildManualPlanOptions(prompt, { beatCount, failurePolicy });
+            result = await runMultiImagePlan(prompt, {}, { source: "manual", policyAutoRetry: false }, planOptions);
+            const okCount = result.jobs.filter((j) => j.status === "succeeded").length;
+            setStatus(`多图模式：成功 ${okCount} / ${beatCount} 张`, okCount === beatCount ? "success" : "warning");
+        } else {
+            effectiveMode = "single";
+            // 单图模式：先规划并编译；如果有手动精修结果，则作为最终 prompt 覆盖编译结果。
+            const optimizedText = String(fp.find("#oair_manual_optimized_text").text() || "").trim();
+            const planOptions = await buildManualPlanOptions(prompt, {});
+            result = await runSingleImagePlan(prompt, {
+                skipOptimize: !!optimizedText,
+                promptOverride: optimizedText,
+                forceOptimize: false,
+                fixed: planOptions.fixed,
+            }, { source: "manual", policyAutoRetry: false }, planOptions);
+            prompt = result.jobs?.[0]?.prompt || prompt;
         }
 
-        // 运行完整提示词处理流水线（优化 + NSFW安全审查）
-        // 如果已有手动优化结果，forceOptimize=false 跳过再次自动优化
-        prompt = await processPromptPipeline(prompt, { forceOptimize: !optimizedText });
-
-        const result = await requestImagesFromBackend(prompt, { source: "manual" });
-        renderManualPreview(result.images, result.content);
+        manualWorkbenchState.lastJobs = result.jobs || [];
+        renderPlanProgress(result.jobs);
+        renderManualPreview(result.images, result.content, result.jobs);
+        addGenerationHistoryRecord(createGenerationHistoryRecord({
+            source: effectiveMode === "comic" ? "manual-comic" : "manual",
+            mode: effectiveMode,
+            prompt,
+            plan: result.plan,
+            jobs: result.jobs,
+            status: result.images.length ? "succeeded" : "failed",
+        }));
 
         if (result.images.length > 0) {
             setStatus(`已生成 ${result.images.length} 张图片`, "success");
@@ -1820,26 +5344,31 @@ async function manualOptimize() {
 
     const settings = extension_settings[extensionName];
     if (!settings.optimizeEnabled) {
-        toastr.warning("请先在「优化」标签页启用提示词优化功能。");
+        toastr.warning("请先在「模型后端」里启用编译后精修功能。");
         return;
     }
 
-    setStatus("正在优化提示词...", "info");
+    setStatus("正在精修编译提示词...", "info");
     setButtonLoading("#oair_btn_optimize", true);
 
     try {
         const fixed = await resolveFixedSettings(prompt, settings);
-        const optimized = await optimizePrompt(prompt, fixed);
+        const previewPlan = createSingleImagePlan(prompt, {
+            fixed,
+            strategy: settings.singleImageStrategy,
+        });
+        const compiled = previewPlan.jobs?.[0]?.prompt || prompt;
+        const optimized = await optimizePrompt(compiled, fixed);
         if (optimized && optimized !== prompt) {
             fp.find("#oair_manual_optimized_text").text(optimized);
             fp.find("#oair_manual_optimized_prompt").show();
-            setStatus("提示词已优化", "success");
-            toastr.success("提示词优化完成，可查看优化结果。");
+            setStatus("编译提示词已精修", "success");
+            toastr.success("提示词精修完成，可查看结果。");
         } else if (optimized === prompt) {
-            setStatus("提示词无需优化", "info");
-            toastr.info("优化结果与原始提示词相同，将使用原始提示词。");
+            setStatus("提示词无需精修", "info");
+            toastr.info("精修结果与原提示词相同，将使用当前提示词。");
         } else {
-            setStatus("优化失败，将使用原始提示词", "warning");
+            setStatus("精修失败，将使用编译提示词", "warning");
         }
     } catch (error) {
         console.error(`[${extensionName}] Manual optimization failed`, error);
@@ -1850,22 +5379,208 @@ async function manualOptimize() {
     }
 }
 
-function renderManualPreview(images, content = "") {
+/**
+ * 手动生图预览。jobs 可选：多图/漫画模式传入后，按格/节点展示标题、对白元数据与失败标记。
+ * （为后续 HTML/CSS 气泡叠加与整页合成保留的 UI 插槽：.oair-panel-card / .oair-panel-dialogue）
+ * manualPreviewEpoch：每次重渲染递增；旧 plan 的重试回调完成后若已有新一轮预览则放弃重绘，避免覆盖。
+ */
+let manualPreviewEpoch = 0;
+
+function makePreviewImageAccessible(image, label, open) {
+    return image
+        .attr("role", "button")
+        .attr("tabindex", "0")
+        .attr("alt", label)
+        .on("keydown", (e) => {
+            if (e.key === "Enter" || e.key === " ") {
+                e.preventDefault();
+                open();
+            }
+        });
+}
+
+function getJobDialogueMode(job) {
+    return String(job?.dialogueMode || job?.promptDiagnostics?.dialogueMode || (job?.mode === "comic" ? "bubble" : "")).trim();
+}
+
+function parseDialogueLine(line) {
+    const text = String(line || "").trim();
+    const match = text.match(/^([^：:]{1,16})[：:]\s*(.+)$/);
+    if (!match) return { speaker: "", text };
+    return { speaker: match[1].trim(), text: match[2].trim() };
+}
+
+function appendComicBubbleLayer(frame, job) {
+    const mode = getJobDialogueMode(job);
+    if (mode !== "bubble") return;
+    const lines = Array.isArray(job?.dialogue) ? job.dialogue.filter(Boolean).slice(0, 3) : [];
+    const caption = String(job?.caption || "").trim();
+    if (!lines.length && !caption) return;
+
+    const layer = $("<div></div>").css({
+        position: "absolute",
+        inset: 0,
+        pointerEvents: "none",
+        display: "flex",
+        flexDirection: "column",
+        justifyContent: "space-between",
+        padding: "10px",
+        boxSizing: "border-box",
+        gap: "8px",
+    });
+
+    if (caption) {
+        $("<div></div>")
+            .text(caption)
+            .css({
+                alignSelf: "flex-start",
+                maxWidth: "82%",
+                padding: "5px 8px",
+                borderRadius: "6px",
+                background: "rgba(0,0,0,0.66)",
+                color: "#f7f7f7",
+                fontSize: "12px",
+                lineHeight: 1.35,
+                boxShadow: "0 2px 10px rgba(0,0,0,0.35)",
+            })
+            .appendTo(layer);
+    } else {
+        $("<div></div>").appendTo(layer);
+    }
+
+    const row = $("<div></div>").css({
+        display: "flex",
+        flexWrap: "wrap",
+        gap: "6px",
+        alignItems: "flex-end",
+        justifyContent: "center",
+    });
+    for (const [index, rawLine] of lines.entries()) {
+        const parsed = parseDialogueLine(rawLine);
+        const bubble = $("<div></div>").css({
+            maxWidth: lines.length === 1 ? "86%" : "46%",
+            minWidth: "0",
+            padding: "7px 9px",
+            borderRadius: "14px",
+            background: "rgba(255,255,255,0.92)",
+            color: "#171717",
+            border: "1px solid rgba(0,0,0,0.2)",
+            boxShadow: "0 3px 12px rgba(0,0,0,0.32)",
+            fontSize: "12px",
+            lineHeight: 1.35,
+            textAlign: "left",
+            transform: index % 2 ? "translateY(-3px)" : "translateY(0)",
+        });
+        if (parsed.speaker) {
+            $("<strong></strong>")
+                .text(parsed.speaker)
+                .css({ display: "block", fontSize: "10px", opacity: 0.7, marginBottom: "2px" })
+                .appendTo(bubble);
+        }
+        $("<span></span>").text(parsed.text).appendTo(bubble);
+        bubble.appendTo(row);
+    }
+    row.appendTo(layer);
+    layer.appendTo(frame);
+}
+
+function renderManualPreview(images, content = "", jobs = null) {
+    const epoch = ++manualPreviewEpoch;
     const fp = $("#oair_floating_panel");
     const preview = fp.find("#oair_manual_preview");
     preview.empty();
 
+    const directImages = Array.isArray(images) ? images : [];
+    const richJobs = Array.isArray(jobs)
+        ? jobs.filter((job) => job && (
+            job.mode === "comic"
+            || job.mode === "multi"
+            || (!directImages.length && Array.isArray(job.result?.images) && job.result.images.length > 0)
+        ))
+        : [];
+
+    if (richJobs.length > 0) {
+        const previewImages = richJobs.map((job) => job?.result?.images?.[0]).filter(Boolean);
+        // 按 job 顺序逐格/逐节点展示：成功格显示图片 + 对白；失败格显示错误标记
+        for (const job of richJobs) {
+            const card = $("<div>").addClass("oair-preview-card oair-panel-card");
+            $("<div>")
+                .addClass("oair-preview-title")
+                .text(job.status === "failed" ? `${job.title || "分格"} ✕ 失败：${getImageJobFailureSummary(job)}` : (job.title || ""))
+                .appendTo(card);
+            if (job.status === "failed" && job.error && job.error !== job.errorSummary) {
+                $("<div>")
+                    .addClass("oair-error-summary")
+                    .text(job.error)
+                    .appendTo(card);
+            }
+            const url = job.result?.images?.[0];
+            if (url) {
+                const frame = $("<div></div>").addClass("oair-preview-thumb").appendTo(card);
+                makePreviewImageAccessible(
+                    $("<img>")
+                        .attr("src", url)
+                        .on("click", () => openImageLightbox(url, previewImages)),
+                    `${job.title || "分格"} 预览图`,
+                    () => openImageLightbox(url, previewImages),
+                ).appendTo(frame);
+                appendComicBubbleLayer(frame, job);
+            }
+            if (job.status === "failed" && job.retryable) {
+                // 单格重试：只重跑该格的 prompt，完成后原位重渲染卡片列表
+                const policySafeRetry = canUsePolicySafeRetry(job);
+                $('<button type="button" class="menu_button" style="width:100%; justify-content:center; margin-top:6px;"></button>')
+                    .text(policySafeRetry ? "安全重试" : "↻ 重试本格")
+                    .on("click", async function () {
+                        $(this).prop("disabled", true).text("重试中...");
+                        try {
+                            await retryImageJob(job, requestImagesFromBackend, {
+                                source: policySafeRetry ? "policy-safe-retry" : "manual-retry",
+                                prompt: job.prompt,
+                                policySafeRetry,
+                            });
+                            addGenerationHistoryRecord(createGenerationHistoryRecord({
+                                source: policySafeRetry ? "policy-safe-retry" : "manual-retry",
+                                mode: job.mode,
+                                prompt: job.prompt,
+                                jobs: [job],
+                                status: job.status,
+                            }));
+                            setStatus(`${job.title || "分格"} 重试成功`, "success");
+                        } catch (error) {
+                            setStatus(`${job.title || "分格"} 重试失败：${error?.message || error}`, "error");
+                        }
+                        // epoch 防护：重试期间用户可能已生成新一轮预览，旧回调不得覆盖
+                        if (epoch !== manualPreviewEpoch) return;
+                        renderPlanProgress(richJobs);
+                        renderManualPreview([], "", richJobs);
+                    })
+                    .appendTo(card);
+            }
+            const dialogueLines = Array.isArray(job.dialogue) ? job.dialogue.filter(Boolean) : [];
+            if (dialogueLines.length > 0) {
+                $("<div>")
+                    .addClass("oair-panel-dialogue")
+                    .text(`对白：${dialogueLines.join("　")}`)
+                    .css({ fontSize: "0.75em", opacity: 0.75, marginTop: "6px", lineHeight: 1.5 })
+                    .appendTo(card);
+            }
+            card.appendTo(preview);
+        }
+        return;
+    }
+
     for (const imageUrl of images) {
-        $("<img>")
-            .attr("src", imageUrl)
-            .css({
-                width: "100%",
-                maxWidth: "100%",
-                borderRadius: "6px",
-                cursor: "pointer",
-            })
-            .on("click", () => openImageLightbox(imageUrl))
-            .appendTo(preview);
+        const card = $("<div>").addClass("oair-preview-card");
+        const frame = $("<div>").addClass("oair-preview-thumb").appendTo(card);
+        makePreviewImageAccessible(
+            $("<img>")
+                .attr("src", imageUrl)
+                .on("click", () => openImageLightbox(imageUrl, images)),
+            "生成图片预览",
+            () => openImageLightbox(imageUrl, images),
+        ).appendTo(frame);
+        card.appendTo(preview);
     }
 
     if (!images.length && content) {
@@ -1885,41 +5600,143 @@ function renderManualPreview(images, content = "") {
 
 /**
  * 图片灯箱：全屏遮罩查看大图。兼容 data:URI（浏览器禁止 window.open 打开 data: 链接）与普通 URL。
- * 点击遮罩或按 Esc 关闭。
+ * 点击遮罩或按 Esc 关闭；有同组图片时支持按钮与左右方向键切换。
  */
-function openImageLightbox(src) {
+function openImageLightbox(src, collection = []) {
     $("#oair_lightbox").remove();
-    const overlay = $('<div id="oair_lightbox"></div>').css({
-        position: "fixed",
-        inset: 0,
-        zIndex: 100000,
-        background: "rgba(0,0,0,0.85)",
-        display: "flex",
-        alignItems: "center",
-        justifyContent: "center",
-        cursor: "zoom-out",
-        padding: "20px",
-        boxSizing: "border-box",
-    });
-    $("<img>")
+    const images = dedupeStrings([...(Array.isArray(collection) ? collection : []), src]).filter(Boolean);
+    let index = Math.max(0, images.indexOf(src));
+    const overlay = $('<div id="oair_lightbox"></div>')
+        .attr("role", "dialog")
+        .attr("aria-modal", "true")
+        .attr("aria-label", "图片预览")
+        .attr("tabindex", "-1")
+        .css({
+            position: "fixed",
+            left: 0,
+            top: 0,
+            width: "100vw",
+            height: "100vh",
+            minHeight: "100dvh",
+            zIndex: 100000,
+            background: "rgba(0,0,0,0.85)",
+            display: "flex",
+            alignItems: "center",
+            justifyContent: "center",
+            cursor: "zoom-out",
+            padding: "20px",
+            boxSizing: "border-box",
+            overflow: "hidden",
+        });
+    const image = $("<img>")
         .attr("src", src)
-        .css({ maxWidth: "100%", maxHeight: "100%", objectFit: "contain", borderRadius: "6px", boxShadow: "0 4px 30px rgba(0,0,0,0.6)" })
+        .attr("alt", "生成图片预览")
+        .css({ maxWidth: "100%", maxHeight: "100%", objectFit: "contain", borderRadius: "6px", boxShadow: "0 4px 30px rgba(0,0,0,0.6)", cursor: "default" })
+        .appendTo(overlay);
+
+    const counter = $("<div></div>").css({
+        position: "absolute",
+        left: "50%",
+        bottom: "18px",
+        transform: "translateX(-50%)",
+        color: "#fff",
+        background: "rgba(0,0,0,0.45)",
+        border: "1px solid rgba(255,255,255,0.18)",
+        borderRadius: "999px",
+        padding: "4px 10px",
+        fontSize: "12px",
+        lineHeight: 1,
+        display: images.length > 1 ? "block" : "none",
+    }).appendTo(overlay);
+
+    const showAt = (nextIndex) => {
+        if (!images.length) return;
+        index = (nextIndex + images.length) % images.length;
+        image.attr("src", images[index]);
+        counter.text(`${index + 1} / ${images.length}`);
+    };
+
+    const navButton = (label, title, side, delta) => $("<button type=\"button\"></button>")
+        .text(label)
+        .attr("title", title)
+        .css({
+            position: "absolute",
+            top: "50%",
+            [side]: "18px",
+            transform: "translateY(-50%)",
+            width: "42px",
+            height: "54px",
+            borderRadius: "10px",
+            border: "1px solid rgba(255,255,255,0.22)",
+            background: "rgba(0,0,0,0.46)",
+            color: "#fff",
+            fontSize: "28px",
+            lineHeight: 1,
+            cursor: "pointer",
+            display: images.length > 1 ? "flex" : "none",
+            alignItems: "center",
+            justifyContent: "center",
+        })
+        .on("click", (e) => {
+            e.preventDefault();
+            e.stopPropagation();
+            showAt(index + delta);
+        })
+        .appendTo(overlay);
+
+    navButton("‹", "上一张", "left", -1);
+    navButton("›", "下一张", "right", 1);
+    $('<button type="button"></button>')
+        .text("×")
+        .attr("title", "关闭")
+        .css({
+            position: "absolute",
+            top: "16px",
+            right: "18px",
+            width: "36px",
+            height: "36px",
+            borderRadius: "999px",
+            border: "1px solid rgba(255,255,255,0.22)",
+            background: "rgba(0,0,0,0.46)",
+            color: "#fff",
+            fontSize: "22px",
+            lineHeight: 1,
+            cursor: "pointer",
+        })
+        .on("click", (e) => {
+            e.preventDefault();
+            e.stopPropagation();
+            close();
+        })
         .appendTo(overlay);
 
     const close = () => {
         overlay.remove();
         $(document).off("keydown.oair_lightbox");
     };
-    overlay.on("click", close);
+    overlay.on("click", (e) => {
+        if (e.target === overlay[0]) close();
+    });
     $(document).off("keydown.oair_lightbox").on("keydown.oair_lightbox", (e) => {
         if (e.key === "Escape") close();
+        if (e.key === "ArrowLeft" && images.length > 1) showAt(index - 1);
+        if (e.key === "ArrowRight" && images.length > 1) showAt(index + 1);
     });
     $("body").append(overlay);
+    showAt(index);
+    overlay[0]?.focus?.();
 }
 
 // ═══════════════════════════════════════════════════════════════
 // SECTION 13: MESSAGE IMAGE GENERATION (feat 6 & 7)
 // ═══════════════════════════════════════════════════════════════
+
+function injectMessageActionsForVisibleMessages() {
+    $("#chat .mes[mesid]").each((_, element) => {
+        const id = Number(element.getAttribute("mesid"));
+        if (Number.isInteger(id)) onMessageRendered(id);
+    });
+}
 
 /**
  * 消息渲染时注入生图按钮
@@ -1980,8 +5797,16 @@ async function generateFromMessage(messageId) {
 
     try {
         setStatus("正在从消息生图...", "info");
-        prompt = await processPromptPipeline(prompt, { forceOptimize: false });
-        const result = await requestImagesFromBackend(prompt, { source: "message" });
+        const result = await runSingleImagePlan(prompt, { forceOptimize: false }, { source: "message" });
+        prompt = result.jobs?.[0]?.prompt || prompt;
+        addGenerationHistoryRecord(createGenerationHistoryRecord({
+            source: "message",
+            mode: "single",
+            prompt,
+            plan: result.plan,
+            jobs: result.jobs,
+            status: result.images.length ? "succeeded" : "failed",
+        }));
 
         if (result.images.length > 0) {
             attachGeneratedImages(message, result.images, [prompt]);
@@ -1991,7 +5816,7 @@ async function generateFromMessage(messageId) {
                 source: "message-gen",
             };
             // 仅附加图片，不重新渲染正文——保留该消息已渲染的 HTML
-            updateMessageBlock(messageId, message, { rerenderMessage: false });
+            await updateMessageBlockWhenReady(messageId, message, { rerenderMessage: false });
             try { await context.saveChat(); } catch (e) { console.warn(`[${extensionName}] saveChat failed`, e); }
             setStatus("消息生图完成", "success");
             toastr.success("消息生图完成！");
@@ -2033,12 +5858,16 @@ async function summarizeAndGenerate(messageId) {
             return;
         }
 
-        setStatus("正在生图...", "info");
-        // 总结模板已包含 SFW 指令，但额外运行安全审查
-        let sanitizedPrompt = await sanitizePrompt(prompt);
-        // 注入固定角色外貌（仅注入提示词中出现的角色）
-        sanitizedPrompt = await injectStableDescriptions(sanitizedPrompt, settings);
-        const result = await requestImagesFromBackend(sanitizedPrompt, { source: "summarize", prompt });
+        setStatus("正在规划并生图...", "info");
+        const result = await runSingleImagePlan(prompt, { forceOptimize: false }, { source: "summarize", prompt }, { sourceText: prompt });
+        addGenerationHistoryRecord(createGenerationHistoryRecord({
+            source: "summarize",
+            mode: "single",
+            prompt,
+            plan: result.plan,
+            jobs: result.jobs,
+            status: result.images.length ? "succeeded" : "failed",
+        }));
 
         if (result.images.length > 0) {
             attachGeneratedImages(message, result.images, [prompt]);
@@ -2048,7 +5877,7 @@ async function summarizeAndGenerate(messageId) {
                 source: "summarize-gen",
             };
             // 仅附加图片，不重新渲染正文——保留该消息已渲染的 HTML
-            updateMessageBlock(messageId, message, { rerenderMessage: false });
+            await updateMessageBlockWhenReady(messageId, message, { rerenderMessage: false });
             try { await context.saveChat(); } catch (e) { console.warn(`[${extensionName}] saveChat failed`, e); }
             setStatus("总结生图完成", "success");
             toastr.success("总结生图完成！");
@@ -2371,24 +6200,39 @@ function renderPromptWithMessage(template, message) {
         .replaceAll("{{prompt}}", String(message || "").trim());
 }
 
-/**
- * 优化模板渲染：替换 {{style}}/{{characters}}/{{prompt}}；风格/人物为空时给中性兜底文案。
- */
-function renderOptimizeTemplate(template, { prompt, style, characters } = {}) {
-    const src = String(template || defaultSettings.optimizeTemplate);
-    const styleText = String(style || "").trim() || "保持画面整体协调即可";
-    const charText = String(characters || "").trim() || "（本图无需固定角色设定）";
-    return src
-        .replaceAll("{{style}}", styleText)
-        .replaceAll("{{characters}}", charText)
-        .replaceAll("{{prompt}}", String(prompt || "").trim());
+function normalizeSingleImageStrategy(value) {
+    const key = String(value || "").trim();
+    return ["climax", "poster", "final"].includes(key) ? key : DEFAULT_SINGLE_IMAGE_STRATEGY;
 }
 
 /**
- * 模板是否含固定设定占位符（{{style}} 或 {{characters}}）。无则走旧的仅 {{prompt}} 渲染。
+ * 精修模板渲染：替换 {{style}}/{{characters}}/{{scenes}}/{{prompt}}；空值给中性兜底文案。
+ */
+function renderOptimizeTemplate(template, { prompt, style, characters, scenes, singleStrategy } = {}) {
+    const src = String(template || defaultSettings.optimizeTemplate);
+    const styleText = String(style || "").trim() || "保持画面整体协调即可";
+    const charText = String(characters || "").trim() || "（本图无需固定角色设定）";
+    const sceneText = String(scenes || "").trim() || "（本图无需固定场景设定）";
+    const strategyKey = normalizeSingleImageStrategy(singleStrategy || extension_settings?.[extensionName]?.singleImageStrategy);
+    const strategyText = SINGLE_IMAGE_STRATEGY_LABELS[strategyKey] || SINGLE_IMAGE_STRATEGY_LABELS[DEFAULT_SINGLE_IMAGE_STRATEGY];
+    return src
+        .replace(/\{\{\s*singleStrategy\s*\}\}/g, strategyText)
+        .replace(/\{\{\s*style\s*\}\}/g, styleText)
+        .replace(/\{\{\s*characters\s*\}\}/g, charText)
+        .replace(/\{\{\s*scenes\s*\}\}/g, sceneText)
+        .replace(/\{\{\s*prompt\s*\}\}/g, String(prompt || "").trim());
+}
+
+/**
+ * 模板是否含精修模板占位符（{{style}} / {{characters}} / {{scenes}} / {{singleStrategy}}）。
+ * 无则走旧的仅 {{prompt}} 渲染。
  */
 function optimizeHasSlots(template) {
-    return /\{\{\s*(style|characters)\s*\}\}/.test(String(template || ""));
+    return /\{\{\s*(style|characters|scenes|singleStrategy)\s*\}\}/.test(String(template || ""));
+}
+
+function optimizeHasFixedReferenceSlots(template) {
+    return /\{\{\s*(style|characters|scenes)\s*\}\}/.test(String(template || ""));
 }
 
 function parseRegex(value, label) {
@@ -2488,7 +6332,7 @@ async function fetchModelList() {
 }
 
 /**
- * 获取自定义优化LLM后端的模型列表
+ * 获取自定义精修 LLM 后端的模型列表
  */
 async function fetchOptimizeModelList() {
     const settings = extension_settings[extensionName];
@@ -2496,7 +6340,7 @@ async function fetchOptimizeModelList() {
     const apiKey = String(settings.optimizeApiKey || "").trim();
 
     if (!serviceUrl) {
-        throw new Error("请先填写优化 LLM 服务地址");
+        throw new Error("请先填写精修 LLM 服务地址");
     }
 
     const endpoint = resolveEndpoint(serviceUrl, "models");
@@ -2709,6 +6553,35 @@ function parseNamedLibrary(text) {
     return out;
 }
 
+function serializeNamedLibrary(items) {
+    return (items || [])
+        .map((item) => {
+            const name = String(item?.name || "").trim();
+            const body = String(item?.body || "").trim();
+            return name && body ? `${name}：${body}` : "";
+        })
+        .filter(Boolean)
+        .join("\n");
+}
+
+function addNamedLibraryItems(existingText, newItems) {
+    const list = parseNamedLibrary(existingText);
+    const seen = new Set(list.map((item) => item.name));
+    for (const item of (newItems || [])) {
+        const name = String(item?.name || "").trim();
+        const body = String(item?.body || "").trim();
+        if (!name || !body) continue;
+        if (seen.has(name)) {
+            const old = list.find((x) => x.name === name);
+            if (old && !old.body.includes(body)) old.body = `${old.body}；${body}`;
+        } else {
+            seen.add(name);
+            list.push({ name, body, raw: `${name}：${body}` });
+        }
+    }
+    return serializeNamedLibrary(list);
+}
+
 /**
  * 按风格名从风格库取描述：精确匹配优先，再松匹配（互为子串）；找不到/名字空 → 返回 ""。
  */
@@ -2720,6 +6593,48 @@ function resolveStyleText(settings, styleName) {
     if (exact) return exact.body;
     const loose = lib.find((s) => s.name.includes(want) || want.includes(s.name));
     return loose ? loose.body : "";
+}
+
+function resolveLibraryText(libraryText, name) {
+    const want = String(name || "").trim();
+    if (!want) return "";
+    const lib = parseNamedLibrary(libraryText);
+    const exact = lib.find((item) => item.name === want);
+    if (exact) return exact.body;
+    const loose = lib.find((item) => item.name.includes(want) || want.includes(item.name));
+    return loose ? loose.body : "";
+}
+
+function collectLibraryItemsByPrompt(prompt, libraryText) {
+    const base = String(prompt || "");
+    return parseNamedLibrary(libraryText)
+        .filter((item) => item.name && base.includes(item.name))
+        .map((item) => ({ name: item.name, text: `${item.name}：${item.body}` }));
+}
+
+function worldBookMode(settings) {
+    const mode = String(settings?.worldBookMode || "").trim();
+    if (["off", "inject", "extract"].includes(mode)) return mode;
+    return settings?.worldBookEnabled ? "inject" : "off";
+}
+
+function libraryWorldBookMode(settings, kind) {
+    const key = kind === "scene" ? "sceneWorldBookMode" : "characterWorldBookMode";
+    const mode = String(settings?.[key] || "").trim();
+    if (["off", "inject", "extract"].includes(mode)) return mode;
+    return worldBookMode(settings);
+}
+
+function normalizeWorldBookModes(settings, flags = {}) {
+    const legacy = worldBookMode(settings);
+    if (!flags.hadCharacterMode) settings.characterWorldBookMode = legacy;
+    if (!flags.hadSceneMode) settings.sceneWorldBookMode = legacy;
+    settings.characterWorldBookMode = libraryWorldBookMode(settings, "character");
+    settings.sceneWorldBookMode = libraryWorldBookMode(settings, "scene");
+    settings.worldBookMode = (settings.characterWorldBookMode === settings.sceneWorldBookMode)
+        ? settings.characterWorldBookMode
+        : "off";
+    settings.worldBookEnabled = settings.characterWorldBookMode === "inject" || settings.sceneWorldBookMode === "inject";
 }
 
 /**
@@ -2750,8 +6665,10 @@ function appendFixedBlock(prompt, fixed) {
     const parts = [];
     const style = String(fixed?.styleText || "").trim();
     const chars = String(fixed?.charactersText || "").trim();
+    const scenes = String(fixed?.scenesText || "").trim();
     if (style) parts.push(`风格：${style}`);
     if (chars) parts.push(chars);
+    if (scenes) parts.push(scenes);
     if (!parts.length) return base;
     return `${base}\n\n【设定参考】\n${parts.join("\n")}`;
 }
@@ -2778,31 +6695,41 @@ function collectManualAppearancesByNames(appearanceText, names, covered = new Se
 }
 
 /**
- * 宽松解析分析调用返回：抽首个 {...} JSON 片段，归一成 {characters:string[], style:string}。
+ * 宽松抽取文本中首个 {...} JSON 片段并解析为【原始对象】；失败返回 null。
+ * 供 parseAnalysisJson / splitStoryBeats / splitComicPanels 共用——
+ * 后两者需要 beats/panels 等原始字段，不能用归一化后的场景分析结果。
+ */
+function parseRawJsonObject(text) {
+    const m = String(text || "").match(/\{[\s\S]*\}/);
+    if (!m) return null;
+    try { return JSON.parse(m[0]); } catch (e) { return null; }
+}
+
+/**
+ * 宽松解析分析调用返回：抽首个 {...} JSON 片段，归一成 {characters:string[], style:string, scene:string}。
  * 解析失败 / 字段缺失 → 返回空结果（由上层降级）。
  */
 function parseAnalysisJson(text) {
-    const s = String(text || "");
-    let obj = null;
-    const m = s.match(/\{[\s\S]*\}/);
-    if (m) { try { obj = JSON.parse(m[0]); } catch (e) { obj = null; } }
+    const obj = parseRawJsonObject(text);
     const characters = Array.isArray(obj?.characters)
         ? obj.characters.map((x) => String(x || "").trim()).filter(Boolean)
         : [];
     const style = obj && obj.style != null ? String(obj.style).trim() : "";
-    return { characters, style };
+    const scene = obj && obj.scene != null ? String(obj.scene).trim() : "";
+    return { characters, style, scene };
 }
 
 /**
  * 一次轻量分析调用：喂场景原文 + 候选人物名 + 候选风格名，要求输出紧凑 JSON。
  * 走 callLlmForText（主聊天模型 / 自定义文本后端），不经图片后端。失败由调用方兜回。
  */
-async function analyzeSceneForFixed(prompt, { charNames = [], styleNames = [] } = {}) {
+async function analyzeSceneForFixed(prompt, { charNames = [], styleNames = [], sceneNames = [] } = {}) {
     const settings = extension_settings[extensionName];
     const template = settings.analysisTemplate || defaultSettings.analysisTemplate;
     const userMessage = String(template)
         .replaceAll("{{characters}}", charNames.join("、") || "（无）")
         .replaceAll("{{styles}}", styleNames.join("、") || "（无）")
+        .replaceAll("{{scenes}}", sceneNames.join("、") || "（无）")
         .replaceAll("{{prompt}}", String(prompt || "").trim());
     const systemPrompt = "你是一个图片场景分析助手，只输出 JSON。";
     const result = await callLlmForText(systemPrompt, userMessage);
@@ -2820,7 +6747,7 @@ async function gatherCharacterItems(base, settings, names) {
     const useNames = Array.isArray(names);
     const rel = (a, b) => { a = String(a); b = String(b); return a.includes(b) || b.includes(a); };
 
-    if (settings.worldBookEnabled) {
+    if (libraryWorldBookMode(settings, "character") === "inject") {
         try {
             const entries = await loadActiveWorldBookEntries();
             const headings = String(settings.worldBookSectionHeadings || "")
@@ -2849,33 +6776,82 @@ async function gatherCharacterItems(base, settings, names) {
     } else {
         collected.push(...collectManualAppearances(base, settings.characterAppearance, covered));
     }
-    return collected;
+
+    const level = normalizeVisualSanitizationLevel(settings.visualSanitizationLevel);
+    const sanitized = collected
+        .map((item) => ({ ...item, text: sanitizeCharacterReferenceText(item.text, level, item.name) }))
+        .filter((item) => String(item.text || "").trim());
+    logSanitizationSummary("人物", collected, sanitized, level);
+    return sanitized;
+}
+
+async function gatherSceneItems(base, settings, sceneName = "") {
+    const collected = [];
+    const wanted = String(sceneName || "").trim();
+    if (wanted) {
+        const body = resolveLibraryText(settings.sceneLibrary, wanted);
+        if (body) collected.push({ name: wanted, text: `${wanted}：${body}` });
+    } else {
+        collected.push(...collectLibraryItemsByPrompt(base, settings.sceneLibrary));
+    }
+
+    if (libraryWorldBookMode(settings, "scene") === "inject") {
+        try {
+            const entries = await loadActiveWorldBookEntries();
+            const headings = String(settings.worldBookSectionHeadings || "")
+                .split(/[,，]/).map((h) => h.trim()).filter(Boolean);
+            for (const e of entries) {
+                const hit = e.keys.find((k) => base.includes(k));
+                if (!hit) continue;
+                const section = extractEntrySection(e.content, headings);
+                if (section) collected.push({ name: e.comment || hit, text: section });
+            }
+        } catch (err) {
+            console.warn(`[${extensionName}] world book scene gather failed`, err);
+        }
+    }
+
+    const level = normalizeVisualSanitizationLevel(settings.visualSanitizationLevel);
+    const sanitized = collected
+        .map((item) => ({ ...item, text: sanitizeSceneReferenceText(item.text, level) }))
+        .filter((item) => String(item.text || "").trim());
+    logSanitizationSummary("场景", collected, sanitized, level);
+    return sanitized;
 }
 
 /**
- * 流水线 Step 0：收集固定设定（风格 + 人物），返回 {styleText, charactersText}。
+ * 流水线 Step 0：收集固定设定（风格 + 人物 + 场景），返回 {styleText, charactersText, scenesText}。
  * 两 LLM 开关都关 → 0 调用（子串匹配 + styleActive）；任一开 → 合并一次 analyzeSceneForFixed。
  * 分析失败静默降级：人物退子串、风格退 styleActive。
  */
 async function resolveFixedSettings(prompt, settings) {
     const base = String(prompt || "");
-    const needLlm = !!settings.characterLlmExtract || !!settings.styleAutoSelect;
+    const visualBible = resolveCurrentChatVisualBible(base, settings);
+    settings = { ...settings, ...visualBible.values };
+    const needLlm = !!settings.characterLlmExtract || !!settings.styleAutoSelect || !!settings.sceneAutoSelect;
 
     let analysis = null;
     if (needLlm) {
         try {
             const charNames = parseNamedLibrary(settings.characterAppearance).map((c) => c.name);
             const styleNames = parseNamedLibrary(settings.styleLibrary).map((s) => s.name);
-            if (settings.worldBookEnabled) {
+            const sceneNames = parseNamedLibrary(settings.sceneLibrary).map((s) => s.name);
+            if (libraryWorldBookMode(settings, "character") === "inject" || libraryWorldBookMode(settings, "scene") === "inject") {
                 try {
                     const entries = await loadActiveWorldBookEntries();
                     for (const e of entries) {
                         if (e.comment) charNames.push(e.comment);
                         charNames.push(...e.keys);
+                        if (e.comment) sceneNames.push(e.comment);
+                        sceneNames.push(...e.keys);
                     }
                 } catch (e) { /* 世界书读不到不阻断分析 */ }
             }
-            analysis = await analyzeSceneForFixed(base, { charNames: dedupeStrings(charNames), styleNames });
+            analysis = await analyzeSceneForFixed(base, {
+                charNames: dedupeStrings(charNames),
+                styleNames,
+                sceneNames: dedupeStrings(sceneNames),
+            });
         } catch (err) {
             console.warn(`[${extensionName}] scene analysis failed, falling back`, err);
             analysis = null;
@@ -2886,16 +6862,33 @@ async function resolveFixedSettings(prompt, settings) {
     const styleName = (settings.styleAutoSelect && analysis && analysis.style)
         ? analysis.style
         : settings.styleActive;
+    const sceneName = (settings.sceneAutoSelect && analysis && analysis.scene)
+        ? analysis.scene
+        : settings.sceneActive;
 
     const items = await gatherCharacterItems(base, settings, charNames);
     const charactersText = pickCappedText(items, Number(settings.worldBookMaxChars) || 800);
+    const sceneItems = await gatherSceneItems(base, settings, sceneName);
+    const scenesText = pickCappedText(sceneItems, Number(settings.worldBookMaxChars) || 800);
     const styleText = resolveStyleText(settings, styleName);
-    return { styleText, charactersText };
+    return {
+        styleText: styleText || visualBible.styleText,
+        charactersText: charactersText || visualBible.charactersText,
+        scenesText: scenesText || visualBible.scenesText,
+        visualBible: {
+            ...visualBible,
+            fixed: {
+                styleText: styleText || visualBible.styleText,
+                charactersText: charactersText || visualBible.charactersText,
+                scenesText: scenesText || visualBible.scenesText,
+            },
+        },
+    };
 }
 
 /**
- * 降级/总结路的固定设定注入：收集风格+人物 → 拼【设定参考】块到末尾。
- * 主流水线优化路改走 resolveFixedSettings + 优化模板占位符（见 processPromptPipeline）。
+ * 降级/总结路的固定设定注入：收集风格+人物+场景 → 拼【设定参考】块到末尾。
+ * 旧主流水线精修路改走 resolveFixedSettings + 精修模板占位符（见 processPromptPipeline）。
  */
 async function injectStableDescriptions(prompt, settings) {
     return appendFixedBlock(prompt, await resolveFixedSettings(prompt, settings));
@@ -2905,47 +6898,64 @@ async function injectStableDescriptions(prompt, settings) {
 // SECTION 16: IMAGE HANDLING UTILITIES
 // ═══════════════════════════════════════════════════════════════
 
-function attachGeneratedImages(message, images, titles) {
+function attachGeneratedImages(message, images, titles, metadata = {}) {
     const newImages = dedupeStrings(images);
     if (!newImages.length) {
         return;
     }
 
     const extra = message.extra || (message.extra = {});
-    const firstTitle = titles.find((title) => String(title || "").trim().length > 0);
-
-    // 新版 SillyTavern 把图片统一存进 extra.media（[{type:'image', url}]），并把旧的
-    // extra.image / extra.image_swipes 迁移成只读 getter——此时再写旧字段不会生效，这正是
-    // 「已有一张图后再附加既不替换也不并列」的根因。检测到新版就直接操作 extra.media 数组。
-    const imgDesc = Object.getOwnPropertyDescriptor(extra, "image");
-    const usesMediaArray = Array.isArray(extra.media) || !!(imgDesc && imgDesc.get);
-
-    if (usesMediaArray) {
-        if (!Array.isArray(extra.media)) extra.media = [];
-        const seen = new Set(extra.media.map((m) => m && m.url).filter(Boolean));
-        for (const url of newImages) {
-            if (seen.has(url)) continue;
-            seen.add(url);
-            extra.media.push(firstTitle ? { type: "image", url, title: firstTitle } : { type: "image", url });
-        }
-        // 多张时用「列表」模式并列显示全部；并把焦点定位到最新一张
-        if (extra.media.length > 1) extra.media_display = "list";
-        extra.media_index = Math.max(0, extra.media.length - 1);
-        extra.inline_image = true;
-        if (firstTitle) extra.title = firstTitle;
-        return;
+    const firstTitle = (Array.isArray(titles) ? titles : []).find((title) => String(title || "").trim().length > 0);
+    if (metadata && typeof metadata === "object" && Object.keys(metadata).length) {
+        extra[extensionName] = {
+            ...(extra[extensionName] || {}),
+            ...metadata,
+            lastAttachmentAt: Date.now(),
+        };
     }
 
-    // 旧版 SillyTavern：维护 extra.image / extra.image_swipes（追加新图，显示最新一张）
+    // 始终写新版 extra.media；自动流程可能早于 ST 的媒体包装初始化，不能依赖 getter 探测。
     const existingImages = [];
+    if (Array.isArray(extra.media)) existingImages.push(...extra.media.map((m) => m && m.url).filter(Boolean));
     if (Array.isArray(extra.image_swipes)) existingImages.push(...extra.image_swipes);
-    if (extra.image) existingImages.push(extra.image);
+    if (typeof extra.image === "string" && extra.image) existingImages.push(extra.image);
 
     const mergedImages = dedupeStrings([...existingImages, ...newImages]);
-    extra.image_swipes = mergedImages;
-    extra.image = mergedImages[mergedImages.length - 1];
+    if (!Array.isArray(extra.media)) extra.media = [];
+    const seen = new Set(extra.media.map((m) => m && m.url).filter(Boolean));
+    for (const url of mergedImages) {
+        if (seen.has(url)) continue;
+        seen.add(url);
+        extra.media.push(firstTitle ? { type: "image", url, title: firstTitle } : { type: "image", url });
+    }
+
+    // 旧版 SillyTavern 仍读取 extra.image / image_swipes；新版 getter 存在时不要写旧字段。
+    const imgDesc = Object.getOwnPropertyDescriptor(extra, "image");
+    if (!imgDesc || !imgDesc.get) {
+        extra.image_swipes = mergedImages;
+        extra.image = mergedImages[mergedImages.length - 1];
+    }
+
+    if (extra.media.length > 1) extra.media_display = "list";
+    extra.media_index = Math.max(0, extra.media.length - 1);
     extra.inline_image = true;
     if (firstTitle) extra.title = firstTitle;
+}
+
+function createDialogueAttachmentMetadata(jobs = []) {
+    const dialogueJobs = (Array.isArray(jobs) ? jobs : [])
+        .filter((job) => Array.isArray(job?.dialogue) && job.dialogue.some(Boolean) || String(job?.caption || "").trim())
+        .map((job) => ({
+            mode: String(job.mode || ""),
+            index: Number(job.index) || 0,
+            title: summarizeHistoryText(job.title || "", 80),
+            dialogueMode: String(job.dialogueMode || job.promptDiagnostics?.dialogueMode || ""),
+            dialogueEnabled: job.dialogueEnabled !== false,
+            dialogue: Array.isArray(job.dialogue) ? job.dialogue.slice(0, 8).map((line) => summarizeHistoryText(line, 160)) : [],
+            caption: summarizeHistoryText(job.caption || "", 160),
+        }))
+        .slice(0, 12);
+    return dialogueJobs.length ? { dialogueJobs } : {};
 }
 
 // ═══════════════════════════════════════════════════════════════
@@ -2954,10 +6964,153 @@ function attachGeneratedImages(message, images, titles) {
 
 const GALLERY_KEY = `${extensionName}:gallery`;
 const GALLERY_MAX = 100;
+const GALLERY_PAGE_SIZE = 12;
+const GENERATION_HISTORY_KEY = `${extensionName}:generation-history`;
+const GENERATION_HISTORY_MAX = 100;
+const HISTORY_PAGE_SIZE = 10;
+const historyUiPages = {
+    gallery: 0,
+    generation: 0,
+    failed: 0,
+    retry: 0,
+};
 
 /** 是否为 data:image/...;base64,... 形式的内联图 */
 function isDataUri(value) {
     return /^data:image\//i.test(String(value || ""));
+}
+
+function sanitizeHistoryImages(images = []) {
+    return dedupeStrings((images || []).filter((url) => url && !isDataUri(url))).slice(0, 12);
+}
+
+function summarizeHistoryText(text, maxChars = 500) {
+    const value = String(text || "").replace(/\s+/g, " ").trim();
+    return value.length > maxChars ? `${value.slice(0, maxChars)}...` : value;
+}
+
+function createGenerationHistoryJob(job = {}) {
+    const images = sanitizeHistoryImages(job.result?.images || job.images || []);
+    return {
+        id: String(job.id || ""),
+        mode: String(job.mode || "single"),
+        kind: String(job.kind || "text2image"),
+        index: Number(job.index) || 0,
+        title: String(job.title || ""),
+        prompt: summarizeHistoryText(job.prompt, 800),
+        compiledPrompt: summarizeHistoryText(job.compiledPrompt, 800),
+        refinedPrompt: summarizeHistoryText(job.refinedPrompt, 800),
+        safetyPrompt: summarizeHistoryText(job.safetyPrompt, 800),
+        promptDiagnostics: summarizePromptDiagnostics(job.promptDiagnostics),
+        sourceText: summarizeHistoryText(job.sourceText, 800),
+        status: String(job.status || "pending"),
+        error: summarizeHistoryText(job.error, 300),
+        errorClass: String(job.errorClass || ""),
+        errorSummary: summarizeHistoryText(job.errorSummary, 200),
+        rawError: summarizeHistoryText(job.rawError, 300),
+        retryable: !!job.retryable,
+        policyRetryCount: Number(job.policyRetryCount) || 0,
+        safeRetryPrompt: summarizeHistoryText(job.safeRetryPrompt, 800),
+        policyOriginalPrompt: summarizeHistoryText(job.policyOriginalPrompt, 800),
+        safetyRewritten: !!job.safetyRewritten,
+        missingPlaceholder: !!job.missingPlaceholder,
+        dialogue: Array.isArray(job.dialogue) ? job.dialogue.slice(0, 8).map((line) => summarizeHistoryText(line, 160)) : job.dialogue,
+        dialogueMode: String(job.dialogueMode || job.promptDiagnostics?.dialogueMode || ""),
+        caption: summarizeHistoryText(job.caption, 200),
+        durationMs: Number(job.durationMs) || 0,
+        images,
+    };
+}
+
+function summarizePromptDiagnostics(diagnostics = {}) {
+    if (!diagnostics || typeof diagnostics !== "object") return {};
+    const out = {};
+    for (const [key, value] of Object.entries(diagnostics)) {
+        if (Array.isArray(value)) {
+            out[key] = value.map((item) => summarizeHistoryText(item, 120)).slice(0, 12);
+        } else if (value && typeof value === "object") {
+            out[key] = summarizeHistoryText(JSON.stringify(value), 240);
+        } else if (typeof value === "string") {
+            out[key] = summarizeHistoryText(value, 160);
+        } else if (typeof value === "number" || typeof value === "boolean") {
+            out[key] = value;
+        }
+    }
+    return out;
+}
+
+function createGenerationHistoryRecord(input = {}) {
+    const plan = input.plan || null;
+    const jobs = Array.isArray(input.jobs) ? input.jobs : (Array.isArray(plan?.jobs) ? plan.jobs : []);
+    const historyJobs = jobs.map((job) => createGenerationHistoryJob(job));
+    const images = sanitizeHistoryImages([
+        ...(Array.isArray(input.images) ? input.images : []),
+        ...historyJobs.flatMap((job) => job.images || []),
+    ]);
+    const failedJobCount = historyJobs.filter((job) => job.status === "failed").length;
+    const retryable = historyJobs.some((job) => job.retryable);
+    const mode = String(input.mode || plan?.mode || historyJobs[0]?.mode || "single");
+    const status = String(input.status || (failedJobCount ? (images.length ? "partial" : "failed") : "succeeded"));
+    const durationMs = Number(input.durationMs) || historyJobs.reduce((sum, job) => sum + (Number(job.durationMs) || 0), 0);
+    return {
+        id: String(input.id || `hist_${Date.now()}_${Math.floor(Math.random() * 1e6)}`),
+        ts: Number(input.ts) || Date.now(),
+        source: String(input.source || "generate"),
+        mode,
+        title: String(input.title || plan?.strategy || ""),
+        prompt: summarizeHistoryText(input.prompt || plan?.sourceText || historyJobs[0]?.prompt || "", 800),
+        status,
+        imageCount: images.length,
+        failedJobCount,
+        durationMs,
+        retryable,
+        images,
+        jobs: historyJobs,
+    };
+}
+
+function loadGenerationHistory() {
+    try {
+        const arr = JSON.parse(localStorage.getItem(GENERATION_HISTORY_KEY) || "[]");
+        return Array.isArray(arr) ? arr : [];
+    } catch {
+        return [];
+    }
+}
+
+function saveGenerationHistory(list) {
+    try {
+        const normalized = (Array.isArray(list) ? list : []).slice(0, GENERATION_HISTORY_MAX);
+        localStorage.setItem(GENERATION_HISTORY_KEY, JSON.stringify(normalized));
+    } catch (e) {
+        console.warn(`[${extensionName}] 生成历史保存失败`, e);
+    }
+}
+
+function addGenerationHistoryRecord(record) {
+    if (!record) return null;
+    const normalized = createGenerationHistoryRecord(record);
+    const list = loadGenerationHistory().filter((item) => item && item.id !== normalized.id);
+    list.unshift(normalized);
+    if (list.length > GENERATION_HISTORY_MAX) list.length = GENERATION_HISTORY_MAX;
+    saveGenerationHistory(list);
+    refreshGenerationHistoryUi();
+    return normalized;
+}
+
+function clearGenerationHistory() {
+    resetHistoryUiPage("generation");
+    resetHistoryUiPage("failed");
+    resetHistoryUiPage("retry");
+    saveGenerationHistory([]);
+    refreshGenerationHistoryUi();
+}
+
+function deleteGenerationHistoryRecord(recordId) {
+    const id = String(recordId || "");
+    if (!id) return;
+    saveGenerationHistory(loadGenerationHistory().filter((item) => item && item.id !== id));
+    refreshGenerationHistoryUi();
 }
 
 /** 当前角色名作为落盘子目录（与 ST 自带 SD 出图同目录约定），非法字符替换，回退扩展名 */
@@ -3052,11 +7205,61 @@ function deleteGalleryRecord(url) {
 }
 
 function clearGallery() {
+    resetHistoryUiPage("gallery");
     saveGallery([]);
     refreshGalleryUi();
 }
 
 // ─── 图库 UI ──────────────────────────────────────────────────
+
+function resetHistoryUiPage(key) {
+    if (Object.prototype.hasOwnProperty.call(historyUiPages, key)) {
+        historyUiPages[key] = 0;
+    }
+}
+
+function getPagedUiItems(key, list, pageSize) {
+    const source = Array.isArray(list) ? list : [];
+    const size = Math.max(1, Number(pageSize) || 1);
+    const totalPages = Math.max(1, Math.ceil(source.length / size));
+    const current = Math.min(Math.max(0, Number(historyUiPages[key]) || 0), totalPages - 1);
+    historyUiPages[key] = current;
+    const start = current * size;
+    return {
+        items: source.slice(start, start + size),
+        page: current,
+        totalPages,
+        start,
+        end: Math.min(source.length, start + size),
+    };
+}
+
+function appendPaginationControls(container, key, total, pageSize, rerender) {
+    if (!container?.length || total <= pageSize) return;
+    const pageInfo = getPagedUiItems(key, new Array(total), pageSize);
+    const controls = $('<div class="oair-pagination"></div>');
+    $('<button type="button" class="menu_button oair-page-btn"></button>')
+        .text("上一页")
+        .prop("disabled", pageInfo.page <= 0)
+        .on("click", () => {
+            historyUiPages[key] = Math.max(0, pageInfo.page - 1);
+            rerender();
+        })
+        .appendTo(controls);
+    $("<span>")
+        .addClass("oair-pagination-info")
+        .text(`${pageInfo.start + 1}-${pageInfo.end} / ${total}`)
+        .appendTo(controls);
+    $('<button type="button" class="menu_button oair-page-btn"></button>')
+        .text("下一页")
+        .prop("disabled", pageInfo.page >= pageInfo.totalPages - 1)
+        .on("click", () => {
+            historyUiPages[key] = Math.min(pageInfo.totalPages - 1, pageInfo.page + 1);
+            rerender();
+        })
+        .appendTo(controls);
+    container.append(controls);
+}
 
 function refreshGalleryUi() {
     const fp = $("#oair_floating_panel");
@@ -3072,15 +7275,20 @@ function refreshGalleryUi() {
         return;
     }
 
-    for (const rec of list) {
+    const galleryUrls = list.map((item) => item?.url).filter(Boolean);
+    const page = getPagedUiItems("gallery", list, GALLERY_PAGE_SIZE);
+    for (const rec of page.items) {
         if (!rec || !rec.url) continue;
         const cell = $('<div class="oair-gallery-cell"></div>');
-        $("<img>")
-            .attr("src", rec.url)
-            .attr("title", rec.prompt || "")
-            .attr("loading", "lazy")
-            .on("click", () => openImageLightbox(rec.url))
-            .appendTo(cell);
+        makePreviewImageAccessible(
+            $("<img>")
+                .attr("src", rec.url)
+                .attr("title", rec.prompt || "")
+                .attr("loading", "lazy")
+                .on("click", () => openImageLightbox(rec.url, galleryUrls)),
+            rec.prompt ? `图库图片：${String(rec.prompt).slice(0, 80)}` : "图库图片预览",
+            () => openImageLightbox(rec.url, galleryUrls),
+        ).appendTo(cell);
 
         const bar = $('<div class="oair-gallery-cell-bar"></div>');
         $('<button class="oair-gallery-mini" title="附加到当前消息">📎</button>')
@@ -3097,6 +7305,168 @@ function refreshGalleryUi() {
             .appendTo(bar);
         bar.appendTo(cell);
         grid.append(cell);
+    }
+    appendPaginationControls(grid, "gallery", list.length, GALLERY_PAGE_SIZE, refreshGalleryUi);
+}
+
+function formatHistoryTime(ts) {
+    try {
+        return new Date(Number(ts) || Date.now()).toLocaleString();
+    } catch {
+        return "";
+    }
+}
+
+function formatHistoryStatus(status) {
+    const key = String(status || "");
+    if (key === "succeeded") return "成功";
+    if (key === "partial") return "部分完成";
+    if (key === "failed") return "失败";
+    return key || "未知";
+}
+
+function appendHistoryCard(container, record, jobs = null) {
+    const shownJobs = Array.isArray(jobs) ? jobs : (record.jobs || []);
+    const card = $('<div class="oair-history-record"></div>').attr("data-oair-history-id", record.id || "");
+    const head = $('<div class="oair-history-record-head"></div>').appendTo(card);
+    $("<strong>").text(`${record.source || "generate"} / ${record.mode || "single"} / ${formatHistoryStatus(record.status)}`).appendTo(head);
+    const headActions = $('<span class="oair-history-actions"></span>').appendTo(head);
+    $("<span>").addClass("oair-history-time").text(formatHistoryTime(record.ts)).appendTo(headActions);
+    $('<button type="button" class="menu_button oair-history-delete-btn"></button>')
+        .text("删除")
+        .on("click", function () {
+            if (confirm("删除这条生成历史记录？")) deleteGenerationHistoryRecord(record.id);
+        })
+        .appendTo(headActions);
+    $("<div>")
+        .addClass("oair-history-meta")
+        .text(`图片 ${record.imageCount || 0}，失败 ${record.failedJobCount || 0}，耗时 ${Math.round((record.durationMs || 0) / 100) / 10}s`)
+        .appendTo(card);
+    if (record.prompt) {
+        $("<div>").addClass("oair-history-prompt").text(record.prompt).appendTo(card);
+    }
+    for (const job of shownJobs) {
+        const row = $('<div class="oair-history-job"></div>');
+        $("<span>").text(`${Number(job.index) + 1}. ${job.title || "任务"}：${formatHistoryStatus(job.status)}`).appendTo(row);
+        if (job.errorSummary || job.error) {
+            $("<span>").addClass("oair-history-error").text(job.errorSummary || job.error).appendTo(row);
+        }
+        if (job.retryable) {
+            const policySafeRetry = canUsePolicySafeRetry(job);
+            $('<button type="button" class="menu_button oair-history-retry-btn"></button>')
+                .text(policySafeRetry ? "安全重试" : "重试")
+                .on("click", async function () {
+                    $(this).prop("disabled", true).text("重试中...");
+                    await retryHistoryJob(record.id, job.id, { policySafeRetry });
+                })
+                .appendTo(row);
+        }
+        row.appendTo(card);
+    }
+    container.append(card);
+}
+
+function refreshGenerationHistoryUi() {
+    const fp = $("#oair_floating_panel");
+    const historyBox = fp.find("#oair_generation_history_list");
+    const failedBox = fp.find("#oair_failed_history_list");
+    const retryBox = fp.find("#oair_retry_history_list");
+    if (!historyBox.length && !failedBox.length && !retryBox.length) return;
+
+    const list = loadGenerationHistory();
+    fp.find("#oair_generation_history_count").text(`${list.length} 条`);
+
+    const fillEmpty = (box, text) => {
+        if (box.length) box.empty().append($("<div>").addClass("oair-history-empty").text(text));
+    };
+
+    if (historyBox.length) {
+        historyBox.empty();
+        if (!list.length) {
+            fillEmpty(historyBox, "还没有生成历史");
+        } else {
+            const page = getPagedUiItems("generation", list, HISTORY_PAGE_SIZE);
+            for (const record of page.items) appendHistoryCard(historyBox, record);
+            appendPaginationControls(historyBox, "generation", list.length, HISTORY_PAGE_SIZE, refreshGenerationHistoryUi);
+        }
+    }
+
+    if (failedBox.length) {
+        failedBox.empty();
+        const failed = list
+            .map((record) => ({ record, jobs: (record.jobs || []).filter((job) => job.status === "failed") }))
+            .filter((item) => item.jobs.length);
+        if (!failed.length) {
+            fillEmpty(failedBox, "暂无失败记录");
+        } else {
+            const page = getPagedUiItems("failed", failed, HISTORY_PAGE_SIZE);
+            for (const item of page.items) appendHistoryCard(failedBox, item.record, item.jobs);
+            appendPaginationControls(failedBox, "failed", failed.length, HISTORY_PAGE_SIZE, refreshGenerationHistoryUi);
+        }
+    }
+
+    if (retryBox.length) {
+        retryBox.empty();
+        const retryable = list
+            .map((record) => ({ record, jobs: (record.jobs || []).filter((job) => job.retryable) }))
+            .filter((item) => item.jobs.length);
+        if (!retryable.length) {
+            fillEmpty(retryBox, "暂无可重试任务");
+        } else {
+            const page = getPagedUiItems("retry", retryable, HISTORY_PAGE_SIZE);
+            for (const item of page.items) appendHistoryCard(retryBox, item.record, item.jobs);
+            appendPaginationControls(retryBox, "retry", retryable.length, HISTORY_PAGE_SIZE, refreshGenerationHistoryUi);
+        }
+    }
+}
+
+async function retryHistoryJob(recordId, jobId, options = {}) {
+    const record = loadGenerationHistory().find((item) => item && item.id === recordId);
+    const savedJob = record?.jobs?.find((job) => job && job.id === jobId);
+    if (!record || !savedJob) {
+        toastr.warning("找不到可重试的历史任务。");
+        refreshGenerationHistoryUi();
+        return;
+    }
+    const job = createImageJob({
+        ...savedJob,
+        status: "pending",
+        retryable: false,
+        result: null,
+        error: "",
+    });
+    try {
+        setStatus("正在从历史重试任务...", "info");
+        const policySafeRetry = !!options.policySafeRetry && canUsePolicySafeRetry(job);
+        await retryImageJob(job, requestImagesFromBackend, {
+            source: policySafeRetry ? "policy-safe-retry" : "history-retry",
+            prompt: job.prompt,
+            policySafeRetry,
+        });
+        addGenerationHistoryRecord(createGenerationHistoryRecord({
+            source: policySafeRetry ? "policy-safe-retry" : "history-retry",
+            mode: job.mode,
+            prompt: job.prompt,
+            jobs: [job],
+            status: job.status,
+        }));
+        manualWorkbenchState.lastJobs = [job];
+        renderPlanProgress([job]);
+        renderManualPreview(job.result?.images || [], job.result?.content || "", [job]);
+        setStatus("历史任务重试完成", job.status === "succeeded" ? "success" : "warning");
+        toastr.success("历史任务重试完成。");
+    } catch (error) {
+        addGenerationHistoryRecord(createGenerationHistoryRecord({
+            source: "history-retry",
+            mode: job.mode,
+            prompt: job.prompt,
+            jobs: [job],
+            status: "failed",
+        }));
+        setStatus(`历史任务重试失败：${error?.message || error}`, "error");
+        toastr.error(error?.message || String(error || "历史任务重试失败"));
+    } finally {
+        refreshGenerationHistoryUi();
     }
 }
 
@@ -3115,7 +7485,7 @@ async function attachGalleryImageToMessage(url) {
     }
     if (!msg) { idx = chat.length - 1; msg = chat[idx]; }
     attachGeneratedImages(msg, [url], ["图库"]);
-    updateMessageBlock(idx, msg, { rerenderMessage: false });
+    await updateMessageBlockWhenReady(idx, msg, { rerenderMessage: false });
     try { await context.saveChat(); } catch (_) {}
     toastr.success("已附加图库图片到消息");
 }
