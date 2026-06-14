@@ -1,4 +1,4 @@
-const NON_VISUAL_HINTS = /脑海|意识|内心|旁白|系统|声音|回荡|扫描|命令|只在意识|没有实体|并没有实体|不可见|虚拟|narrator|inner voice|system spirit/i;
+const NON_VISUAL_HINTS = /脑海|记忆|意识|内心|旁白|系统|声音|回声|回荡|低语|扫描|命令|只在意识|没有实体|并没有实体|不可见|虚拟|narrator|inner voice|system spirit/i;
 const IN_IMAGE_TEXT_RISK = /绘制.*(?:文字|对白|字幕)|画面中.*(?:文字|对白|字幕)|清晰中文对白|可读(?:文字|对白)|对白气泡|字幕|水印|draw readable|render readable|readable text/i;
 const MINOR_CODED = /萝莉|幼女|未成年|少女体态|小女孩|little girl|loli/i;
 const SEXUALIZED = /裸露|色情|性暗示|性行为|丰满曲线|布料极少|暴露|娇媚诱惑|爱欲|erotic|sexy|nude/i;
@@ -17,6 +17,37 @@ function unique(values) {
 
 function escapeRegExp(value) {
   return String(value || "").replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+}
+
+function splitPromptSentences(text) {
+  const source = String(text || "").replace(/\s+/g, " ").trim();
+  if (!source) return [];
+  const parts = source.match(/[^。！？!?]+[。！？!?]?/g);
+  return (parts && parts.length ? parts : [source])
+    .map((part) => part.trim())
+    .filter(Boolean);
+}
+
+function removeNonVisualCharacterSentences(text, names = []) {
+  const source = String(text || "").trim();
+  const nonVisualNames = unique(names);
+  if (!source || !nonVisualNames.length) return source;
+  const kept = splitPromptSentences(source).filter((sentence) => (
+    !nonVisualNames.some((name) => sentence.includes(name) && NON_VISUAL_HINTS.test(sentence))
+  ));
+  return (kept.length ? kept.join(" ") : source).trim();
+}
+
+function collectNonVisualMentionNames(text) {
+  const names = [];
+  for (const sentence of splitPromptSentences(text)) {
+    if (!NON_VISUAL_HINTS.test(sentence)) continue;
+    const lead = sentence.match(/^([\p{Script=Han}A-Za-z][\p{Script=Han}A-Za-z0-9_·]{1,11}?)(?=只在|在|的|像|声音|低语|说|：|:|，|,|。|$)/u);
+    if (lead) names.push(lead[1]);
+    const quoted = sentence.match(/[“"'‘：:]\s*([\p{Script=Han}A-Za-z][\p{Script=Han}A-Za-z0-9_·]{1,11}?)(?=[，,。！？!?'"”’]|$)/u);
+    if (quoted) names.push(quoted[1]);
+  }
+  return unique(names).filter((name) => !/^(他|她|它|他们|她们|声音|系统|旁白|记忆|意识|内心|脑海)$/.test(name) && !NON_VISUAL_HINTS.test(name));
 }
 
 function stripCssBlocks(text, diagnostics) {
@@ -96,26 +127,95 @@ function stripChoiceAndBoilerplateTail(text, diagnostics) {
   const out = [];
   let removed = false;
   let tailMode = false;
+  const abstractTail = /\s+\b(?:The narrative explores|All character actions|The content is|The text avoids|The story explores|The story|Readers are|By adhering|Depicting harsh environments|The universal themes|Universal themes|This scene explores|The scene explores|The themes of)\b[^\n。！？]*[.!?]?/i;
   for (const line of lines) {
-    const trimmed = line.trim();
+    let currentLine = line;
+    const inlineAbstract = currentLine.match(abstractTail);
+    if (inlineAbstract && inlineAbstract.index > 0) {
+      currentLine = currentLine.slice(0, inlineAbstract.index).trimEnd();
+      removed = true;
+      diagnostics.removed.push("abstract-boilerplate");
+    }
+    const trimmed = currentLine.trim();
     if (/^\d+[\.、]\s*/.test(trimmed)) {
       tailMode = true;
       removed = true;
       continue;
     }
-    if (/^The narrative |^All character actions |^The content is |^The text avoids |^The story |^Readers are |^By adhering |^Depicting harsh environments/i.test(trimmed)) {
+    if (/^The narrative |^All character actions |^The content is |^The text avoids |^The story |^Readers are |^By adhering |^Depicting harsh environments|^The universal themes |^Universal themes |^This scene explores |^The scene explores |^The themes of /i.test(trimmed)) {
       tailMode = true;
       removed = true;
+      diagnostics.removed.push("abstract-boilerplate");
       continue;
     }
     if (tailMode) {
       removed = true;
       continue;
     }
-    out.push(line);
+    out.push(currentLine);
   }
   if (removed) diagnostics.removed.push("tail-choices-boilerplate");
   return out.join("\n");
+}
+
+function truncateTraceText(value, limit = 360) {
+  const text = String(value || "").replace(/\s+/g, " ").trim();
+  if (text.length <= limit) return text;
+  return `${text.slice(0, Math.max(0, limit - 1))}…`;
+}
+
+function makePromptTraceEntry(stage, summary, data = {}) {
+  const entry = {
+    stage: String(stage || "").trim(),
+    summary: truncateTraceText(summary, 480),
+  };
+  const cleanData = {};
+  for (const [key, value] of Object.entries(data || {})) {
+    if (Array.isArray(value)) {
+      cleanData[key] = value.slice(0, 12).map((item) => truncateTraceText(item, 160));
+    } else if (value && typeof value === "object") {
+      cleanData[key] = truncateTraceText(JSON.stringify(value), 240);
+    } else if (typeof value === "string") {
+      cleanData[key] = truncateTraceText(value, 240);
+    } else if (typeof value === "number" || typeof value === "boolean") {
+      cleanData[key] = value;
+    }
+  }
+  if (Object.keys(cleanData).length) entry.data = cleanData;
+  return entry;
+}
+
+function createPromptTrace(draft, cleanup, visualCleanup) {
+  const visible = draft.visibleCharacters || [];
+  const nonVisual = draft.nonVisualCharacters || [];
+  const missing = draft.diagnostics?.missingCharacters || [];
+  return [
+    makePromptTraceEntry(
+      "source-cleanup",
+      `cleaned source ${String(draft.sourceText || "").length} -> ${String(draft.cleanedText || "").length} chars; removed ${(cleanup?.diagnostics?.removed || []).join(",") || "none"}`,
+      { removed: cleanup?.diagnostics?.removed || [] },
+    ),
+    makePromptTraceEntry(
+      "visual-moment",
+      `selected visual moment: ${draft.visualMoment}`,
+      { visualMoment: draft.visualMoment, removed: visualCleanup?.diagnostics?.removed || [] },
+    ),
+    makePromptTraceEntry(
+      "character-binding",
+      `visible ${visible.join("、") || "none"}; non-visual ${nonVisual.join("、") || "none"}; missing ${missing.join("、") || "none"}`,
+      { visible, nonVisual, missing },
+    ),
+    makePromptTraceEntry(
+      "compiled-prompt",
+      `compiled prompt: ${draft.compiledPrompt}`,
+      { finalPrompt: draft.compiledPrompt },
+    ),
+    makePromptTraceEntry(
+      "final-prompt",
+      `final prompt: ${draft.finalPrompt || draft.compiledPrompt}`,
+      { finalPrompt: draft.finalPrompt || draft.compiledPrompt },
+    ),
+  ];
 }
 
 export function cleanPromptSource(sourceText) {
@@ -274,15 +374,23 @@ export function createPromptDraft(input = {}) {
   const fixedRefs = normalizeFixedReferences(input.fixed || input.visualBible?.fixed || input.visualBible || {});
   const job = input.job || {};
   const parts = getPromptParts(job);
-  const characters = collectJobCharacters(job);
+  const sourceFixedCharacters = fixedRefs.characters
+    .map((entry) => entry.name)
+    .filter((name) => cleanup.text.includes(name));
+  const sourceNonVisualCharacters = collectNonVisualMentionNames(cleanup.text);
+  const characters = unique([...collectJobCharacters(job), ...sourceFixedCharacters, ...sourceNonVisualCharacters]);
   const classified = classifyVisibleCharacters(characters, cleanup.text);
-  const visibleCharacters = classified.visible;
-  const nonVisualCharacters = classified.nonVisual;
+  const nonVisualCharacters = unique([...classified.nonVisual, ...sourceNonVisualCharacters]);
+  const visibleCharacters = classified.visible.filter((name) => !nonVisualCharacters.includes(name));
   const protectedCharacters = fixedRefs.characters.filter((entry) => visibleCharacters.includes(entry.name));
   const missingCharacters = visibleCharacters.filter((name) => !protectedCharacters.some((entry) => entry.name === name));
   const rawVisualMoment = String(parts.visualMoment || parts.imageDescription || parts.prompt || job.prompt || cleanup.text || sourceText).trim();
   const visualCleanup = cleanPromptFragment(rawVisualMoment);
-  const visualMoment = String(visualCleanup.text || cleanup.text || rawVisualMoment || sourceText).trim();
+  const visualMomentBeforeNonVisualFilter = String(visualCleanup.text || cleanup.text || rawVisualMoment || sourceText).trim();
+  const visualMoment = removeNonVisualCharacterSentences(visualMomentBeforeNonVisualFilter, nonVisualCharacters);
+  if (visualMoment !== visualMomentBeforeNonVisualFilter) {
+    visualCleanup.diagnostics.removed.push("non-visual-character-sentence");
+  }
   const sceneName = String(parts.scene || job.scene || input.scene || "").trim();
   const protectedScenes = resolveSceneReferences(fixedRefs, sceneName, cleanup.text);
   const dialogue = Array.isArray(parts.dialogue) ? parts.dialogue.filter(Boolean) : [];
@@ -320,6 +428,7 @@ export function createPromptDraft(input = {}) {
   };
   draft.compiledPrompt = compileDraftPrompt(draft);
   draft.finalPrompt = draft.compiledPrompt;
+  draft.diagnostics.promptTrace = createPromptTrace(draft, cleanup, visualCleanup);
   return draft;
 }
 
@@ -455,6 +564,15 @@ export function rewriteRiskyPromptFields(draft, riskReport = null) {
   next.safetyPrompt = next.compiledPrompt;
   next.finalPrompt = next.compiledPrompt;
   next.validation = validatePromptCandidate(next.finalPrompt, next);
+  next.diagnostics.promptTrace = [
+    ...((draft?.diagnostics?.promptTrace || []).slice(0, 10)),
+    makePromptTraceEntry(
+      "safety-rewrite",
+      risks.requiresRewrite ? `safety rewrite applied to ${risks.items.length} risky item(s)` : "safety classified; no rewrite required",
+      { riskItems: risks.items.map((item) => `${item.source}:${item.name}:${(item.categories || []).join("/")}`) },
+    ),
+    makePromptTraceEntry("final-prompt", `final prompt: ${next.finalPrompt}`, { finalPrompt: next.finalPrompt }),
+  ];
   return next;
 }
 

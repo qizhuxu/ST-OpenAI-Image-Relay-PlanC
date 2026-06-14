@@ -1,3 +1,8 @@
+import {
+    cleanPromptSource,
+    classifyVisibleCharacters,
+} from "./prompt_preflight.mjs";
+
 const PROMPT_SAFETY_LEVELS = ["strict", "standard", "loose"];
 const SINGLE_STRATEGIES = ["climax", "poster", "final"];
 const VISUAL_SCOPE_FIELDS = [
@@ -387,16 +392,8 @@ export function normalizeSinglePromptStrategy(value) {
 }
 
 function cleanSourceForVisualPlanning(text) {
-    return String(text || "")
-        .replace(/<style\b[^>]*>[\s\S]*?<\/style>/gi, "\n")
-        .replace(/<script\b[^>]*>[\s\S]*?<\/script>/gi, "\n")
-        .replace(/<options\b[^>]*>[\s\S]*?<\/options>/gi, "\n")
-        .replace(/<disclaimer\b[^>]*>[\s\S]*?<\/disclaimer>/gi, "\n")
-        .replace(/<UpdateVariable\b[^>]*>[\s\S]*?<\/UpdateVariable>/gi, "\n")
-        .replace(/<StatusPlaceHolderImpl\b[^>]*\/?>/gi, "\n")
-        .replace(/(?:^|\n)\s*[.#][\w-]+\s*\{[\s\S]*?\}\s*/g, "\n")
-        .replace(/[.#][\w-]+\s*\{[^{}]*\}/g, " ")
-        .replace(/<[^>]+>/g, " ")
+    const cleanup = cleanPromptSource(text);
+    return String(cleanup.text || "")
         .replace(/[ \t]+\n/g, "\n")
         .replace(/\n{3,}/g, "\n\n")
         .trim();
@@ -407,7 +404,8 @@ export function splitVisualParagraphs(text) {
         .split(/\n{2,}|\r?\n/)
         .map((line) => line.replace(/\s+/g, " ").trim())
         .filter(Boolean)
-        .filter((line) => !isLowVisualSystemLine(line));
+        .filter((line) => !isLowVisualSystemLine(line))
+        .filter((line) => isDrawableVisualMoment(line));
 }
 
 export function planSingleImageTarget(sourceText, options = {}) {
@@ -435,13 +433,18 @@ export function planSingleImageTarget(sourceText, options = {}) {
         selected = scored.sort((a, b) => b.score - a.score || b.index - a.index)[0];
     }
 
-    const visualMoment = selected?.text || fallback || "当前剧情中最具代表性的安全画面。";
+    const visualMoment = selected?.text || candidates.find((item) => isDrawableVisualMoment(item)) || fallback || "当前剧情中最具代表性的安全画面。";
     const contextText = selected?.index >= 0
         ? [candidates[selected.index - 1], visualMoment, candidates[selected.index + 1]].filter(Boolean).join("\n")
         : visualMoment;
+    const analysisClassification = classifyAnalysisCharacterCandidates(options.analysisCharacters, planningText);
+    const nonVisualCharacters = analysisClassification.nonVisual;
     const characters = options.characters?.length
-        ? dedupeStrings(options.characters)
-        : collectVisibleCharacters(contextText, options.fixed?.charactersText || options.fixed?.characters || "");
+        ? dedupeStrings(options.characters).filter((name) => !nonVisualCharacters.includes(name))
+        : dedupeStrings([
+            ...collectVisibleCharacters(contextText, options.fixed?.charactersText || options.fixed?.characters || ""),
+            ...analysisClassification.visible.filter((name) => contextText.includes(name)),
+        ]).filter((name) => !nonVisualCharacters.includes(name));
     const anchors = collectVisualAnchors(visualMoment);
     return {
         strategy,
@@ -449,6 +452,11 @@ export function planSingleImageTarget(sourceText, options = {}) {
         visualMoment,
         scene: inferSceneText(sourceText, options.fixed),
         characters,
+        nonVisualCharacters,
+        visualCandidates: scored.map((item) => ({
+            text: item.text,
+            score: item.score,
+        })).slice(0, 12),
         actions: collectActionPhrases(visualMoment),
         anchors,
     };
@@ -462,6 +470,7 @@ export function createSingleImagePlanFromSource(sourceText, options = {}) {
         mode: "single",
         title: target.title,
         characters: target.characters,
+        nonVisualCharacters: target.nonVisualCharacters,
         scene: target.scene,
         promptParts: target,
     };
@@ -493,11 +502,16 @@ export function compileImagePrompt(input = {}) {
     const fixed = normalizeFixedReferences(input.fixed || visualBible?.fixed || visualBible);
     const job = input.job || {};
     const parts = normalizePromptParts(job.promptParts || job, mode, input);
+    const nonVisualCharacters = dedupeStrings([
+        ...(Array.isArray(parts.nonVisualCharacters) ? parts.nonVisualCharacters : []),
+        ...(Array.isArray(job.nonVisualCharacters) ? job.nonVisualCharacters : []),
+    ]);
+    const nonVisualSet = new Set(nonVisualCharacters);
     const visibleCharacters = dedupeStrings([
         ...(Array.isArray(parts.characters) ? parts.characters : []),
         ...(Array.isArray(job.characters) ? job.characters : []),
         ...(Array.isArray(visualBible?.confirmedCharacters) ? visualBible.confirmedCharacters : []),
-    ]);
+    ]).filter((name) => !nonVisualSet.has(name));
     const scopedCharacters = scopeCharacterReferences(fixed.characters, visibleCharacters, input.strategy);
     const candidateCharacters = scopeCandidateReferences(visualBible?.characterCandidates, visibleCharacters);
     const missingCharacters = visibleCharacters.filter((name) => (
@@ -533,9 +547,11 @@ export function compileImagePrompt(input = {}) {
             mode,
             strategy: input.strategy || parts.strategy || "",
             visibleCharacters,
+            nonVisualCharacters,
             scopedCharacters: scopedCharacters.map((entry) => entry.name),
             candidateCharacters: candidateCharacters.map((entry) => entry.name),
             missingCharacters,
+            visualCandidates: Array.isArray(parts.visualCandidates) ? parts.visualCandidates.slice(0, 8) : [],
             dialogueMode: parts.dialogueMode || "",
             dialogueEnabled: mode === "comic" ? !!parts.dialogueEnabled : false,
             dialogue,
@@ -557,6 +573,8 @@ function normalizePromptParts(parts, mode, input = {}) {
         shot: source.shot || source.shotType || "",
         scene: source.scene || "",
         characters: Array.isArray(source.characters) ? source.characters : [],
+        nonVisualCharacters: Array.isArray(source.nonVisualCharacters) ? source.nonVisualCharacters : [],
+        visualCandidates: Array.isArray(source.visualCandidates) ? source.visualCandidates : [],
         actions: Array.isArray(source.actions) ? source.actions : [],
         anchors: Array.isArray(source.anchors) ? source.anchors : [],
         dialogue,
@@ -638,9 +656,9 @@ function collectLikelyNamedCharacters(text) {
     const source = String(text || "");
     const namePattern = String.raw`([\p{Script=Han}A-Za-z][\p{Script=Han}A-Za-z0-9_·]{1,11}?)`;
     const patterns = [
-        new RegExp(String.raw`(?:^|[。！？；;\n])\s*${namePattern}(?=(?:在|把|向|对|从|与|和|朝|将|用|举|握|拔|回头|挡|站|看|低语|喊|冲|躲|横移|转身|收|露出|注视|侧身|反手))`, "gu"),
+        new RegExp(String.raw`(?:^|[。！？；;，,:：,\n])\s*${namePattern}(?=(?:在|把|向|对|从|与|和|朝|将|用|举|握|拔|回头|挡|站|看|低语|喊|冲|躲|横移|转身|收|露出|注视|侧身|反手|捂|蹲|停步|停下|扶|观察))`, "gu"),
         new RegExp(String.raw`(?:挡在|护住|看着|望向|转向|冲着|对着|靠近|拉住|抓住|扶住|保护|挡住)${namePattern}(?=(?:前方|身前|身后|旁边|[，,。！？；;\s]|$))`, "gu"),
-        new RegExp(String.raw`(?:与|和|跟)${namePattern}(?=(?:一起|并肩|对峙|交错|[，,。！？；;\s]|$))`, "gu"),
+        new RegExp(String.raw`(?:与|和|跟)${namePattern}(?=(?:一起|并肩|对峙|交错|在|站|看|注视|观察|扶|捂|蹲|停步|停下|转身|回头|[，,。！？；;\s]|$))`, "gu"),
     ];
     const names = [];
     for (const pattern of patterns) {
@@ -655,6 +673,7 @@ function collectLikelyNamedCharacters(text) {
 function isLikelyNonCharacterName(name) {
     const value = String(name || "").trim();
     if (value.length < 2 || value.length > 12) return true;
+    if (/(捂|蹲|受伤|手背|停步|注视|脑海|声音|只$|没有|实体|出现|泥水|马厩|破败|下层|红肿|身旁|晨光|光线|冷光|暖光|柔光|光照|光芒|光束|照在|照向|落$)/.test(value)) return true;
     if (/^(自然光|柔和自然光|阳光|月光|灯光|光线|光影|窗边|图书馆|地图|晴朗下午)$/.test(value)) return true;
     const generic = /^(这个|那个|这些|那些|一个|一名|几名|几个|众人|人群|路人|敌人|对手|混混|壮汉|少女|男子|女人|男人)$/;
     if (generic.test(value)) return true;
@@ -707,6 +726,7 @@ function buildPosterMoment(candidates) {
 
 function scoreVisualParagraph(text, index, total) {
     const source = String(text || "");
+    if (!isDrawableVisualMoment(source)) return -120;
     let score = 0;
     const strongWords = ["突然", "瞬间", "冲", "闪", "剑", "挡", "刺", "反击", "躲开", "喊", "危机", "高潮", "回头", "注视"];
     const weakWords = ["状态:", "骰运:", "结果:", "目标剩余:", "HP", "判定", "规则", "token", "TavernDB"];
@@ -721,6 +741,38 @@ function scoreVisualParagraph(text, index, total) {
 
 function isLowVisualSystemLine(text) {
     return /^(角色|动作|目标|骰运|结果|目标剩余|状态|特图的旁白)\s*:/.test(String(text || "").trim());
+}
+
+function isAbstractBoilerplateLine(text) {
+    const value = String(text || "").replace(/\s+/g, " ").trim();
+    if (!value) return true;
+    if (/^(The universal themes|Universal themes|The narrative|The story|This scene explores|The scene explores|Readers are|By adhering|The content is|The text avoids)\b/i.test(value)) {
+        return true;
+    }
+    if (/\b(themes?|narrative traditions?|psychological manipulation|power disparity|moral ambiguity|ethical concerns|fictional depiction|content policy|safety guidelines)\b/i.test(value)) {
+        return true;
+    }
+    return /^(主题|寓意|叙事|读者|本文|本段|这个故事|这段剧情|该场景|从文学|从叙事|安全策略|内容政策)/.test(value);
+}
+
+function isDrawableVisualMoment(text) {
+    const source = String(text || "").trim();
+    if (!source || isLowVisualSystemLine(source) || isAbstractBoilerplateLine(source)) return false;
+    const concreteChinese = /(站|坐|蹲|跪|走|跑|冲|停|看|注视|望|握|举|捂|扶|拉|抓|挡|躲|闪|推|靠|转身|回头|露出|穿|拿|落在|停在|拴着|散落|弥漫|光线|泥水|马厩|城堡|街道|房间|窗|桌|推车|长剑|手背|表情|眼神)/;
+    const concreteEnglish = /\b(stands?|sits?|kneels?|walks?|runs?|holds?|looks?|gazes?|turns?|leans?|beside|inside|room|street|stable|castle|window|mud|cart|light|shadow|hand|face|eyes?|cloak|map)\b/i;
+    const hasNamedSubject = /[\p{Script=Han}A-Za-z][\p{Script=Han}A-Za-z0-9_·]{1,11}/u.test(source);
+    return concreteChinese.test(source) || concreteEnglish.test(source) || (hasNamedSubject && source.length <= 220 && /[，,。.!?]/.test(source));
+}
+
+function classifyAnalysisCharacterCandidates(names = [], sourceText = "") {
+    const source = String(sourceText || "");
+    const presentNames = dedupeStrings(names).filter((name) => name && source.includes(name));
+    if (!presentNames.length) return { visible: [], nonVisual: [] };
+    const classified = classifyVisibleCharacters(presentNames, source);
+    return {
+        visible: classified.visible.filter((name) => source.includes(name)),
+        nonVisual: classified.nonVisual.filter((name) => source.includes(name)),
+    };
 }
 
 function defaultStyleForMode(mode) {
