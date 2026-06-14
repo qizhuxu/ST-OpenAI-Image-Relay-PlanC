@@ -658,6 +658,7 @@ function isLikelyNonCharacterName(name) {
     if (/^(自然光|柔和自然光|阳光|月光|灯光|光线|光影|窗边|图书馆|地图|晴朗下午)$/.test(value)) return true;
     const generic = /^(这个|那个|这些|那些|一个|一名|几名|几个|众人|人群|路人|敌人|对手|混混|壮汉|少女|男子|女人|男人)$/;
     if (generic.test(value)) return true;
+    if (/^[\p{Script=Han}]{2,10}(?:上|下|中|里|内|外|旁|边|前|后|间|处)$/u.test(value)) return true;
     return /街道|石板|长剑|重剑|剑尖|药剂|药水|露液|腰间|腰包|地面|前方|后方|画面|场景|光影|道具|瓶|手中|脚下/.test(value);
 }
 

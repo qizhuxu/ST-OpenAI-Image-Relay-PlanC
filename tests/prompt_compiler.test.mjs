@@ -62,6 +62,17 @@ test("single planner does not treat lighting words as missing characters", () =>
   assert.doesNotMatch(plan.jobs[0].promptDiagnostics.missingCharacters.join(","), /自然光/);
 });
 
+test("single planner does not treat locative object phrases as missing characters", () => {
+  const source = "艾琳在图书馆窗边展开一张旧地图，晨光落在木桌和书架上。";
+
+  const plan = createSingleImagePlanFromSource(source, { strategy: "climax", fixed: {} });
+  const job = plan.jobs[0];
+
+  assert.match(job.prompt, /艾琳/);
+  assert.deepEqual(job.promptDiagnostics.missingCharacters, ["艾琳"]);
+  assert.doesNotMatch(job.prompt, /书架上：无固定外貌参考|可见人物：.*书架上/);
+});
+
 test("single compiler keeps visible named characters without fixed references", () => {
   const source = "齐齐在石板街道上横移半步，挡在米特前方，手中的长剑斜指地面，金色药剂瓶在腰间闪光。";
   const fixedWithoutQiQi = {
