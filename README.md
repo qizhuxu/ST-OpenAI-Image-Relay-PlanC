@@ -1,0 +1,273 @@
+# OpenAI Image Relay（OpenAI 图像中继）
+
+一个 **SillyTavern 第三方扩展**：让主对话模型在回复里输出 `<pic prompt="...">` 标签，扩展自动捕获其中的提示词，发送到任意兼容 OpenAI 接口的生图后端，再把标签替换成生成的图片。也可以开启「自动整条 AI 消息生图」，让每条符合条件的新 AI 消息按完整正文排队生成图片并附加回原消息。除此之外，你也可以手动生图、或对任意一条消息一键生图。
+
+> 浏览器端纯 ES 模块，无需构建、无需打包。由 SillyTavern 通过 `manifest.json` 在运行时加载，**不能**单独运行。
+
+---
+
+## ✨ 核心特性
+
+- **标签自动生图**：主模型回复中出现 `<pic prompt="...">` → 自动提取 → 生图 → 替换为图片（自动整条消息流程关闭时）。
+- **自动整条 AI 消息生图**：可选开启；每条新 AI 消息经 `cleanRpText()` 清洗、满足最小字数后进入同聊天串行队列，并按当前工作台模式、张数、对白和失败策略生成后附加回原消息。
+- **单图 / 多图 / 漫画三种模式**：单图先按剧情高潮、总结海报、最后镜头取景规划一个画面目标，再由本地提示词编译器生成 prompt；多图按 2-6 个 StoryBeat 递进生成；漫画按 2-8 格分镜生成并保留对白元数据。
+- **手动生图工作台**：在悬浮面板「生成工作台」里输入剧情或提示词，选择生成模式后直接出图；进度、错误和诊断有高度约束，结果以缩略图卡片预览，点击进入灯箱查看大图。
+- **消息生图**：每条消息操作栏多出两个按钮，对单条消息直接生图或先总结再生图。
+- **当前角色卡视觉库 / Visual Bible**：每个角色卡拥有自己的风格、人物、场景、确认人物和来源诊断；旧全局库、旧聊天作用域、世界书或剧情候选只作为回退/显式导入来源，生成时统一解析成 Visual Bible 注入单图、多图、漫画和重试 prompt。
+- **内置风格 / Built-in style presets**：插件自带 3 个风格预设，空角色卡也能看到；点击导入后只追加到当前角色卡风格库，不覆盖用户已有风格。
+- **自动设定提取**：`autoExtractCharactersEnabled` 和 `autoExtractScenesEnabled` 默认关闭；开启后每条新 AI 消息会保守提取人物/场景视觉条目，只写入当前角色卡 Visual Bible。
+- **Prompt Preflight / 编译 / 精修 / 安全分类**：`prompt_preflight.mjs` 在每次请求图片后端前创建 PromptDraft；本地编译是必经权威步骤，LLM 精修只是可选后置步骤，安全分类必跑，安全重写按风险或 policy retry 条件触发。文本步骤默认走**酒馆主模型**，无需额外配置。
+- **两种后端模式**：`Chat Completions` 与 `Images API`，自适应解析多种返回格式。
+- **一键 chatgpt2api 预设**：一个按钮切换到 [chatgpt2api](https://github.com/basketikun/chatgpt2api) 的推荐配置。
+- **三层界面**：极简抽屉 + 可选悬浮球 + 完整悬浮配置窗，按需展开。
+
+---
+
+## 🧭 当前实现状态
+
+`image-generation-modes` 的主体能力已经实现并归档，OpenSpec change `complete-generation-mode-features` 进一步补齐了此前的占位能力：
+
+- `<pic>` 标签在旧 `<pic prompt="...">` 单图兼容之外，支持 `mode="single|multi|comic"`、`count`、`panels`、`dialogue`、`failure`、`strategy` 等属性；无效属性会中文警告并回退安全默认值。
+- 设定库已改为**当前角色卡视觉库 profile**：旧全局人物/场景/风格设定会保留为回退/显式导入来源，但新的库编辑、当前场景/风格、确认人物和 user/persona 候选只写入当前角色卡作用域。
+- `retry` 是可保存的失败策略：失败 job 会保留 prompt、错误分类、错误摘要和可重试状态；policy 失败会显示“安全重试”，用保守 SFW prompt 最多重试一次，手动预览与历史页都能只重试单个 job，不会重跑整组计划。
+- 多图拆分少于请求张数时，会生成可见的缺失 StoryBeat 占位 job，并可从预览或历史中单独重试补齐。
+- 「人物确认 / 分镜计划」已替换为人物候选卡片，支持勾选、取消和编辑；确认结果会写入当前角色卡人物库，并进入本次手动单图/多图/漫画计划。当前 user/persona（例如“齐齐”）会优先作为可确认候选，而不是长期停留在“缺外貌”诊断。
+- 工作台进度、错误和诊断文本会自动换行并限制高度；预览区恢复为缩略图网格，点击缩略图后在灯箱中左右切换查看。
+- 「图库历史」包含落盘图库、轻量生成历史、失败记录和历史重试入口；历史只保存短路径和元数据，不保存 base64 图片字节。
+- 真实图生图/图片编辑连续性仍是后续预留；当前连续性只记录参考图元数据，不改变文生图请求。
+
+---
+
+## 📦 安装
+
+把本扩展文件夹放到 SillyTavern 的第三方扩展目录下：
+
+```
+SillyTavern/public/scripts/extensions/third-party/<本扩展文件夹>/
+```
+
+文件夹内至少包含 `index.js`、`manifest.json`（连同 `settings_panel.html`、`settings_full.html`、`style.css` 一起复制最稳妥）。三种方式任选其一：
+
+- **扩展安装器（推荐）**：SillyTavern → 扩展安装器 → 填入本仓库地址 → 安装。
+- **手动复制**：把整个文件夹复制到上面的路径。
+- **Git Clone**：
+  ```bash
+  cd SillyTavern/public/scripts/extensions/third-party/
+  git clone <本仓库地址>
+  ```
+
+装好后**硬刷新**浏览器（Ctrl/Cmd + Shift + R）。在「扩展设置」里出现 **「🖼️ 图片中继」** 抽屉即表示加载成功。
+
+> 排查问题时打开浏览器开发者工具（F12）→ Console，所有日志都以 `[ST-OpenAI-Image-Relay]` 前缀输出。
+
+---
+
+## 🚀 快速上手
+
+1. 打开「扩展设置」→ 展开 **「🖼️ 图片中继」** 抽屉（L0）。
+2. 勾选 **启用**，点击 **打开详细配置** 打开悬浮配置窗（L2）。
+3. 到 **「模型后端」** 标签：
+   - 用 **universal-web-api** 等通用后端：保持默认即可（地址 `http://127.0.0.1:8199/v1`，密钥 `sk-any`，模型 `any`，Chat 模式）。
+   - 用 **chatgpt2api**：直接点 **「⚡ 一键 chatgpt2api 预设」**（见下文），再确认地址与密钥。
+4. 先到 **「生成工作台」** 输入一句简单提示词测试出图，确认后端通了。若要长剧情多图或漫画，切换「工作台模式」并设置张数、是否生成对白/旁白、对白模式、连续性和失败策略。
+5. 一切正常后有两种自动方式：
+   - 保持「自动整条 AI 消息生图」关闭，让主模型按主提示词输出 `<pic prompt="...">`，旧标签流程会接管并替换标签。
+   - 或在「生成工作台」里开启「自动整条 AI 消息生图」，让每条符合最小字数的新 AI 消息按当前工作台模式自动排队生图并附加图片；此时消息里的 `<pic>` 不再作为单独触发，避免重复生成。
+
+---
+
+## ⚡ 一键 chatgpt2api 预设
+
+[chatgpt2api](https://github.com/basketikun/chatgpt2api) 是一个**只生图**的 OpenAI 兼容后端。在 **「模型后端」** 标签顶部点击 **「⚡ 一键 chatgpt2api 预设」**，会一次性套用推荐配置：
+
+| 项目 | 值 |
+| --- | --- |
+| API 模式 | **Images API** |
+| 模型 | `gpt-image-2` |
+| 响应格式 | `b64_json` |
+| 提示词模板 | `{{prompt}}`（直通，不额外包装） |
+| 文本步骤（精修/安全重写/总结） | 走**酒馆主模型** |
+| 超时 | `600000` 毫秒（600 秒，因 chatgpt2api 生图较慢） |
+| 服务地址 | 仅在为空或仍是默认值时填入 `http://127.0.0.1:3000/v1` |
+
+> 预设**不会覆盖你已填写的 API 密钥**，也不会改动你自定义过的服务地址。套用后请自行核对地址与密钥。
+
+---
+
+## 🪟 三层界面
+
+同一套设置按三个递进层级呈现，想露多少露多少：
+
+- **L0 · 极简抽屉**：扩展设置里的「🖼️ 图片中继」抽屉。只有启用开关、悬浮球开关、以及「打开详细配置」按钮。
+- **L1 · 悬浮球（FAB）**：可选的可拖拽圆形按钮，点一下打开 L2，并用颜色/动画提示生图状态（加载/成功/失败）。在 L0 开启。
+- **L2 · 悬浮配置窗**：可拖拽、可缩放的窗口，包含完整的 5 个标签页：
+  - **生成工作台**：模式、源文本、人物确认、单图取景、多图张数、漫画对白、连续性、自动整条消息开关、进度、预览与队列状态。
+  - **设定库**：当前角色卡视觉库 profile，包含风格、人物、场景、世界书提取、显式导入来源与固定设定清洗级别。
+  - **提示词模板**：按运行角色分层显示必需后端/规划模板、旧 `<pic>` 兼容项、高级精修/总结/安全重写模板，以及当前未启用的清洗模板预留项。
+  - **模型后端**：一键预设、图片后端、文本步骤模型、自定义精修后端。
+  - **图库历史**：已落盘图库、生成历史、失败记录与历史重试入口。
+
+---
+
+## 🎨 五种生图方式
+
+| 方式 | 触发点 | 行为 |
+| --- | --- | --- |
+| **标签自动** | 主模型回复含 `<pic prompt="...">`，且「自动整条 AI 消息生图」关闭 | 用提取正则取出提示词，并读取标签上的模式属性 → 走单图/多图/漫画 ImagePlan → 生图 → 把标签替换为图片，写回消息 |
+| **整条消息自动** | 「生成工作台」里开启自动整条 AI 消息生图 | 新 AI 消息经清洗和最小字数检查后进入同聊天串行队列 → 按当前工作台模式、张数、对白和失败策略生成 → 图片附加回原消息；不改写正文 |
+| **手动单图/多图/漫画** | 「生成工作台」按「工作台模式」选择 | 单图先规划取景目标并本地编译 prompt，可手动精修；多图先拆分 StoryBeat 后逐节点编译生成图组；漫画按分镜逐格编译生成，并在预览区展示插件气泡/对白元数据与单格重试 |
+| **直接生图** | 消息操作栏 🖼️ 按钮 | 用该条消息的**原文**直接生图并附加到该消息 |
+| **总结生图** | 消息操作栏 ✨ 按钮 | 先用 LLM 把该条消息**总结**成提示词，再生图并附加 |
+
+> 消息按钮需在设置中开启「消息生图」（默认开启）。标签自动、整条消息自动、手动各模式和直接消息生图都会复用 ImagePlan / ImageJob 管线；总结生图会先走总结，再进入单图规划、编译、安全重写、图片请求、落盘和附加路径。
+>
+> 标签扩展示例：
+> - `<pic prompt="雨夜巷口的追逐" mode="multi" count="3" failure="retry">`
+> - `<pic prompt="集市追逐的四格漫画" mode="comic" panels="4" dialogue="bubble" dialogueEnabled="true" failure="continue">`
+> - `<pic prompt="角色立绘" mode="single" strategy="poster">`
+>
+> 多图模式接入手动工作台、标签自动和自动整条消息流程：LLM 将长文本拆分为 2-6 个 StoryBeat，每个节点生成一个独立 ImageJob。若文本模型返回节点不足，会生成缺失节点占位；这些占位可从预览或历史中单独重试。
+>
+> 漫画模式接入手动工作台、标签自动和自动整条消息流程：LLM 先规划 2-8 格分镜（每格含镜头、画面、对白、旁白、视觉锚点），逐格生成图片。「生成对白/旁白元数据」控制 planner 是否必须产出 dialogue/caption；关闭时不会强行创造对白。对白默认走「插件气泡」——画面中不出现文字，对白保留为元数据并由插件在预览区叠加气泡；也可切换「模型画字」让后端尝试在画面里绘制中文气泡（可能不稳定）。手动预览里的失败格会显示标记并在 retry 策略或缺失节点场景下支持单格重试。
+>
+> 「连续性策略」目前是图生图/图片编辑预留：可选择关闭、上一张、首图+上一张、角色参考+上一张；本阶段只把参考图写入 ImageJob 元数据并保持文生图请求不变，未接入真实图片编辑 HTTP 接口。
+>
+> 失败策略含义：`stop` 会停止后续待执行 job 并显示停止原因；`continue` 会继续生成剩余 job 并保留失败诊断；`retry` 不会自动循环请求后端，而是保留可重试 job，供预览区或历史页定向重试。
+>
+> 自动整条消息流程是**可选开关**，默认关闭。开启后会按聊天串行排队，并可跟随当前工作台模式、张数、对白和失败策略；关闭后旧 `<pic prompt="...">` 标签兼容行为不变，扩展标签属性会被标签自动路径读取。开启自动整条消息时，消息里的 `<pic>` 不再作为单独触发，避免重复生成。
+
+---
+
+## 🧭 当前角色卡视觉库 / Visual Bible
+
+设定库现在按**当前角色卡**拥有视觉库 profile。人物库、场景库、当前风格、当前场景和手动确认的人物都会写入当前角色卡作用域；切换到角色卡 B 时不会显示角色卡 A 的库，新角色卡 C 默认没有 A/B 的人物或场景。旧版本保存在全局 settings 或旧聊天作用域里的库不会被删除，但不会自动回填到当前角色卡。
+
+每次生成前，扩展会从当前角色卡作用域解析一份 **Visual Bible**：风格、人物外貌、场景环境、确认人物、user/persona 候选、缺失固定外貌的人物、连续性和负面约束。单图、多图、漫画、手动生成、自动整条消息、`<pic>` 标签和 policy 安全重试都会复用这份 Visual Bible，再进入本地 prompt compiler。进度卡、历史记录和 job diagnostics 会记录本次使用的 scope、风格、场景、命中人物、候选人物和缺失外貌，并区分 `character-card library`、`worldbook`、`story-derived`、`missing` 等来源。
+
+「设定库」里会显示插件内置的 3 个 built-in style presets。它们属于插件预设目录，不会在打开新角色卡时自动写入库；点击「导入内置风格到当前角色卡」才会把缺失的预设追加到当前角色卡 `styleLibrary`，并保留同名用户风格的原文。
+
+自动设定提取是可选功能：`autoExtractCharactersEnabled` 控制每条新 AI 消息后自动提取人物库，`autoExtractScenesEnabled` 控制自动提取场景库。两个开关默认关闭；开启后，提取结果只通过当前角色卡 scope 写入，重复名称不会覆盖手动编辑条目。
+
+---
+
+## ✨ Prompt Preflight / 编译 / 精修 / 安全重写
+
+在 **「提示词模板」** 和 **「模型后端」** 标签：
+
+- **规划**：单图用本地策略从长剧情中选择一个画面目标；多图/漫画先用文本模型拆 StoryBeat 或 ComicPanel。
+- **视觉圣经**：先读取当前角色卡的设定库和确认状态，合成 Visual Bible；旧全局设定只在当前角色卡没有 scoped 数据时作为回退来源。
+- **预检**：`prompt_preflight.mjs` 是所有入口请求图片后端前的统一边界。它会清理 HTML/CSS、隐藏思考、数值状态、选项列表和安全样板文本，创建 PromptDraft，分离 sourceText、cleanedText、visualMoment、visible/non-visual characters、protected references、dialogue policy、riskReport、validation 和 finalPrompt。
+- **编译**：`prompt_compiler.mjs` 在本地把计划和 Visual Bible 转换成图像后端友好的 prompt，包含主体、出场人物、镜头构图、动作表情、场景光影、视觉锚点、连续性、文字/对白策略和负面约束。编译不会调用 LLM。
+- **精修**：原「提示词优化」现在是可选后置步骤，只对编译后的 prompt 做轻量润色；`optimizeEnabled` 控制是否允许精修，`optimizeAuto` 控制是否自动精修，手动精修按钮只影响当前预览。精修候选必须通过 PromptDraft 校验，不能丢失受保护的人物、场景、风格或对白策略；失败时回退本地编译 prompt。
+- **安全分类**：风险分类是必经步骤，会判断风险来自源文本、人物库、场景库、动作、编译 prompt 还是精修 prompt，并把结果写入 job diagnostics、进度卡、历史和 Console。
+- **安全重写**：安全重写是 conditional flow，只在风险分类要求、用户启用相应安全处理、或 policy retry 需要时触发。它优先做字段级定向改写，例如只软化有风险的人物库/场景库/动作字段，并保留允许的人物名、SFW 外貌锚点、场景锚点、构图和对白策略。
+- **policy 安全重试**：图片后端返回 `content_policy_violation` 或等价政策拒绝时，ImageJob 会记录 `policy` 错误分类、短摘要和原始错误；如果尚未重试过，会优先基于同一个 PromptDraft 生成保守的 SFW prompt 并显示“安全重试”。老 job 没有 draft 时才回退旧的裸 prompt 重试逻辑，且每个 job 最多一次。
+- **请求与落盘**：最终 prompt 才进入图片后端；返回的 data URI 会经 SillyTavern `saveBase64AsFile` 落盘并记录到轻量图库/历史，聊天消息只保存短路径和元数据。
+
+最终发给图片后端的 final image backend prompt 优先级是固定的：先取源文本或 `<pic prompt>`，解析当前角色卡 Visual Bible，创建 PromptDraft，然后由 `compileImagePrompt` 本地编译；如果 `optimizeEnabled` 与 `optimizeAuto` 或手动精修触发成功，并且精修候选通过校验，则使用精修后的 prompt；安全分类始终运行；如果分类发现风险或 policy retry 触发，则再使用安全改写后的 prompt；最后才请求图片后端。也就是说 Prompt Preflight 和 local compile 是 mandatory，LLM refine 是 optional，safety classification 是 mandatory，safety rewrite 是 conditional。
+
+### 提示词模板角色
+
+| 模板/设置 | 当前角色 | 说明 |
+| --- | --- | --- |
+| Chat Completions 图片模板 | 必需后端模板 | 默认 `{{prompt}}` 直通，除非后端兼容预设主动改写。 |
+| Images API 图片模板 | 必需后端模板 | 默认 `{{prompt}}` 直通，PromptDraft finalPrompt 是主要内容。 |
+| 多图分析模板 / 漫画分镜模板 / 人物风格场景选择模板 | 必需规划模板 | 负责拆 StoryBeat、ComicPanel 或解析视觉库选择，不是最终生图 prompt。 |
+| 主模型提示注入 / 提取正则 | 兼容旧 `<pic>` 工作流 | 只影响旧标签自动路径；自动整条消息和手动工作台不依赖它生成 `<pic>`。 |
+| 精修模板 | 高级可选后处理 | 只在启用 `optimizeEnabled` 且自动/手动触发时运行，输出仍要通过 PromptDraft 校验。 |
+| 消息总结模板 | 高级入口转换 | 只服务“总结生图”按钮，把消息压成视觉目标后再进入 preflight。 |
+| 安全重写模板 | 高级风险兜底 | 当前优先使用本地风险分类和定向改写；模板是风险触发后的高级兜底，不是固定必跑流程。 |
+| 清洗模板 / cleanup template | inactive / reserved | 当前清洗由 `prompt_preflight.mjs` 本地完成；该模板保留以兼容旧设置，当前未启用。 |
+
+**这些文本步骤默认使用酒馆的主对话模型**（通过 SillyTavern 自身代理，无需填 URL/密钥、无跨域问题）。只有当你勾选「使用自定义精修后端」时，才会改为请求你单独填写的精修后端地址/模型/密钥。
+
+> 这一点很关键：**文本步骤永远不会发给生图后端**。所以即使你的生图后端（如 chatgpt2api）只会出图、不会生成文字，精修/安全重写/总结也照常工作。
+
+---
+
+## ⚙️ 后端配置
+
+### API 模式
+
+- **Chat Completions（`chat`）** → `POST /v1/chat/completions`。适配把图片塞进对话回复的后端。
+  - 针对 chatgpt2api，请求体会自动注入 `modalities:["image"]`，让后端走出图分支（可被「额外正文 JSON」覆盖）。
+- **Images API（`images`）** → `POST /v1/images/generations`。标准 OpenAI 图像接口，可设尺寸、数量、响应格式（`url` / `b64_json`）。
+
+### 关键设置项
+
+- **服务地址**：填 `.../v1` 这样的基础路径，或完整的 `.../chat/completions` / `.../images/generations` 都行 —— 扩展会自动规整成当前模式正确的端点。
+- **API 密钥 / 模型**：按你的后端要求填写。
+- **提示词模板**：发送前对 finalPrompt 做包装。`{{prompt}}` 是占位符；Chat Completions 与 Images API 默认都保持 `{{prompt}}` 直通，除非你手动使用后端兼容预设。
+- **图片尺寸 / 数量 / 响应格式**：仅 Images 模式生效。
+- **额外正文 JSON**：可选，合并进请求体，用来覆盖或追加特定后端需要的字段。
+
+---
+
+## 🔍 提取与响应解析
+
+### 提取正则
+
+默认 `/<pic[^>]*\sprompt="([^"]+)"[^>]*>/g`：取**捕获组 1**或名为 `prompt` 的命名组作为提示词。改主提示词时记得让标签格式与此正则对应。
+
+### 响应解析顺序
+
+**Chat 模式**按优先级依次尝试，取到即停：
+
+1. 结构化字段：`media` / `images` / `choices[0].message.media` / `choices[0].message.images`
+2. 多模态 `content[].image_url`
+3. 你配置的「响应图像正则」
+4. 内置 Markdown 图片正则（`![](url)`，含 data URI）
+5. 宽泛的图片 URL 兜底匹配
+
+**Images 模式**读取 `data[].url` / `data[].b64_json`（外加顶层 `images` 兜底）。
+
+---
+
+## 🧩 chatgpt2api 专项说明
+
+- **推荐模型**：`gpt-image-2`。
+- **Chat 模式**：图片以 **Markdown data-URI** 形式出现在 `choices[0].message.content`；只有当请求被判定为「出图请求」（图片模型 *或* 含 `modalities:["image"]`）时才会出图 —— 本扩展已自动注入该字段。
+- **Images 模式**：`b64_json` 模式下后端会对同一张图**同时**返回 `url` 和 `b64_json`，扩展每张图只取其一（优先 `b64_json`），避免重复。
+- **`size` 参数**：该后端**不实现**，填了也会被忽略。
+- **生图较慢**：实测单张可能 **超过 3 分钟**。默认 120 秒超时会在出图前中断、表现为「收不到图」—— **一键预设已把超时提到 600 秒**；若手动配置，请到「模型后端」把「超时」调大（如 `600000`）。
+- **文本能力**：它只出图，所以精修/安全重写/总结请保持走酒馆主模型（预设已为你设好）。
+- **连续性状态**：本版本的连续性策略只把上一张/首图等参考写入 `ImageJob.referenceImages` 元数据，实际请求仍回退到文生图；chatgpt2api 的真实图片编辑/图生图接口尚未接入。
+
+---
+
+## 🧪 故障排查
+
+- **抽屉没出现 / 报错**：确认文件夹在 `third-party/` 正确深度下且含 `index.js`、`manifest.json`，然后硬刷新。看 Console 里 `[ST-OpenAI-Image-Relay]` 日志。
+- **不出图**：先用「生成工作台」测后端连通性；检查服务地址、密钥、模型、API 模式是否匹配你的后端。若后端生图慢（如 chatgpt2api 单张 >3 分钟），把「模型后端」的「超时」调大到 `600000`，否则会在出图前中断。
+- **出了重复图**：多见于 Images 模式；本扩展已对 chatgpt2api 的 `b64_json` 去重，若仍重复检查后端返回结构。
+- **精修/总结报错或无效果**：确认酒馆主模型已正确配置可用；或在「模型后端」改用自定义精修后端并填好地址/模型/密钥。精修或安全重写失败时会回退为当前 prompt，总结失败会回退为空。
+- **提示词质量不稳 / 人物不一致**：先看生成工作台、历史记录或 job diagnostics 里的 Visual Bible 摘要，确认当前角色卡 scope、命中人物、缺失外貌和最终 backend prompt；如果 user/persona 或关键角色仍显示缺外貌，先在当前角色卡人物库补全或从候选卡片确认，再决定是否开启自动设定提取或 LLM 精修。
+- **被后端风控/封号**：保持安全重写开启，并确保主提示词要求 SFW 内容。
+- **policy 失败后没有继续**：`content_policy_violation` 会被归类为 policy 失败；只有未重试过的 job 才会显示“安全重试”，且每个 job 最多一次。若仍失败，说明后端继续拒绝该安全改写 prompt，需要人工改源文本或降低敏感视觉描述。
+
+---
+
+## 🛠️ 本地开发同步
+
+本仓库没有构建步骤。修改插件文件后，把以下文件同步到本地 SillyTavern 第三方扩展目录：
+
+```powershell
+Copy-Item index.js,prompt_compiler.mjs,manifest.json,settings_panel.html,settings_full.html,style.css `
+  ..\SillyTavern\public\scripts\extensions\third-party\ST-OpenAI-Image-Relay-PlanC\ -Force
+```
+
+可用轻量测试和语法检查：
+
+```powershell
+node --test tests\chat_visual_bible.test.mjs tests\prompt_compiler.test.mjs tests\index_pipeline_static.test.mjs tests\policy_retry.test.mjs
+node --check index.js
+node --check prompt_compiler.mjs
+```
+
+本地测试 SillyTavern 当前在 `http://127.0.0.1:8258/`（以 `../SillyTavern/config.yaml` 为准）。同步后对浏览器做硬刷新，并在 Console 查看 `[ST-OpenAI-Image-Relay]` 日志。
+
+---
+
+## 📄 默认后端
+
+shipped 默认设置指向 `http://127.0.0.1:8199/v1`（密钥 `sk-any`，模型 `any`，Chat 模式），匹配 [universal-web-api](https://github.com/lumingya/universal-web-api)。任何兼容 OpenAI 接口的服务都可用 —— 只生图的后端推荐配合一键 chatgpt2api 预设使用。
