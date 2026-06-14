@@ -16,7 +16,7 @@
 - **当前角色卡视觉库 / Visual Bible**：每个角色卡拥有自己的风格、人物、场景、确认人物和来源诊断；旧全局库、旧聊天作用域、世界书或剧情候选只作为回退/显式导入来源，生成时统一解析成 Visual Bible 注入单图、多图、漫画和重试 prompt。
 - **内置风格 / Built-in style presets**：插件自带 3 个风格预设，空角色卡也能看到；点击导入后只追加到当前角色卡风格库，不覆盖用户已有风格。
 - **自动设定提取**：`autoExtractCharactersEnabled` 和 `autoExtractScenesEnabled` 默认关闭；开启后每条新 AI 消息会保守提取人物/场景视觉条目，只写入当前角色卡 Visual Bible。
-- **提示词编译 / 精修 / 安全重写**：本地编译器负责基础提示词质量；LLM 精修只是可选后置步骤，安全重写按严格/标准/宽松级别处理最终 prompt。后端 `content_policy_violation` 会标记为 policy 失败，并提供最多一次 SFW 安全重试。文本步骤默认走**酒馆主模型**，无需额外配置。
+- **Prompt Preflight / 编译 / 精修 / 安全分类**：`prompt_preflight.mjs` 在每次请求图片后端前创建 PromptDraft；本地编译是必经权威步骤，LLM 精修只是可选后置步骤，安全分类必跑，安全重写按风险或 policy retry 条件触发。文本步骤默认走**酒馆主模型**，无需额外配置。
 - **两种后端模式**：`Chat Completions` 与 `Images API`，自适应解析多种返回格式。
 - **一键 chatgpt2api 预设**：一个按钮切换到 [chatgpt2api](https://github.com/basketikun/chatgpt2api) 的推荐配置。
 - **三层界面**：极简抽屉 + 可选悬浮球 + 完整悬浮配置窗，按需展开。
@@ -103,7 +103,7 @@ SillyTavern/public/scripts/extensions/third-party/<本扩展文件夹>/
 - **L2 · 悬浮配置窗**：可拖拽、可缩放的窗口，包含完整的 5 个标签页：
   - **生成工作台**：模式、源文本、人物确认、单图取景、多图张数、漫画对白、连续性、自动整条消息开关、进度、预览与队列状态。
   - **设定库**：当前角色卡视觉库 profile，包含风格、人物、场景、世界书提取、显式导入来源与固定设定清洗级别。
-  - **提示词模板**：主提示注入、图片请求模板、编译后精修模板、多图分析、漫画分镜、总结与安全重写模板、提取正则。
+  - **提示词模板**：按运行角色分层显示必需后端/规划模板、旧 `<pic>` 兼容项、高级精修/总结/安全重写模板，以及当前未启用的清洗模板预留项。
   - **模型后端**：一键预设、图片后端、文本步骤模型、自定义精修后端。
   - **图库历史**：已落盘图库、生成历史、失败记录与历史重试入口。
 
@@ -150,19 +150,34 @@ SillyTavern/public/scripts/extensions/third-party/<本扩展文件夹>/
 
 ---
 
-## ✨ 提示词编译 / 精修 / 安全重写
+## ✨ Prompt Preflight / 编译 / 精修 / 安全重写
 
 在 **「提示词模板」** 和 **「模型后端」** 标签：
 
 - **规划**：单图用本地策略从长剧情中选择一个画面目标；多图/漫画先用文本模型拆 StoryBeat 或 ComicPanel。
 - **视觉圣经**：先读取当前角色卡的设定库和确认状态，合成 Visual Bible；旧全局设定只在当前角色卡没有 scoped 数据时作为回退来源。
+- **预检**：`prompt_preflight.mjs` 是所有入口请求图片后端前的统一边界。它会清理 HTML/CSS、隐藏思考、数值状态、选项列表和安全样板文本，创建 PromptDraft，分离 sourceText、cleanedText、visualMoment、visible/non-visual characters、protected references、dialogue policy、riskReport、validation 和 finalPrompt。
 - **编译**：`prompt_compiler.mjs` 在本地把计划和 Visual Bible 转换成图像后端友好的 prompt，包含主体、出场人物、镜头构图、动作表情、场景光影、视觉锚点、连续性、文字/对白策略和负面约束。编译不会调用 LLM。
-- **精修**：原「提示词优化」现在是可选后置步骤，只对编译后的 prompt 做轻量润色；`optimizeEnabled` 控制是否允许精修，`optimizeAuto` 控制是否自动精修，手动精修按钮只影响当前预览。关闭后仍会使用编译器产物，不再依赖通用优化器保证质量。
-- **安全重写**：原 NSFW 规避升级为严格/标准/宽松三级。默认标准级会移除明确色情、裸露、血腥、重伤等内容，同时保留非血腥动作戏、武器持握、奇幻道具、追逐、对峙和电影感张力。
-- **policy 安全重试**：图片后端返回 `content_policy_violation` 或等价政策拒绝时，ImageJob 会记录 `policy` 错误分类、短摘要和原始错误；如果尚未重试过，会生成保守的 SFW prompt 并显示“安全重试”。安全重试不会要求后端忽略或绕过政策，且每个 job 最多一次。
+- **精修**：原「提示词优化」现在是可选后置步骤，只对编译后的 prompt 做轻量润色；`optimizeEnabled` 控制是否允许精修，`optimizeAuto` 控制是否自动精修，手动精修按钮只影响当前预览。精修候选必须通过 PromptDraft 校验，不能丢失受保护的人物、场景、风格或对白策略；失败时回退本地编译 prompt。
+- **安全分类**：风险分类是必经步骤，会判断风险来自源文本、人物库、场景库、动作、编译 prompt 还是精修 prompt，并把结果写入 job diagnostics、进度卡、历史和 Console。
+- **安全重写**：安全重写是 conditional flow，只在风险分类要求、用户启用相应安全处理、或 policy retry 需要时触发。它优先做字段级定向改写，例如只软化有风险的人物库/场景库/动作字段，并保留允许的人物名、SFW 外貌锚点、场景锚点、构图和对白策略。
+- **policy 安全重试**：图片后端返回 `content_policy_violation` 或等价政策拒绝时，ImageJob 会记录 `policy` 错误分类、短摘要和原始错误；如果尚未重试过，会优先基于同一个 PromptDraft 生成保守的 SFW prompt 并显示“安全重试”。老 job 没有 draft 时才回退旧的裸 prompt 重试逻辑，且每个 job 最多一次。
 - **请求与落盘**：最终 prompt 才进入图片后端；返回的 data URI 会经 SillyTavern `saveBase64AsFile` 落盘并记录到轻量图库/历史，聊天消息只保存短路径和元数据。
 
-最终发给图片后端的 final image backend prompt 优先级是固定的：先取源文本或 `<pic prompt>`，解析当前角色卡 Visual Bible，然后由 `compileImagePrompt` 本地编译；如果 `optimizeEnabled` 与 `optimizeAuto` 或手动精修触发成功，则使用精修后的 prompt；如果安全重写或 policy retry 触发，则再使用安全改写后的 prompt；最后才请求图片后端。也就是说 local compile 是必经的非 LLM 流程，LLM refine 是 optional，safety rewrite 是按设置或策略失败触发的条件流程。
+最终发给图片后端的 final image backend prompt 优先级是固定的：先取源文本或 `<pic prompt>`，解析当前角色卡 Visual Bible，创建 PromptDraft，然后由 `compileImagePrompt` 本地编译；如果 `optimizeEnabled` 与 `optimizeAuto` 或手动精修触发成功，并且精修候选通过校验，则使用精修后的 prompt；安全分类始终运行；如果分类发现风险或 policy retry 触发，则再使用安全改写后的 prompt；最后才请求图片后端。也就是说 Prompt Preflight 和 local compile 是 mandatory，LLM refine 是 optional，safety classification 是 mandatory，safety rewrite 是 conditional。
+
+### 提示词模板角色
+
+| 模板/设置 | 当前角色 | 说明 |
+| --- | --- | --- |
+| Chat Completions 图片模板 | 必需后端模板 | 默认 `{{prompt}}` 直通，除非后端兼容预设主动改写。 |
+| Images API 图片模板 | 必需后端模板 | 默认 `{{prompt}}` 直通，PromptDraft finalPrompt 是主要内容。 |
+| 多图分析模板 / 漫画分镜模板 / 人物风格场景选择模板 | 必需规划模板 | 负责拆 StoryBeat、ComicPanel 或解析视觉库选择，不是最终生图 prompt。 |
+| 主模型提示注入 / 提取正则 | 兼容旧 `<pic>` 工作流 | 只影响旧标签自动路径；自动整条消息和手动工作台不依赖它生成 `<pic>`。 |
+| 精修模板 | 高级可选后处理 | 只在启用 `optimizeEnabled` 且自动/手动触发时运行，输出仍要通过 PromptDraft 校验。 |
+| 消息总结模板 | 高级入口转换 | 只服务“总结生图”按钮，把消息压成视觉目标后再进入 preflight。 |
+| 安全重写模板 | 高级风险兜底 | 当前优先使用本地风险分类和定向改写；模板是风险触发后的高级兜底，不是固定必跑流程。 |
+| 清洗模板 / cleanup template | inactive / reserved | 当前清洗由 `prompt_preflight.mjs` 本地完成；该模板保留以兼容旧设置，当前未启用。 |
 
 **这些文本步骤默认使用酒馆的主对话模型**（通过 SillyTavern 自身代理，无需填 URL/密钥、无跨域问题）。只有当你勾选「使用自定义精修后端」时，才会改为请求你单独填写的精修后端地址/模型/密钥。
 
@@ -182,7 +197,7 @@ SillyTavern/public/scripts/extensions/third-party/<本扩展文件夹>/
 
 - **服务地址**：填 `.../v1` 这样的基础路径，或完整的 `.../chat/completions` / `.../images/generations` 都行 —— 扩展会自动规整成当前模式正确的端点。
 - **API 密钥 / 模型**：按你的后端要求填写。
-- **提示词模板**：发送前对提示词做包装。`{{prompt}}` 是占位符。Chat 模式默认会附一句「只返回最终图片」；Images 模式默认 `{{prompt}}` 直通。
+- **提示词模板**：发送前对 finalPrompt 做包装。`{{prompt}}` 是占位符；Chat Completions 与 Images API 默认都保持 `{{prompt}}` 直通，除非你手动使用后端兼容预设。
 - **图片尺寸 / 数量 / 响应格式**：仅 Images 模式生效。
 - **额外正文 JSON**：可选，合并进请求体，用来覆盖或追加特定后端需要的字段。
 

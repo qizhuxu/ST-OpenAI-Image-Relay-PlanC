@@ -386,8 +386,24 @@ export function normalizeSinglePromptStrategy(value) {
     return SINGLE_STRATEGIES.includes(key) ? key : "climax";
 }
 
-export function splitVisualParagraphs(text) {
+function cleanSourceForVisualPlanning(text) {
     return String(text || "")
+        .replace(/<style\b[^>]*>[\s\S]*?<\/style>/gi, "\n")
+        .replace(/<script\b[^>]*>[\s\S]*?<\/script>/gi, "\n")
+        .replace(/<options\b[^>]*>[\s\S]*?<\/options>/gi, "\n")
+        .replace(/<disclaimer\b[^>]*>[\s\S]*?<\/disclaimer>/gi, "\n")
+        .replace(/<UpdateVariable\b[^>]*>[\s\S]*?<\/UpdateVariable>/gi, "\n")
+        .replace(/<StatusPlaceHolderImpl\b[^>]*\/?>/gi, "\n")
+        .replace(/(?:^|\n)\s*[.#][\w-]+\s*\{[\s\S]*?\}\s*/g, "\n")
+        .replace(/[.#][\w-]+\s*\{[^{}]*\}/g, " ")
+        .replace(/<[^>]+>/g, " ")
+        .replace(/[ \t]+\n/g, "\n")
+        .replace(/\n{3,}/g, "\n\n")
+        .trim();
+}
+
+export function splitVisualParagraphs(text) {
+    return cleanSourceForVisualPlanning(text)
         .split(/\n{2,}|\r?\n/)
         .map((line) => line.replace(/\s+/g, " ").trim())
         .filter(Boolean)
@@ -396,8 +412,9 @@ export function splitVisualParagraphs(text) {
 
 export function planSingleImageTarget(sourceText, options = {}) {
     const strategy = normalizeSinglePromptStrategy(options.strategy);
-    const paragraphs = splitVisualParagraphs(sourceText);
-    const fallback = String(sourceText || "").replace(/\s+/g, " ").trim();
+    const planningText = cleanSourceForVisualPlanning(sourceText);
+    const paragraphs = splitVisualParagraphs(planningText);
+    const fallback = String(planningText || "").replace(/\s+/g, " ").trim();
     const candidates = paragraphs.length ? paragraphs : (fallback ? [fallback] : []);
     const scored = candidates.map((text, index) => ({
         text,
@@ -638,6 +655,7 @@ function collectLikelyNamedCharacters(text) {
 function isLikelyNonCharacterName(name) {
     const value = String(name || "").trim();
     if (value.length < 2 || value.length > 12) return true;
+    if (/^(自然光|柔和自然光|阳光|月光|灯光|光线|光影|窗边|图书馆|地图|晴朗下午)$/.test(value)) return true;
     const generic = /^(这个|那个|这些|那些|一个|一名|几名|几个|众人|人群|路人|敌人|对手|混混|壮汉|少女|男子|女人|男人)$/;
     if (generic.test(value)) return true;
     return /街道|石板|长剑|重剑|剑尖|药剂|药水|露液|腰间|腰包|地面|前方|后方|画面|场景|光影|道具|瓶|手中|脚下/.test(value);

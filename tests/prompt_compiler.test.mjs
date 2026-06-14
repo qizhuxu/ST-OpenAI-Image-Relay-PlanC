@@ -35,6 +35,33 @@ test("single planner selects a visual target and compiler keeps scoped character
   assert.match(plan.jobs[0].prompt, /避免/);
 });
 
+test("single planner ignores tagged safety disclaimer when selecting visual target", () => {
+  const source = [
+    "<style>.scene-card{font-size:12px;color:red}</style>",
+    "<div class=\"scene-card\">Adult explorer Erin stands beside a quiet library window, holding an unfolded antique map in soft daylight.</div>",
+    "<options><option>Open the next menu</option></options>",
+    "<disclaimer>请遵守政策，请确保画面安全合规。</disclaimer>",
+  ].join("\n");
+
+  const plan = createSingleImagePlanFromSource(source, { strategy: "climax", fixed: {} });
+  const moment = plan.selectedTarget.visualMoment;
+
+  assert.match(moment, /Adult explorer Erin/);
+  assert.match(moment, /quiet library/);
+  assert.doesNotMatch(moment, /disclaimer|遵守政策|安全合规|scene-card|<div|<style|<options/i);
+  assert.doesNotMatch(plan.jobs[0].prompt, /disclaimer|遵守政策|安全合规|scene-card|<div|<style|<options/i);
+});
+
+test("single planner does not treat lighting words as missing characters", () => {
+  const source = "晴朗下午，成年女性探险者艾琳站在安静图书馆窗边，手持地图，柔和自然光。";
+
+  const plan = createSingleImagePlanFromSource(source, { strategy: "climax", fixed: {} });
+
+  assert.match(plan.jobs[0].prompt, /艾琳/);
+  assert.doesNotMatch(plan.jobs[0].prompt, /自然光：无固定外貌参考|可见人物：自然光/);
+  assert.doesNotMatch(plan.jobs[0].promptDiagnostics.missingCharacters.join(","), /自然光/);
+});
+
 test("single compiler keeps visible named characters without fixed references", () => {
   const source = "齐齐在石板街道上横移半步，挡在米特前方，手中的长剑斜指地面，金色药剂瓶在腰间闪光。";
   const fixedWithoutQiQi = {

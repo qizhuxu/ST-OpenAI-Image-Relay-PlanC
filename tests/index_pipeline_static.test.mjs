@@ -254,6 +254,19 @@ test("manual workbench keeps policy safe retry as a visible action", () => {
   assert.match(manual, /source: "manual", policyAutoRetry: false/);
 });
 
+test("manual refinement preview runs through Prompt Preflight finalization", () => {
+  const manualStart = indexSource.indexOf("async function manualOptimize");
+  const manualEnd = indexSource.indexOf("\nfunction makePreviewImageAccessible", manualStart);
+  assert.notEqual(manualStart, -1, "manual optimization handler should be present");
+  assert.notEqual(manualEnd, -1, "manual optimization handler should have a stable end marker");
+
+  const manual = indexSource.slice(manualStart, manualEnd);
+  assert.match(manual, /createSingleImagePlan\(prompt/);
+  assert.match(manual, /await finalizeImagePlanPrompts\(\s*previewPlan,\s*\{\s*fixed,\s*forceOptimize:\s*true\s*\}\s*\)/);
+  assert.match(manual, /previewPlan\.jobs\?\.\[0\]\?\.prompt/);
+  assert.doesNotMatch(manual, /await optimizePrompt\(compiled,\s*fixed\)/);
+});
+
 test("single-job safe retry result can render from job result images", () => {
   const previewStart = indexSource.indexOf("function renderManualPreview");
   const previewEnd = indexSource.indexOf("\nfunction openImageLightbox", previewStart);
@@ -264,6 +277,59 @@ test("single-job safe retry result can render from job result images", () => {
   assert.match(preview, /const directImages = Array\.isArray\(images\) \? images : \[\]/);
   assert.match(preview, /!\s*directImages\.length\s*&&\s*Array\.isArray\(job\.result\?\.images\)/);
   assert.match(preview, /job\.result\.images\.length > 0/);
+});
+
+test("generation history stores a bounded PromptDraft summary", () => {
+  assert.match(indexSource, /function summarizePromptDraft/);
+
+  const summaryStart = indexSource.indexOf("function summarizePromptDraft");
+  const summaryEnd = indexSource.indexOf("\nfunction createGenerationHistoryJob", summaryStart);
+  assert.notEqual(summaryStart, -1, "PromptDraft summarizer should be present");
+  assert.notEqual(summaryEnd, -1, "PromptDraft summarizer should precede history job serialization");
+  const summary = indexSource.slice(summaryStart, summaryEnd);
+  assert.match(summary, /sourceChars:/);
+  assert.match(summary, /cleanedChars:/);
+  assert.match(summary, /summarizeHistoryText\(draft\.visualMoment,\s*240\)/);
+  assert.doesNotMatch(summary, /sourceText:\s*draft\.sourceText/);
+
+  const historyStart = indexSource.indexOf("function createGenerationHistoryJob");
+  const historyEnd = indexSource.indexOf("\nfunction summarizePromptDiagnostics", historyStart);
+  assert.notEqual(historyStart, -1, "history job serializer should be present");
+  assert.notEqual(historyEnd, -1, "history job serializer should have a stable end marker");
+  const history = indexSource.slice(historyStart, historyEnd);
+  assert.match(history, /promptDraft:\s*summarizePromptDraft\(job\.promptDraft\)/);
+});
+
+test("gallery records keep concise preflight diagnostics", () => {
+  const executeStart = indexSource.indexOf("async function executeImageJob");
+  const executeEnd = indexSource.indexOf("\nasync function executeImagePlan", executeStart);
+  assert.notEqual(executeStart, -1, "image job executor should be present");
+  assert.notEqual(executeEnd, -1, "image job executor should have a stable end marker");
+  const execute = indexSource.slice(executeStart, executeEnd);
+  assert.match(execute, /promptDiagnostics:\s*job\.promptDiagnostics/);
+  assert.match(execute, /promptDraft:\s*summarizePromptDraft\(job\.promptDraft\)/);
+
+  const requestStart = indexSource.indexOf("async function requestImagesFromBackend");
+  const requestEnd = indexSource.indexOf("\nasync function requestViaChatCompletions", requestStart);
+  assert.notEqual(requestStart, -1, "backend dispatcher should be present");
+  assert.notEqual(requestEnd, -1, "backend dispatcher should have a stable end marker");
+  const request = indexSource.slice(requestStart, requestEnd);
+  assert.match(request, /persistAndRecordImages\([\s\S]*promptDiagnostics:\s*meta\.promptDiagnostics[\s\S]*promptDraft:\s*meta\.promptDraft/);
+
+  const galleryStart = indexSource.indexOf("function addGalleryRecord");
+  const galleryEnd = indexSource.indexOf("\nfunction deleteGalleryRecord", galleryStart);
+  assert.notEqual(galleryStart, -1, "gallery record helper should be present");
+  assert.notEqual(galleryEnd, -1, "gallery record helper should have a stable end marker");
+  const gallery = indexSource.slice(galleryStart, galleryEnd);
+  assert.match(gallery, /promptDiagnostics:\s*summarizePromptDiagnostics\(meta\.promptDiagnostics\)/);
+  assert.match(gallery, /promptDraft:\s*meta\.promptDraft \|\| null/);
+});
+
+test("inline full settings fallback matches settings_full.html", () => {
+  const match = indexSource.match(/const SETTINGS_FULL_HTML = ("(?:\\.|[^"\\])*");/);
+  assert.ok(match, "inline SETTINGS_FULL_HTML string should be present");
+  const inline = JSON.parse(match[1]);
+  assert.equal(inline, fullSettingsSource);
 });
 
 test("lightbox controls stay anchored inside a viewport-sized overlay", () => {
@@ -460,12 +526,18 @@ test("automatic extraction is wired into new AI message handling without manual 
 
 test("README explains compile, optional refinement, safety rewrite, and final prompt priority", () => {
   assert.match(readmeSource, /compileImagePrompt|prompt_compiler\.mjs/);
+  assert.match(readmeSource, /prompt_preflight\.mjs/);
+  assert.match(readmeSource, /PromptDraft/);
   assert.match(readmeSource, /local compile|本地编译|本地 prompt compiler/i);
   assert.match(readmeSource, /optimizeEnabled/);
   assert.match(readmeSource, /optimizeAuto/);
   assert.match(readmeSource, /optional|可选/);
+  assert.match(readmeSource, /safety classification|安全分类|风险分类/i);
   assert.match(readmeSource, /safety rewrite|安全重写|policy retry/i);
+  assert.match(readmeSource, /conditional|条件触发|按风险触发/i);
   assert.match(readmeSource, /final image backend prompt|最终.*图片后端|最终.*生图后端/i);
+  assert.match(readmeSource, /cleanup template|清洗模板/i);
+  assert.match(readmeSource, /inactive|reserved|当前未启用|预留/i);
   assert.match(readmeSource, /autoExtractCharactersEnabled/);
   assert.match(readmeSource, /autoExtractScenesEnabled/);
   assert.match(readmeSource, /built-in style|内置风格/);
